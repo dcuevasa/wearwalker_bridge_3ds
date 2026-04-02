@@ -251,6 +251,10 @@ class WearWalkerMockState:
         special_flags: int = 0,
         seed: int | None = None,
         clear_buffers: bool = False,
+        allow_locked_course: bool = False,
+        assume_national_dex: bool = True,
+        unlock_special_courses: bool = False,
+        unlock_event_courses: bool = False,
     ) -> dict:
         with self._lock:
             payload = send_pokemon_to_stroll(
@@ -267,6 +271,10 @@ class WearWalkerMockState:
                 special_flags=special_flags,
                 seed=seed,
                 clear_buffers=clear_buffers,
+                allow_locked_course=allow_locked_course,
+                assume_national_dex=assume_national_dex,
+                unlock_special_courses=unlock_special_courses,
+                unlock_event_courses=unlock_event_courses,
             )
             save_eeprom(self.eeprom_path, self._eeprom)
             return payload
@@ -459,6 +467,10 @@ class StrollSendRequest(BaseModel):
     specialFlags: int = Field(default=0, ge=0, le=0xFF)
     seed: int | None = Field(default=None)
     clearBuffers: bool = False
+    allowLockedCourse: bool = False
+    assumeNationalDex: bool = True
+    unlockSpecialCourses: bool = False
+    unlockEventCourses: bool = False
 
 
 class StrollReturnRequest(BaseModel):
@@ -678,6 +690,10 @@ def create_app(eeprom_path: Path) -> FastAPI:
                 special_flags=body.specialFlags,
                 seed=body.seed,
                 clear_buffers=body.clearBuffers,
+                allow_locked_course=body.allowLockedCourse,
+                assume_national_dex=body.assumeNationalDex,
+                unlock_special_courses=body.unlockSpecialCourses,
+                unlock_event_courses=body.unlockEventCourses,
             )
             return {"status": "ok", **payload}
         except ValueError as exc:

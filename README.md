@@ -36,9 +36,23 @@ When connecting to the Pokewalker, make sure to point it towards the 3DS's infra
 
 Just download the latest [release](https://github.com/francesco265/pwalkerHax/releases) as a `.3dsx` file and execute it using the homebrew launcher.
 
+This repository can now also build a `.cia` package for install-based testing.
+
 ## How to build
 
-The only requirement to build this project is to have the [libctru](https://github.com/devkitPro/libctru) library installed on your system, then just run the `make` command in the root directory of the project.
+The only requirement to build this project is to have the [libctru](https://github.com/devkitPro/libctru) library installed on your system.
+
+Build `.3dsx`:
+
+```sh
+make
+```
+
+Build `.cia` (requires `bannertool` + `makerom` and local `banner.png` + `audio.wav` assets):
+
+```sh
+make cia
+```
 
 ## WiFi protocol and offline testing
 
@@ -135,17 +149,35 @@ python3 scripts/eeprom_client.py clear-journal --server http://127.0.0.1:8080
 These commands operate directly on HGSS `.sav` files (no watch/3DS required) and use PKHeX-aligned block detection/checksum logic.
 
 ```sh
-python3 scripts/eeprom_client.py hgss-status --save "scripts/test_HGSS_saves/4832 - Pokemon - Edicion Oro HeartGold (Spain) [b].sav"
+python3 scripts/eeprom_client.py hgss-status --save scripts/test_HGSS_saves/input_hgss.sav
 
 python3 scripts/eeprom_client.py hgss-patch \
-	--save "scripts/test_HGSS_saves/4832 - Pokemon - Edicion Oro HeartGold (Spain) [b].sav" \
-	--output scripts/test_HGSS_saves/hgss_patched.sav \
+	--save scripts/test_HGSS_saves/input_hgss.sav \
+	--output scripts/test_HGSS_saves/output_hgss_patched.sav \
 	--steps 123456 --watts 321 --unlock-all-courses
 
 python3 scripts/eeprom_client.py hgss-diff \
-	--before "scripts/test_HGSS_saves/4832 - Pokemon - Edicion Oro HeartGold (Spain) [b].sav" \
-	--after scripts/test_HGSS_saves/hgss_patched.sav
+	--before scripts/test_HGSS_saves/input_hgss.sav \
+	--after scripts/test_HGSS_saves/output_hgss_patched.sav
+
+# Full synthetic return from EEPROM capture to HGSS box.
+# By default this also syncs EEPROM trip progress into HGSS Pokewalker fields
+# (steps/watts/course flags), increments the HGSS trip counter,
+# and can append synthetic trip journal events in EEPROM before generating the boxed PK4 capture.
+python3 scripts/eeprom_client.py hgss-stroll-box-return \
+	--save scripts/test_HGSS_saves/input_hgss.sav \
+	--eeprom scripts/test_roms/eeprom.bin \
+	--output scripts/test_HGSS_saves/output_hgss_return.sav \
+	--box 17 --source-slot 1 --extra-species 16 --caught-slot 2 \
+	--walked-steps 2400 --bonus-watts 30
 ```
+
+Notes for `hgss-stroll-box-return`:
+
+- `--no-sync-eeprom-progress`: capture injection only (skip EEPROM progress sync).
+- `--no-trip-journal`: skip synthetic capture/return events in EEPROM journal.
+- `--no-sync-trip-counter`: skip incrementing the HGSS Pokewalker trip counter.
+- The diary text visible in HGSS is generated from Pokewalker EEPROM event logs at sync time; it is not persisted as diary text inside the HGSS `.sav`.
 
 ### Decoupled sync workflow (ready for watch/backend/3DS split)
 
@@ -176,6 +208,7 @@ Example operations file (`ops.json`):
 
 ```sh
 python3 scripts/eeprom_client.py stroll-send 25 --course-id 0 --level 14 --clear-buffers --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py stroll-send 25 --course-id 20 --allow-locked-course --unlock-special-courses --server http://127.0.0.1:8080
 python3 scripts/eeprom_client.py stroll-return 2400 --auto-captures 2 --bonus-watts 30 --server http://127.0.0.1:8080
 python3 scripts/eeprom_client.py stroll-report --server http://127.0.0.1:8080
 
@@ -199,6 +232,17 @@ make USE_WIFI=1
 
 3. On 3DS, open the WearWalker API test menu and set host/port to the mock server endpoint.
 4. Test status, snapshot, export and import flows.
+
+### HGSS save sync/patch menu (MVP)
+
+The 3DS app now includes a dedicated **HGSS save sync/patch** menu:
+
+- Browse SD folders and select a `.sav` file directly on-device.
+- Apply local HGSS Pokewalker field patch manually (steps/watts/course flags).
+- Apply local HGSS patch from backend `/api/v1/sync/package` (`stats.steps`, `stats.watts`, `routes.courseUnlocks.unlockFlags`).
+- Optional trip-counter increment (maps to HGSS Pokewalker trip counter at `0xE700` in the active General block).
+
+Current MVP patch scope is the Pokewalker progress area + General block checksum refresh.
 
 ## Credits
 

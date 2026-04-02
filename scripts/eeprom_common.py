@@ -161,6 +161,41 @@ COURSE_NAMES: tuple[str, ...] = (
     "Amity Meadow",
 )
 
+# Pokewalker route unlock model distilled from game behavior and public course tables.
+# `watts` is the threshold to unlock by accumulated watts; `None` means special unlock.
+# `requires_national_dex` follows the documented HGSS requirement for late routes.
+# `special` is an informational marker for routes requiring event/trade conditions.
+COURSE_UNLOCK_RULES: tuple[dict[str, Any], ...] = (
+    {"watts": 0, "requires_national_dex": False, "special": None},
+    {"watts": 0, "requires_national_dex": False, "special": None},
+    {"watts": 50, "requires_national_dex": False, "special": None},
+    {"watts": 200, "requires_national_dex": False, "special": None},
+    {"watts": 500, "requires_national_dex": False, "special": None},
+    {"watts": 1000, "requires_national_dex": False, "special": None},
+    {"watts": 2000, "requires_national_dex": False, "special": None},
+    {"watts": 3000, "requires_national_dex": False, "special": None},
+    {"watts": 5000, "requires_national_dex": True, "special": None},
+    {"watts": 7500, "requires_national_dex": True, "special": None},
+    {"watts": 10000, "requires_national_dex": True, "special": None},
+    {"watts": 15000, "requires_national_dex": True, "special": None},
+    {"watts": 20000, "requires_national_dex": True, "special": None},
+    {"watts": 25000, "requires_national_dex": True, "special": None},
+    {"watts": 30000, "requires_national_dex": True, "special": None},
+    {"watts": 40000, "requires_national_dex": True, "special": None},
+    {"watts": 50000, "requires_national_dex": True, "special": None},
+    {"watts": 65000, "requires_national_dex": True, "special": None},
+    {"watts": 80000, "requires_national_dex": True, "special": None},
+    {"watts": 100000, "requires_national_dex": True, "special": None},
+    {"watts": None, "requires_national_dex": False, "special": "gts-trade"},
+    {"watts": None, "requires_national_dex": False, "special": "jirachi-trade"},
+    {"watts": None, "requires_national_dex": False, "special": "event"},
+    {"watts": None, "requires_national_dex": False, "special": "event"},
+    {"watts": None, "requires_national_dex": False, "special": "event"},
+    {"watts": None, "requires_national_dex": False, "special": "event"},
+    {"watts": None, "requires_national_dex": False, "special": "event"},
+)
+COURSE_UNLOCK_MASK = (1 << len(COURSE_NAMES)) - 1
+
 # PKHeX source: PokewalkerRNG.CourseSpecies (6 entries per course, 3 groups of 2).
 COURSE_SPECIES: tuple[int, ...] = (
     115,
@@ -753,6 +788,28 @@ def _load_walker_encounters() -> dict[int, list[dict[str, Any]]]:
     return courses
 
 
+def _find_walker_encounter_by_species(
+    species_id: int,
+    *,
+    preferred_course: int | None,
+) -> dict[str, Any] | None:
+    sid = _validate_u16("speciesId", int(species_id))
+    courses = _load_walker_encounters()
+
+    if preferred_course is not None:
+        entries = courses.get(int(preferred_course), [])
+        for entry in entries:
+            if int(entry.get("speciesId", 0)) == sid:
+                return dict(entry)
+
+    for course_id in sorted(courses.keys()):
+        for entry in courses[course_id]:
+            if int(entry.get("speciesId", 0)) == sid:
+                return dict(entry)
+
+    return None
+
+
 def _weighted_choice(weighted: list[tuple[Any, int]], rng: random.Random) -> Any:
     total = sum(weight for _, weight in weighted)
     if total <= 0:
@@ -763,6 +820,140 @@ def _weighted_choice(weighted: list[tuple[Any, int]], rng: random.Random) -> Any
         if roll < 0:
             return value
     return weighted[-1][0]
+
+
+def _course_unlock_rule(course_id: int) -> dict[str, Any]:
+    if course_id < 0 or course_id >= len(COURSE_NAMES):
+        raise ValueError(f"courseId out of range (0..{len(COURSE_NAMES) - 1}): {course_id}")
+    return dict(COURSE_UNLOCK_RULES[course_id])
+
+
+def _unlocked_course_ids_from_flags(flags: int) -> list[int]:
+    mask = int(flags) & COURSE_UNLOCK_MASK
+    return [course_id for course_id in range(len(COURSE_NAMES)) if ((mask >> course_id) & 0x1) == 1]
+
+
+def _course_unlock_available(
+    *,
+    watts: int,
+    rule: dict[str, Any],
+    assume_national_dex: bool,
+    unlock_special_courses: bool,
+    unlock_event_courses: bool,
+) -> bool:
+    threshold = rule.get("watts")
+    requires_national_dex = bool(rule.get("requires_national_dex", False))
+    special = rule.get("special")
+
+    if threshold is not None:
+        if int(watts) < int(threshold):
+            return False
+        if requires_national_dex and not assume_national_dex:
+            return False
+        return True
+
+    if special in ("gts-trade", "jirachi-trade"):
+        return unlock_special_courses
+    if special == "event":
+        return unlock_event_courses
+    return False
+
+
+def compute_course_unlock_flags(
+    *,
+    watts: int,
+    existing_flags: int = 0,
+    assume_national_dex: bool = True,
+    unlock_special_courses: bool = False,
+    unlock_event_courses: bool = False,
+) -> int:
+    current_watts = max(0, int(watts))
+    flags = int(existing_flags) & COURSE_UNLOCK_MASK
+
+    for course_id in range(len(COURSE_NAMES)):
+        rule = _course_unlock_rule(course_id)
+        if _course_unlock_available(
+            watts=current_watts,
+            rule=rule,
+            assume_national_dex=assume_national_dex,
+            unlock_special_courses=unlock_special_courses,
+            unlock_event_courses=unlock_event_courses,
+        ):
+            flags |= 1 << course_id
+
+    return flags & COURSE_UNLOCK_MASK
+
+
+def build_course_unlock_state(
+    eeprom: bytearray,
+    *,
+    existing_flags: int = 0,
+    assume_national_dex: bool = True,
+    unlock_special_courses: bool = False,
+    unlock_event_courses: bool = False,
+) -> dict[str, Any]:
+    _check_size(eeprom)
+    watts = read_current_watts(eeprom)
+    flags = compute_course_unlock_flags(
+        watts=watts,
+        existing_flags=existing_flags,
+        assume_national_dex=assume_national_dex,
+        unlock_special_courses=unlock_special_courses,
+        unlock_event_courses=unlock_event_courses,
+    )
+    unlocked = _unlocked_course_ids_from_flags(flags)
+
+    courses: list[dict[str, Any]] = []
+    next_unlock: dict[str, Any] | None = None
+
+    for course_id, course_name in enumerate(COURSE_NAMES):
+        rule = _course_unlock_rule(course_id)
+        threshold = rule.get("watts")
+        requires_national_dex = bool(rule.get("requires_national_dex", False))
+        special = rule.get("special")
+        is_unlocked = ((flags >> course_id) & 0x1) == 1
+
+        remaining_watts: int | None
+        if threshold is None:
+            remaining_watts = None
+        else:
+            remaining_watts = max(0, int(threshold) - int(watts))
+
+        entry = {
+            "courseId": course_id,
+            "courseName": course_name,
+            "unlocked": is_unlocked,
+            "requiredWatts": threshold,
+            "remainingWatts": remaining_watts,
+            "requiresNationalDex": requires_national_dex,
+            "specialRequirement": special,
+        }
+        courses.append(entry)
+
+        if is_unlocked or threshold is None:
+            continue
+        if requires_national_dex and not assume_national_dex:
+            continue
+        if next_unlock is None or int(remaining_watts) < int(next_unlock["remainingWatts"]):
+            next_unlock = {
+                "courseId": course_id,
+                "courseName": course_name,
+                "requiredWatts": int(threshold),
+                "remainingWatts": int(remaining_watts),
+            }
+
+    return {
+        "watts": int(watts),
+        "unlockFlags": int(flags),
+        "unlockFlagsHex": f"0x{int(flags):08X}",
+        "assumeNationalDex": bool(assume_national_dex),
+        "unlockSpecialCourses": bool(unlock_special_courses),
+        "unlockEventCourses": bool(unlock_event_courses),
+        "unlockedCourses": unlocked,
+        "unlockedCourseNames": [COURSE_NAMES[course_id] for course_id in unlocked],
+        "nextWattsUnlock": next_unlock,
+        "courses": courses,
+    }
 
 
 
@@ -1379,7 +1570,27 @@ def add_inventory_caught_species(
     eeprom: bytearray, species_id: int, replace_slot: int | None = None
 ) -> Dict[str, int]:
     _check_size(eeprom)
-    summary = _pokemon_summary_from_values(species_id, level=10)
+    preferred_course = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
+    legal_entry = _find_walker_encounter_by_species(species_id, preferred_course=preferred_course)
+
+    if legal_entry is None:
+        summary = _pokemon_summary_from_values(species_id, level=10)
+    else:
+        level = max(1, min(int(legal_entry.get("level", 10)), 100))
+        raw_moves = legal_entry.get("moves", [0, 0, 0, 0])
+        moves = [0, 0, 0, 0]
+        if isinstance(raw_moves, list):
+            for index, value in enumerate(raw_moves[:4]):
+                moves[index] = _validate_u16(f"moves[{index}]", int(value))
+        gender = int(legal_entry.get("gender", 0))
+        variant_flags = 0x20 if gender == 1 else 0
+        summary = _pokemon_summary_from_values(
+            species_id,
+            level=level,
+            moves=moves,
+            variant_flags=variant_flags,
+        )
+
     placement = add_inventory_caught_summary(eeprom, summary, replace_slot)
     return {
         "slot": int(placement["slot"]),
@@ -1577,6 +1788,11 @@ def send_pokemon_to_stroll(
     special_flags: int = 0,
     seed: int | None = None,
     clear_buffers: bool = False,
+    allow_locked_course: bool = False,
+    assume_national_dex: bool = True,
+    unlock_special_courses: bool = False,
+    unlock_event_courses: bool = False,
+    existing_course_flags: int = 0,
 ) -> Dict[str, Any]:
     _check_size(eeprom)
 
@@ -1585,15 +1801,68 @@ def send_pokemon_to_stroll(
 
     sid = _validate_u16("speciesId", species_id)
     lvl = max(1, min(int(level), 100))
-    route_cfg: list[dict[str, Any]] = []
 
+    unlock_state_before = build_course_unlock_state(
+        eeprom,
+        existing_flags=existing_course_flags,
+        assume_national_dex=assume_national_dex,
+        unlock_special_courses=unlock_special_courses,
+        unlock_event_courses=unlock_event_courses,
+    )
+    unlocked_courses = [int(value) for value in unlock_state_before.get("unlockedCourses", [])]
+
+    requested_course: int | None = None
     if course_id is not None:
-        route_cfg = _configure_route_from_course(eeprom, int(course_id), rng=rng)
-        if route_image_index is None:
-            route_image_index = int(course_id)
+        requested_course = int(course_id)
+    elif route_image_index is not None:
+        requested_course = int(route_image_index)
 
-    if route_image_index is None:
-        route_image_index = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
+    selected_course: int
+    course_note: str | None = None
+
+    if requested_course is not None:
+        if requested_course < 0 or requested_course >= len(COURSE_NAMES):
+            raise ValueError(f"courseId out of range (0..{len(COURSE_NAMES) - 1}): {requested_course}")
+
+        if requested_course not in unlocked_courses and not allow_locked_course:
+            rule = _course_unlock_rule(requested_course)
+            required_watts = rule.get("watts")
+            special_requirement = rule.get("special")
+            if required_watts is not None:
+                raise ValueError(
+                    (
+                        f"Requested course {requested_course} ({COURSE_NAMES[requested_course]}) "
+                        f"is locked at {unlock_state_before['watts']} watts; requires {required_watts} watts"
+                    )
+                )
+            raise ValueError(
+                (
+                    f"Requested course {requested_course} ({COURSE_NAMES[requested_course]}) "
+                    f"requires special unlock condition: {special_requirement}"
+                )
+            )
+
+        selected_course = requested_course
+        if course_id is not None and route_image_index is not None and int(course_id) != int(route_image_index):
+            course_note = (
+                "Both courseId and routeImageIndex were provided; courseId was used for route configuration"
+            )
+    else:
+        current_course = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
+        if current_course in unlocked_courses:
+            selected_course = current_course
+        elif unlocked_courses:
+            selected_course = unlocked_courses[-1]
+            course_note = (
+                f"Current route {current_course} is locked at {unlock_state_before['watts']} watts; "
+                f"auto-selected highest unlocked route {selected_course}"
+            )
+        else:
+            selected_course = 0
+            course_note = "No unlocked courses detected; defaulted to route 0"
+
+    route_cfg: list[dict[str, Any]] = _configure_route_from_course(eeprom, selected_course, rng=rng)
+    route_image_index = selected_course
     eeprom[ROUTE_IMAGE_INDEX_OFFSET] = _validate_u8("routeImageIndex", route_image_index)
 
     if friendship is None:
@@ -1637,6 +1906,14 @@ def send_pokemon_to_stroll(
         companion_name=display_name,
     )
 
+    unlock_state_after = build_course_unlock_state(
+        eeprom,
+        existing_flags=existing_course_flags,
+        assume_national_dex=assume_national_dex,
+        unlock_special_courses=unlock_special_courses,
+        unlock_event_courses=unlock_event_courses,
+    )
+
     return {
         "seed": rng_seed,
         "walkingPokemon": {
@@ -1649,6 +1926,18 @@ def send_pokemon_to_stroll(
             "routeCourseName": COURSE_NAMES[int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])]
             if int(eeprom[ROUTE_IMAGE_INDEX_OFFSET]) < len(COURSE_NAMES)
             else None,
+        },
+        "courseSelection": {
+            "requestedCourseId": requested_course,
+            "selectedCourseId": int(eeprom[ROUTE_IMAGE_INDEX_OFFSET]),
+            "selectedCourseName": COURSE_NAMES[int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])],
+            "allowLockedCourse": bool(allow_locked_course),
+            "autoSelected": requested_course is None or int(eeprom[ROUTE_IMAGE_INDEX_OFFSET]) != requested_course,
+            "note": course_note,
+        },
+        "courseUnlocks": {
+            "before": unlock_state_before,
+            "after": unlock_state_after,
         },
         "configuredRouteSlots": route_cfg,
         "stroll": read_stroll_section(eeprom),
@@ -1671,6 +1960,10 @@ def return_pokemon_from_stroll(
     seed: int | None = None,
     replace_when_full: bool = False,
     clear_caught_after_return: bool = False,
+    assume_national_dex: bool = True,
+    unlock_special_courses: bool = False,
+    unlock_event_courses: bool = False,
+    existing_course_flags: int = 0,
 ) -> Dict[str, Any]:
     _check_size(eeprom)
 
@@ -1690,9 +1983,36 @@ def return_pokemon_from_stroll(
     friendship_before = int(eeprom[ROUTE_FRIENDSHIP_OFFSET])
     companion_name = _read_device_text_fixed(eeprom, ROUTE_NICKNAME_OFFSET, ROUTE_NICKNAME_CHARS)
 
+    unlock_state_before = build_course_unlock_state(
+        eeprom,
+        existing_flags=existing_course_flags,
+        assume_national_dex=assume_national_dex,
+        unlock_special_courses=unlock_special_courses,
+        unlock_event_courses=unlock_event_courses,
+    )
+
     step_result = add_walked_steps(eeprom, added_steps)
     if bonus_watts_u16 > 0:
         set_watts(eeprom, min(0xFFFF, read_current_watts(eeprom) + bonus_watts_u16))
+
+    unlock_state_after = build_course_unlock_state(
+        eeprom,
+        existing_flags=existing_course_flags,
+        assume_national_dex=assume_national_dex,
+        unlock_special_courses=unlock_special_courses,
+        unlock_event_courses=unlock_event_courses,
+    )
+    unlocked_before = {
+        int(course_id)
+        for course_id in unlock_state_before.get("unlockedCourses", [])
+        if isinstance(course_id, int)
+    }
+    unlocked_after = {
+        int(course_id)
+        for course_id in unlock_state_after.get("unlockedCourses", [])
+        if isinstance(course_id, int)
+    }
+    newly_unlocked = sorted(unlocked_after - unlocked_before)
 
     capture_requests: list[dict[str, Any]] = []
     if capture_species_ids is not None:
@@ -1766,14 +2086,18 @@ def return_pokemon_from_stroll(
             )
 
     if gained_exp is None:
-        exp_gain = max(1, (added_steps // 2) + len(captures_applied) * 40)
+        exp_gain_requested = added_steps
     else:
-        exp_gain = _validate_u32("gainedExp", gained_exp)
+        exp_gain_requested = _validate_u32("gainedExp", gained_exp)
 
     growth = _species_growth_rate(walking_species)
     start_exp = _exp_threshold(start_level, growth)
-    max_exp = _exp_threshold(100, growth)
-    end_exp = min(max_exp, start_exp + exp_gain)
+    if start_level >= 100:
+        exp_cap = start_exp
+    else:
+        exp_cap = _exp_threshold(start_level + 1, growth)
+    exp_gain_applied = min(exp_gain_requested, max(0, exp_cap - start_exp))
+    end_exp = start_exp + exp_gain_applied
     end_level = _level_from_exp(end_exp, growth)
 
     friendship_after = min(0xFF, friendship_before + added_steps)
@@ -1824,7 +2148,7 @@ def return_pokemon_from_stroll(
     console_log = [
         (
             f"[RETURN] {_species_name(walking_species)} Lv{start_level} -> Lv{end_level} "
-            f"(+{exp_gain} EXP, +{added_steps} steps, +{total_watts_gain} watts)"
+            f"(+{exp_gain_applied} EXP, +{added_steps} steps, +{total_watts_gain} watts)"
         )
     ]
     for capture in captures_applied:
@@ -1849,7 +2173,10 @@ def return_pokemon_from_stroll(
             "startLevel": start_level,
             "endLevel": end_level,
             "growthRate": growth,
-            "expGain": exp_gain,
+            "expGain": exp_gain_applied,
+            "expGainRequested": exp_gain_requested,
+            "expGainApplied": exp_gain_applied,
+            "expCap": exp_cap,
             "startExp": start_exp,
             "endExp": end_exp,
             "friendshipBefore": friendship_before,
@@ -1864,6 +2191,12 @@ def return_pokemon_from_stroll(
             "bonus": bonus_watts_u16,
             "totalGained": total_watts_gain,
             "current": read_current_watts(eeprom),
+        },
+        "courseUnlocks": {
+            "before": unlock_state_before,
+            "after": unlock_state_after,
+            "newlyUnlockedCourses": newly_unlocked,
+            "newlyUnlockedCourseNames": [COURSE_NAMES[course_id] for course_id in newly_unlocked],
         },
         "captures": {
             "requested": len(capture_requests),
@@ -2288,7 +2621,7 @@ def return_from_stroll(
     added_steps = _validate_u32("walkedSteps", walked_steps)
     exp_source_steps = added_steps if exp_steps is None else _validate_u32("expSteps", exp_steps)
     route_index = eeprom[ROUTE_IMAGE_INDEX_OFFSET]
-    walker_friendship = eeprom[ROUTE_FRIENDSHIP_OFFSET]
+    friendship_before = int(eeprom[ROUTE_FRIENDSHIP_OFFSET])
     walker_nickname = _read_device_text_fixed(eeprom, ROUTE_NICKNAME_OFFSET, ROUTE_NICKNAME_CHARS)
 
     step_result = add_walked_steps(eeprom, added_steps)
@@ -2296,9 +2629,16 @@ def return_from_stroll(
     growth = _species_growth_rate(species_id)
     start_level = max(1, min(int(walking["level"]), 100))
     start_exp = _exp_threshold(start_level, growth)
-    gained_exp = int(exp_source_steps)
+    if start_level >= 100:
+        exp_cap = start_exp
+    else:
+        exp_cap = _exp_threshold(start_level + 1, growth)
+    gained_exp_requested = int(exp_source_steps)
+    gained_exp = min(gained_exp_requested, max(0, exp_cap - start_exp))
     final_exp = start_exp + gained_exp
     final_level = _level_from_exp(final_exp, growth)
+    friendship_after = min(0xFF, friendship_before + added_steps)
+    eeprom[ROUTE_FRIENDSHIP_OFFSET] = friendship_after
 
     rng_seed = int(seed) if seed is not None else int(time.time())
     rng = random.Random(rng_seed)
@@ -2358,7 +2698,7 @@ def return_from_stroll(
                     "walkingSpecies": species_id,
                     "caughtSpecies": int(capture["pokemon"]["speciesId"]),
                     "routeImageIndex": route_index,
-                    "friendship": walker_friendship,
+                    "friendship": friendship_after,
                     "stepCount": read_steps(eeprom),
                     "watts": read_current_watts(eeprom),
                     "pokeNick": walker_nickname,
@@ -2376,7 +2716,7 @@ def return_from_stroll(
                 "walkingSpecies": species_id,
                 "caughtSpecies": 0,
                 "routeImageIndex": route_index,
-                "friendship": walker_friendship,
+                "friendship": friendship_after,
                 "stepCount": read_steps(eeprom),
                 "watts": read_current_watts(eeprom),
                 "pokeNick": walker_nickname,
@@ -2399,10 +2739,14 @@ def return_from_stroll(
             "speciesId": species_id,
             "speciesName": _species_name(species_id),
             "nickname": walker_nickname,
-            "friendship": walker_friendship,
+            "friendshipBefore": friendship_before,
+            "friendshipAfter": friendship_after,
             "startLevel": start_level,
             "finalLevel": final_level,
             "expGained": gained_exp,
+            "expGainedRequested": gained_exp_requested,
+            "expGainedApplied": gained_exp,
+            "expCap": exp_cap,
             "startExp": start_exp,
             "finalExp": final_exp,
             "growthRate": growth,
@@ -2461,6 +2805,7 @@ def stroll_report(eeprom: bytearray) -> dict[str, Any]:
 def read_routes_section(eeprom: bytearray) -> Dict[str, Any]:
     _check_size(eeprom)
     route_index = eeprom[ROUTE_IMAGE_INDEX_OFFSET]
+    unlocks = build_course_unlock_state(eeprom)
     return {
         "routeInfoOffset": ROUTE_INFO_OFFSET,
         "routeInfoSize": ROUTE_INFO_SIZE,
@@ -2469,6 +2814,8 @@ def read_routes_section(eeprom: bytearray) -> Dict[str, Any]:
         "routeImageIndex": route_index,
         "routeCourseName": COURSE_NAMES[route_index] if 0 <= route_index < len(COURSE_NAMES) else None,
         "routeName": _read_device_text_fixed(eeprom, ROUTE_NAME_OFFSET, ROUTE_NAME_CHARS),
+        "routeCourseUnlocked": route_index in [int(value) for value in unlocks.get("unlockedCourses", [])],
+        "courseUnlocks": unlocks,
         "routeSlots": _read_route_slots(eeprom),
         "routeInfoPreviewHex": eeprom[
             ROUTE_INFO_OFFSET : ROUTE_INFO_OFFSET + min(64, ROUTE_INFO_SIZE)

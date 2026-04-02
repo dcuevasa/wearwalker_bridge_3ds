@@ -33,6 +33,10 @@ HGSS_WALKER_PAIR_SIZE = 136
 HGSS_WALKER_INFO_OFFSET = 0xE704
 HGSS_WALKER_COURSE_FLAG_COUNT = 32
 
+# The game stores an extra u16 counter immediately before the public
+# steps/watts/courseFlags Pokewalker fields.
+HGSS_WALKER_TRIP_COUNTER_OFFSET = HGSS_WALKER_INFO_OFFSET - 0x4
+
 HGSS_WALKER_STEPS_OFFSET = HGSS_WALKER_INFO_OFFSET
 HGSS_WALKER_WATTS_OFFSET = HGSS_WALKER_INFO_OFFSET + 0x4
 HGSS_WALKER_COURSE_FLAGS_OFFSET = HGSS_WALKER_INFO_OFFSET + 0x8
@@ -78,6 +82,10 @@ LOCATION_LINK_TRADE_4 = 2002
 LOCATION_DAYCARE_4 = 2000
 LOCATION_FARAWAY_4 = 3002
 LOCATION_HATCH_HGSS = 182
+LOCATION_POKEWALKER_4 = 233
+
+POKEWALKER_STROLL_SEED_MOD = 24 * 60 * 60
+POKEWALKER_MAX_PRIOR_POKES = (HGSS_BOX_COUNT * HGSS_BOX_SLOTS) - 1
 
 BALL_POKE = 4
 SPECIES_HO_OH = 250
@@ -87,6 +95,16 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 MONOREPO_ROOT = SCRIPT_DIR.parent.parent
 PKHEX_PERSONAL_HGSS_PATH = (
     MONOREPO_ROOT / "pkhex" / "PKHeX.Core" / "Resources" / "byte" / "personal" / "personal_hgss"
+)
+PKHEX_WALKER_ENCOUNTER_PATH = (
+    MONOREPO_ROOT
+    / "pkhex"
+    / "PKHeX.Core"
+    / "Resources"
+    / "legality"
+    / "wild"
+    / "Gen4"
+    / "encounter_walker4.pkl"
 )
 
 _BLOCK_POSITION = (
@@ -255,6 +273,10 @@ def _species_growth_rate(species_id: int) -> int:
     return _personal_entry(species_id)[0x13]
 
 
+def _species_base_friendship(species_id: int) -> int:
+    return _personal_entry(species_id)[0x14]
+
+
 def _species_gender_ratio(species_id: int) -> int:
     return _personal_entry(species_id)[0x10]
 
@@ -262,6 +284,80 @@ def _species_gender_ratio(species_id: int) -> int:
 def _species_ability_ids(species_id: int) -> tuple[int, int]:
     entry = _personal_entry(species_id)
     return entry[0x16], entry[0x17]
+
+
+@lru_cache(maxsize=1)
+def _load_pokewalker_encounter_table() -> tuple[dict[str, Any], ...]:
+    if not PKHEX_WALKER_ENCOUNTER_PATH.exists():
+        return tuple()
+
+    payload = PKHEX_WALKER_ENCOUNTER_PATH.read_bytes()
+    slot_size = 0x0C
+    if len(payload) % slot_size != 0:
+        return tuple()
+
+    entries: list[dict[str, Any]] = []
+    for index in range(len(payload) // slot_size):
+        offset = index * slot_size
+        species_id = payload[offset] | (payload[offset + 1] << 8)
+        level = payload[offset + 2]
+        gender = payload[offset + 3]
+        moves = [
+            payload[offset + 4] | (payload[offset + 5] << 8),
+            payload[offset + 6] | (payload[offset + 7] << 8),
+            payload[offset + 8] | (payload[offset + 9] << 8),
+            payload[offset + 10] | (payload[offset + 11] << 8),
+        ]
+        entries.append(
+            {
+                "speciesId": species_id,
+                "level": level,
+                "gender": gender,
+                "moves": moves,
+            }
+        )
+    return tuple(entries)
+
+
+def _pick_pokewalker_template(
+    *,
+    species_id: int,
+    level_hint: int,
+    moves_hint: list[int],
+    preferred_gender: int,
+) -> dict[str, Any] | None:
+    entries = [
+        entry
+        for entry in _load_pokewalker_encounter_table()
+        if int(entry.get("speciesId", 0)) == int(species_id)
+    ]
+    if not entries:
+        return None
+
+    hinted_moves = [0, 0, 0, 0]
+    for index, move in enumerate(moves_hint[:4]):
+        hinted_moves[index] = int(move)
+    has_hint_moves = any(move != 0 for move in hinted_moves)
+
+    def _score(entry: dict[str, Any]) -> tuple[int, int, int]:
+        score = 0
+        entry_level = int(entry.get("level", 0))
+        entry_gender = int(entry.get("gender", 0))
+        entry_moves = [int(move) for move in list(entry.get("moves", [0, 0, 0, 0]))[:4]]
+
+        if level_hint > 0 and entry_level == level_hint:
+            score += 10
+        if preferred_gender in (0, 1, 2) and entry_gender == preferred_gender:
+            score += 6
+        if has_hint_moves:
+            if entry_moves == hinted_moves:
+                score += 4
+            elif hinted_moves[0] != 0 and entry_moves[0] == hinted_moves[0]:
+                score += 1
+
+        return score, -abs(entry_level - max(1, level_hint)), -entries.index(entry)
+
+    return max(entries, key=_score)
 
 
 def _exp_for_level(level: int, growth: int) -> int:
@@ -434,6 +530,59 @@ def _gender_from_pid_and_ratio(pid: int, ratio: int) -> int:
     if ratio == 0x00:
         return 0  # male only
     return 1 if (pid & 0xFF) < ratio else 0
+
+
+def _pokewalker_pid(*, id32: int, nature: int, gender: int, gender_ratio: int) -> int:
+    tid16 = int(id32) & 0xFFFF
+    sid16 = (int(id32) >> 16) & 0xFFFF
+    local_nature = int(nature) % 24
+
+    # Mirrors PKHeX PokewalkerRNG.GetPID: force non-shiny top byte, then fit nature/gender.
+    pid = ((((tid16 ^ sid16) >> 8) ^ 0xFF) << 24) & 0xFFFFFFFF
+    pid = (pid + local_nature - (pid % 25)) & 0xFFFFFFFF
+
+    if gender_ratio == 0x00 or gender_ratio >= 0xFE:
+        return pid
+
+    pid_gender = 1 if (pid & 0xFF) < gender_ratio else 0
+    if int(gender) == pid_gender:
+        return pid
+
+    if int(gender) == 0:
+        pid = (pid + ((((gender_ratio - (pid & 0xFF)) // 25) + 1) * 25)) & 0xFFFFFFFF
+        if (local_nature & 1) != (pid & 1):
+            pid = (pid + 25) & 0xFFFFFFFF
+    else:
+        pid = (pid - (((((pid & 0xFF) - gender_ratio) // 25) + 1) * 25)) & 0xFFFFFFFF
+        if (local_nature & 1) != (pid & 1):
+            pid = (pid - 25) & 0xFFFFFFFF
+    return pid & 0xFFFFFFFF
+
+
+def _pokewalker_ivs_from_stroll_seed(seed: int, prior_pokes: int, *, is_nicknamed: bool) -> int:
+    state = int(seed) % POKEWALKER_STROLL_SEED_MOD
+    for _ in range(3):  # slot A/B/C pre-roll on stroll initialization
+        state = _lcrng_next(state)
+
+    advances = max(0, min(int(prior_pokes), POKEWALKER_MAX_PRIOR_POKES)) * 2
+    for _ in range(advances):
+        state = _lcrng_next(state)
+
+    state = _lcrng_next(state)
+    first = (state >> 16) & 0xFFFF
+    state = _lcrng_next(state)
+    second = (state >> 16) & 0xFFFF
+
+    return _pk4_pack_iv32(
+        first & 0x1F,
+        (first >> 5) & 0x1F,
+        (first >> 10) & 0x1F,
+        second & 0x1F,
+        (second >> 5) & 0x1F,
+        (second >> 10) & 0x1F,
+        is_egg=False,
+        is_nicknamed=is_nicknamed,
+    )
 
 
 def _g4_char_to_value(char: str) -> int:
@@ -645,88 +794,138 @@ class HGSSSave:
             "language": self._data[trainer_offset + HGSS_TRAINER_LANGUAGE_REL],
         }
 
-    def _build_hatched_pidgey_pk4(self, *, version: int, trainer: dict[str, Any], seed: int) -> bytearray:
-        rng = random.Random(seed)
-        pid = rng.getrandbits(32)
+    def _build_pokewalker_capture_pk4(
+        self,
+        *,
+        version: int,
+        trainer: dict[str, Any],
+        capture_summary: dict[str, Any],
+        seed: int,
+    ) -> bytearray:
+        species_id = _validate_u16("captureSpeciesId", int(capture_summary.get("speciesId", 0)))
+        if species_id == 0:
+            raise ValueError("capture summary speciesId cannot be 0")
 
-        ability1, ability2 = _species_ability_ids(SPECIES_PIDGEY)
-        growth = _species_growth_rate(SPECIES_PIDGEY)
-        gender_ratio = _species_gender_ratio(SPECIES_PIDGEY)
+        level_raw = int(capture_summary.get("level", 0))
+        level = max(1, min(level_raw if level_raw > 0 else 10, 100))
 
-        ivs = [rng.randint(0, 31) for _ in range(6)]
-        for idx in rng.sample(range(6), k=3):
-            ivs[idx] = 31
-        iv32 = _pk4_pack_iv32(
-            ivs[0],
-            ivs[1],
-            ivs[2],
-            ivs[3],
-            ivs[4],
-            ivs[5],
-            is_egg=False,
-            is_nicknamed=False,
+        raw_moves = capture_summary.get("moves", [0, 0, 0, 0])
+        if not isinstance(raw_moves, list):
+            raise ValueError("capture summary moves must be a list")
+        moves = [0, 0, 0, 0]
+        for index, value in enumerate(raw_moves[:4]):
+            moves[index] = _validate_u16(f"captureMoves[{index}]", int(value))
+        if moves[0] == 0:
+            moves[0] = 33  # fallback to a legal low-level move when summary is sparse
+
+        variant_flags = _validate_u8("captureVariantFlags", int(capture_summary.get("variantFlags", 0)))
+        special_flags = _validate_u8("captureSpecialFlags", int(capture_summary.get("specialFlags", 0)))
+        if (special_flags & 0x02) != 0:
+            raise ValueError("Pokewalker capture summary cannot be shiny (specialFlags bit1 set)")
+
+        source_seed = int(seed) & 0xFFFFFFFF
+        stroll_seed = source_seed % POKEWALKER_STROLL_SEED_MOD
+        prior_pokes = ((source_seed >> 16) & 0xFFFF) % (POKEWALKER_MAX_PRIOR_POKES + 1)
+        nature = (source_seed >> 8) % 24
+
+        gender_ratio = _species_gender_ratio(species_id)
+        preferred_gender = 1 if (variant_flags & 0x20) != 0 else 0
+        encounter_template = _pick_pokewalker_template(
+            species_id=species_id,
+            level_hint=level,
+            moves_hint=moves,
+            preferred_gender=preferred_gender,
         )
+        if encounter_template is not None:
+            level = max(1, min(int(encounter_template.get("level", level)), 100))
+            template_moves = list(encounter_template.get("moves", [0, 0, 0, 0]))
+            for index, move in enumerate(template_moves[:4]):
+                moves[index] = _validate_u16(f"templateMoves[{index}]", int(move))
+            template_gender = int(encounter_template.get("gender", preferred_gender))
+        else:
+            template_gender = preferred_gender
 
+        if gender_ratio == 0xFF:
+            desired_gender = 2
+        elif gender_ratio == 0xFE:
+            desired_gender = 1
+        elif gender_ratio == 0x00:
+            desired_gender = 0
+        elif template_gender in (0, 1):
+            desired_gender = template_gender
+        else:
+            desired_gender = preferred_gender
+
+        pid = _pokewalker_pid(
+            id32=int(trainer["id32"]),
+            nature=nature,
+            gender=desired_gender,
+            gender_ratio=gender_ratio,
+        )
         gender = _gender_from_pid_and_ratio(pid, gender_ratio)
+
+        ability1, ability2 = _species_ability_ids(species_id)
         ability = ability1
         if ability2 != ability1 and (pid & 1) == 1:
             ability = ability2
 
-        exp = _exp_threshold(1, growth)
+        is_nicknamed = False
+        iv32 = _pokewalker_ivs_from_stroll_seed(
+            stroll_seed,
+            prior_pokes,
+            is_nicknamed=is_nicknamed,
+        )
+
+        growth = _species_growth_rate(species_id)
+        exp = _exp_threshold(level, growth)
+        friendship = _validate_u8("friendship", _species_base_friendship(species_id))
         year, month, day = _pk4_today_triplet()
+
+        species_name = str(capture_summary.get("speciesName", "PIDGEY")).strip().upper() or "PIDGEY"
 
         pk = bytearray(HGSS_BOX_SLOT_SIZE)
         _write_u32_le(pk, PK4_OFFSET_PID, pid)
         _write_u16_le(pk, PK4_OFFSET_SANITY, 0)
         _write_u16_le(pk, PK4_OFFSET_CHECKSUM, 0)
-        _write_u16_le(pk, PK4_OFFSET_SPECIES, SPECIES_PIDGEY)
+        _write_u16_le(pk, PK4_OFFSET_SPECIES, species_id)
         _write_u32_le(pk, PK4_OFFSET_ID32, int(trainer["id32"]))
         _write_u32_le(pk, PK4_OFFSET_EXP, exp)
 
+        pk[0x14] = friendship
         pk[PK4_OFFSET_ABILITY] = _validate_u8("ability", ability)
         pk[PK4_OFFSET_LANGUAGE] = _validate_u8("language", int(trainer["language"]))
         _write_u32_le(pk, PK4_OFFSET_IV32, iv32)
 
-        flags = pk[PK4_OFFSET_FLAGS] & 0x01  # preserve fateful bit (default 0)
-        flags &= 0x01
+        flags = pk[PK4_OFFSET_FLAGS] & 0x01
         flags |= (gender & 0x03) << 1
         pk[PK4_OFFSET_FLAGS] = flags
 
         _write_u16_le(pk, PK4_OFFSET_EGG_LOCATION_EXT, 0)
-        _write_u16_le(pk, PK4_OFFSET_MET_LOCATION_EXT, LOCATION_HATCH_HGSS)
+        _write_u16_le(pk, PK4_OFFSET_MET_LOCATION_EXT, LOCATION_POKEWALKER_4)
 
-        pk[PK4_OFFSET_NICKNAME : PK4_OFFSET_NICKNAME + 22] = _encode_g4_string("PIDGEY", 11)
+        pk[PK4_OFFSET_NICKNAME : PK4_OFFSET_NICKNAME + 22] = _encode_g4_string(species_name, 11)
         pk[PK4_OFFSET_VERSION] = _validate_u8("version", version)
         pk[PK4_OFFSET_OT_NAME : PK4_OFFSET_OT_NAME + HGSS_TRAINER_NAME_SIZE] = trainer["ot_name_raw"]
 
-        pk[PK4_OFFSET_EGG_DATE + 0] = _validate_u8("eggYear", year)
-        pk[PK4_OFFSET_EGG_DATE + 1] = _validate_u8("eggMonth", month)
-        pk[PK4_OFFSET_EGG_DATE + 2] = _validate_u8("eggDay", day)
+        pk[PK4_OFFSET_EGG_DATE + 0] = 0
+        pk[PK4_OFFSET_EGG_DATE + 1] = 0
+        pk[PK4_OFFSET_EGG_DATE + 2] = 0
         pk[PK4_OFFSET_MET_DATE + 0] = _validate_u8("metYear", year)
         pk[PK4_OFFSET_MET_DATE + 1] = _validate_u8("metMonth", month)
         pk[PK4_OFFSET_MET_DATE + 2] = _validate_u8("metDay", day)
 
-        _write_u16_le(pk, PK4_OFFSET_EGG_LOCATION_DP, LOCATION_DAYCARE_4)
-        _write_u16_le(pk, PK4_OFFSET_MET_LOCATION_DP, LOCATION_FARAWAY_4)
+        _write_u16_le(pk, PK4_OFFSET_EGG_LOCATION_DP, 0)
+        _write_u16_le(pk, PK4_OFFSET_MET_LOCATION_DP, LOCATION_POKEWALKER_4)
 
         pk[PK4_OFFSET_POKERUS] = 0
         pk[PK4_OFFSET_BALL_DPPT] = BALL_POKE
-        pk[PK4_OFFSET_MET_LEVEL_OTG] = ((int(trainer["ot_gender"]) & 0x1) << 7)
+        pk[PK4_OFFSET_MET_LEVEL_OTG] = (level & 0x7F) | ((int(trainer["ot_gender"]) & 0x1) << 7)
         pk[PK4_OFFSET_BALL_HGSS] = BALL_POKE
         pk[PK4_OFFSET_WALKING_MOOD] = 0
 
-        # EncounterEgg4 sets base friendship 120 and random PID/IVs.
-        pk[0x14] = 120
-
-        # Provide a minimal legal level-up move set for level 1 Pidgey.
-        _write_u16_le(pk, 0x28, 33)  # Tackle
-        _write_u16_le(pk, 0x2A, 0)
-        _write_u16_le(pk, 0x2C, 0)
-        _write_u16_le(pk, 0x2E, 0)
-        pk[0x30] = 35
-        pk[0x31] = 0
-        pk[0x32] = 0
-        pk[0x33] = 0
+        for index, move in enumerate(moves):
+            _write_u16_le(pk, 0x28 + index * 2, move)
+            pk[0x30 + index] = 5 if move != 0 else 0
         pk[0x34] = 0
         pk[0x35] = 0
         pk[0x36] = 0
@@ -741,17 +940,21 @@ class HGSSSave:
         source_slot_number: int,
         source_species: int = SPECIES_HO_OH,
         extra_species: int = SPECIES_PIDGEY,
-        level_gain: int = 1,
+        walked_steps: int = 0,
         target_slot_number: int | None = None,
+        extra_capture_summary: dict[str, Any] | None = None,
         seed: int | None = None,
+        pokewalker_steps: int | None = None,
+        pokewalker_watts: int | None = None,
+        pokewalker_course_flags: int | None = None,
+        increment_pokewalker_trip_counter: bool = False,
     ) -> dict[str, Any]:
         if extra_species != SPECIES_PIDGEY:
             raise ValueError("Only Pidgey (species 16) is supported by this scenario helper")
 
         box_index = int(box_number) - 1
         source_slot_index = int(source_slot_number) - 1
-        if int(level_gain) != 1:
-            raise ValueError("This scenario requires level_gain = 1")
+        walked_steps_u32 = _validate_u32("walkedSteps", walked_steps)
 
         _, source_raw_before, source_dec = self._read_box_slot_decrypted(box_index, source_slot_index)
         source_species_actual = _read_u16_le(source_dec, PK4_OFFSET_SPECIES)
@@ -763,12 +966,22 @@ class HGSSSave:
         growth = _species_growth_rate(source_species_actual)
         exp_before = _read_u32_le(source_dec, PK4_OFFSET_EXP)
         level_before = _level_from_exp(exp_before, growth)
-        if level_before >= 100:
-            raise ValueError("Source Pokemon is already level 100")
 
-        level_after = level_before + 1
-        exp_after = _exp_threshold(level_after, growth)
+        if level_before >= 100:
+            exp_cap = exp_before
+        else:
+            exp_cap = _exp_threshold(level_before + 1, growth)
+
+        exp_gain_requested = walked_steps_u32
+        exp_gain_applied = min(exp_gain_requested, max(0, exp_cap - exp_before))
+        exp_after = exp_before + exp_gain_applied
+        level_after = _level_from_exp(exp_after, growth)
+
+        friendship_before = int(source_dec[0x14])
+        friendship_after = min(0xFF, friendship_before + walked_steps_u32)
+
         _write_u32_le(source_dec, PK4_OFFSET_EXP, exp_after)
+        source_dec[0x14] = friendship_after
         self._write_box_slot_decrypted(box_index, source_slot_index, source_dec)
 
         if target_slot_number is None:
@@ -790,12 +1003,45 @@ class HGSSSave:
         trainer_ctx = self._get_trainer_context()
         version = int(source_dec[PK4_OFFSET_VERSION])
         rng_seed = int(seed) if seed is not None else random.SystemRandom().getrandbits(32)
-        pidgey_dec = self._build_hatched_pidgey_pk4(
+
+        capture_summary = dict(extra_capture_summary or {})
+        if not capture_summary:
+            capture_summary = {
+                "speciesId": extra_species,
+                "speciesName": "PIDGEY",
+                "level": 10,
+                "moves": [33, 0, 0, 0],
+                "variantFlags": 0,
+                "specialFlags": 0,
+            }
+
+        capture_species = _validate_u16("captureSpeciesId", int(capture_summary.get("speciesId", 0)))
+        if capture_species != int(extra_species):
+            raise ValueError(
+                f"EEPROM capture species mismatch: expected {extra_species}, got {capture_species}"
+            )
+
+        pidgey_dec = self._build_pokewalker_capture_pk4(
             version=version,
             trainer=trainer_ctx,
+            capture_summary=capture_summary,
             seed=rng_seed,
         )
         self._write_box_slot_decrypted(box_index, target_slot_index, pidgey_dec)
+
+        pokewalker_patch: dict[str, Any] | None = None
+        if (
+            pokewalker_steps is not None
+            or pokewalker_watts is not None
+            or pokewalker_course_flags is not None
+            or increment_pokewalker_trip_counter
+        ):
+            pokewalker_patch = self.patch_pokewalker(
+                steps=pokewalker_steps,
+                watts=pokewalker_watts,
+                course_flags=pokewalker_course_flags,
+                increment_trip_counter=increment_pokewalker_trip_counter,
+            )
 
         _, source_raw_after, source_dec_after = self._read_box_slot_decrypted(box_index, source_slot_index)
         _, target_raw_after, target_dec_after = self._read_box_slot_decrypted(box_index, target_slot_index)
@@ -808,10 +1054,16 @@ class HGSSSave:
                 "slot": source_slot_number,
                 "speciesBefore": source_species_actual,
                 "speciesAfter": _read_u16_le(source_dec_after, PK4_OFFSET_SPECIES),
+                "walkedSteps": walked_steps_u32,
                 "levelBefore": level_before,
                 "levelAfter": level_after,
                 "expBefore": exp_before,
                 "expAfter": exp_after,
+                "expGainRequested": exp_gain_requested,
+                "expGainApplied": exp_gain_applied,
+                "expCap": exp_cap,
+                "friendshipBefore": friendship_before,
+                "friendshipAfter": friendship_after,
                 "changedBytesInSlot": sum(1 for a, b in zip(source_raw_before, source_raw_after) if a != b),
             },
             "extra": {
@@ -819,6 +1071,18 @@ class HGSSSave:
                 "speciesBefore": _read_u16_le(target_dec_before, PK4_OFFSET_SPECIES),
                 "speciesAfter": _read_u16_le(target_dec_after, PK4_OFFSET_SPECIES),
                 "expectedSpecies": extra_species,
+                "captureLevel": int(capture_summary.get("level", 0)),
+                "captureMoves": [
+                    int(value)
+                    for value in (capture_summary.get("moves", [0, 0, 0, 0]) if isinstance(capture_summary.get("moves", [0, 0, 0, 0]), list) else [0, 0, 0, 0])[:4]
+                ],
+                "captureVariantFlags": int(capture_summary.get("variantFlags", 0)),
+                "captureSpecialFlags": int(capture_summary.get("specialFlags", 0)),
+                "generatedMetLevel": int(target_dec_after[PK4_OFFSET_MET_LEVEL_OTG] & 0x7F),
+                "generatedMoves": [
+                    _read_u16_le(target_dec_after, 0x28 + index * 2)
+                    for index in range(4)
+                ],
                 "changedBytesInSlot": sum(1 for a, b in zip(target_raw_before, target_raw_after) if a != b),
                 "isEmptyBefore": _read_u16_le(target_dec_before, PK4_OFFSET_SPECIES) == 0,
             },
@@ -827,6 +1091,7 @@ class HGSSSave:
                 "sourceSlot": source_slot_number,
                 "targetSlot": target_slot_index + 1,
             },
+            "pokewalkerPatch": pokewalker_patch,
         }
 
     def _read_general_u32(self, relative_offset: int) -> int:
@@ -843,6 +1108,7 @@ class HGSSSave:
         )
 
         return {
+            "tripCounter": _read_u16_le(general, HGSS_WALKER_TRIP_COUNTER_OFFSET),
             "steps": self._read_general_u32(HGSS_WALKER_STEPS_OFFSET),
             "watts": self._read_general_u32(HGSS_WALKER_WATTS_OFFSET),
             "courseFlags": f"0x{course_flags:08X}",
@@ -858,8 +1124,9 @@ class HGSSSave:
         steps: int | None = None,
         watts: int | None = None,
         course_flags: int | None = None,
+        increment_trip_counter: bool = False,
     ) -> dict[str, Any]:
-        if steps is None and watts is None and course_flags is None:
+        if steps is None and watts is None and course_flags is None and not increment_trip_counter:
             raise ValueError("Provide at least one patch value")
 
         before = self.get_pokewalker_state()
@@ -873,12 +1140,20 @@ class HGSSSave:
                 HGSS_WALKER_COURSE_FLAGS_OFFSET,
                 _validate_u32("course_flags", course_flags),
             )
+        if increment_trip_counter:
+            current = _read_u16_le(self._data, self.general_offset + HGSS_WALKER_TRIP_COUNTER_OFFSET)
+            _write_u16_le(
+                self._data,
+                self.general_offset + HGSS_WALKER_TRIP_COUNTER_OFFSET,
+                (current + 1) & 0xFFFF,
+            )
 
         after = self.get_pokewalker_state()
         return {
             "before": before,
             "after": after,
             "changed": {
+                "tripCounter": before["tripCounter"] != after["tripCounter"],
                 "steps": before["steps"] != after["steps"],
                 "watts": before["watts"] != after["watts"],
                 "courseFlags": before["courseFlags"] != after["courseFlags"],
@@ -964,8 +1239,13 @@ def apply_hgss_stroll_box_return(
     target_slot_number: int | None = None,
     source_species: int = SPECIES_HO_OH,
     extra_species: int = SPECIES_PIDGEY,
-    level_gain: int = 1,
+    walked_steps: int = 0,
+    extra_capture_summary: dict[str, Any] | None = None,
     seed: int | None = None,
+    pokewalker_steps: int | None = None,
+    pokewalker_watts: int | None = None,
+    pokewalker_course_flags: int | None = None,
+    increment_pokewalker_trip_counter: bool = False,
 ) -> tuple[dict[str, Any], bytes]:
     save = HGSSSave.from_file(path)
     result = save.apply_stroll_box_return_scenario(
@@ -973,9 +1253,14 @@ def apply_hgss_stroll_box_return(
         source_slot_number=source_slot_number,
         source_species=source_species,
         extra_species=extra_species,
-        level_gain=level_gain,
+        walked_steps=walked_steps,
         target_slot_number=target_slot_number,
+        extra_capture_summary=extra_capture_summary,
         seed=seed,
+        pokewalker_steps=pokewalker_steps,
+        pokewalker_watts=pokewalker_watts,
+        pokewalker_course_flags=pokewalker_course_flags,
+        increment_pokewalker_trip_counter=increment_pokewalker_trip_counter,
     )
     save.resign_active_blocks(include_storage=True)
     return result, save.to_bytes()

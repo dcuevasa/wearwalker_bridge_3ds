@@ -17,16 +17,22 @@ from eeprom_common import (
     add_walked_steps,
     apply_semantic_operations,
     apply_sync_package,
+    append_journal_event,
+    build_course_unlock_state,
     build_sync_package,
     clear_journal,
     clear_stroll_buffers,
     EEPROM_SIZE,
+    EVENT_TYPE_STROLL_CAPTURE,
+    EVENT_TYPE_STROLL_RETURN,
     load_eeprom,
+    read_current_watts,
     read_all_domains,
     read_identity_section,
     read_inventory_section,
     read_journal_section,
     read_routes_section,
+    read_steps,
     read_snapshot,
     read_stats_section,
     read_stroll_section,
@@ -707,6 +713,10 @@ def cmd_stroll_send(args: argparse.Namespace) -> int:
         "variantFlags": args.variant_flags,
         "specialFlags": args.special_flags,
         "clearBuffers": args.clear_buffers,
+        "allowLockedCourse": args.allow_locked_course,
+        "assumeNationalDex": not args.no_national_dex,
+        "unlockSpecialCourses": args.unlock_special_courses,
+        "unlockEventCourses": args.unlock_event_courses,
     }
 
     if args.course_id is not None:
@@ -743,6 +753,10 @@ def cmd_stroll_send(args: argparse.Namespace) -> int:
         special_flags=args.special_flags,
         seed=args.seed,
         clear_buffers=args.clear_buffers,
+        allow_locked_course=args.allow_locked_course,
+        assume_national_dex=not args.no_national_dex,
+        unlock_special_courses=args.unlock_special_courses,
+        unlock_event_courses=args.unlock_event_courses,
     )
     save_target_eeprom(args, eeprom)
     print_json({"status": "ok", **result})
@@ -861,6 +875,74 @@ def cmd_hgss_diff(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_capture_summary_from_eeprom(
+    *,
+    eeprom: bytearray,
+    expected_species: int,
+    caught_slot: int | None,
+) -> dict[str, Any]:
+    inventory = read_inventory_section(eeprom)
+    caught = inventory.get("caught", [])
+    if not isinstance(caught, list) or len(caught) == 0:
+        raise ValueError("EEPROM inventory.caught is unavailable or invalid")
+
+    chosen: dict[str, Any] | None = None
+    if caught_slot is not None:
+        slot = int(caught_slot)
+        if slot < 0 or slot >= len(caught):
+            raise ValueError(f"caught slot out of range (0..{len(caught) - 1}): {slot}")
+        chosen = dict(caught[slot])
+        if int(chosen.get("speciesId", 0)) == 0:
+            raise ValueError(f"caught slot {slot} is empty in EEPROM")
+    else:
+        for entry in caught:
+            if int(entry.get("speciesId", 0)) == int(expected_species):
+                chosen = dict(entry)
+                break
+        if chosen is None:
+            for entry in caught:
+                if int(entry.get("speciesId", 0)) != 0:
+                    chosen = dict(entry)
+                    break
+
+    if chosen is None:
+        raise ValueError("No captured Pokemon available in EEPROM caught slots")
+
+    species_id = int(chosen.get("speciesId", 0))
+    if species_id != int(expected_species):
+        raise ValueError(
+            f"EEPROM caught species mismatch: expected {expected_species}, got {species_id}"
+        )
+
+    raw_moves = chosen.get("moves", [0, 0, 0, 0])
+    if not isinstance(raw_moves, list):
+        raise ValueError("EEPROM caught moves field must be a list")
+    moves = [0, 0, 0, 0]
+    for index, value in enumerate(raw_moves[:4]):
+        moves[index] = int(value)
+
+    level = int(chosen.get("level", 0))
+    if level <= 0:
+        level = 10
+
+    return {
+        "slot": int(chosen.get("slot", -1)),
+        "speciesId": species_id,
+        "speciesName": str(chosen.get("speciesName", "PIDGEY")),
+        "level": level,
+        "moves": moves,
+        "variantFlags": int(chosen.get("variantFlags", 0)),
+        "specialFlags": int(chosen.get("specialFlags", 0)),
+        "rawHex": str(chosen.get("rawHex", "")),
+    }
+
+
+def _parse_u32_like(value: Any) -> int:
+    if isinstance(value, str):
+        return int(value, 0)
+    return int(value)
+
+
 def cmd_hgss_stroll_box_return(args: argparse.Namespace) -> int:
     if args.in_place:
         output_path = Path(args.save).resolve()
@@ -869,6 +951,108 @@ def cmd_hgss_stroll_box_return(args: argparse.Namespace) -> int:
     else:
         raise ValueError("Provide --output or use --in-place")
 
+    eeprom_path = Path(args.eeprom).resolve()
+    eeprom = load_eeprom(eeprom_path)
+
+    capture_summary = _load_capture_summary_from_eeprom(
+        eeprom=eeprom,
+        expected_species=args.extra_species,
+        caught_slot=args.caught_slot,
+    )
+
+    eeprom_progress: dict[str, Any] | None = None
+    pokewalker_steps: int | None = None
+    pokewalker_watts: int | None = None
+    pokewalker_course_flags: int | None = None
+    sync_trip_counter = not bool(args.no_sync_trip_counter)
+    journal_entries_added: list[dict[str, Any]] = []
+
+    if not args.no_sync_eeprom_progress:
+        unlock_opts = {
+            "assume_national_dex": not bool(args.no_national_dex),
+            "unlock_special_courses": bool(args.unlock_special_courses),
+            "unlock_event_courses": bool(args.unlock_event_courses),
+        }
+        unlock_before = build_course_unlock_state(eeprom, **unlock_opts)
+        steps_before = int(read_steps(eeprom))
+        watts_before = int(read_current_watts(eeprom))
+
+        tick = add_walked_steps(eeprom, args.walked_steps)
+        bonus_watts = max(0, int(args.bonus_watts))
+        if bonus_watts > 0:
+            set_watts(eeprom, min(0xFFFF, int(read_current_watts(eeprom)) + bonus_watts))
+
+        gained_from_steps = int(tick.get("gainedWatts", 0))
+        total_watts_gain = gained_from_steps + bonus_watts
+
+        route_info = read_routes_section(eeprom)
+        route_image_index = int(route_info.get("routeImageIndex", 0))
+
+        if not args.no_trip_journal:
+            walking_species = int(args.source_species)
+            walking_friendship_before = int(read_stroll_section(eeprom).get("walkingFriendship", 0))
+            walking_friendship_after = min(0xFF, walking_friendship_before + int(args.walked_steps))
+
+            journal_entries_added.append(
+                append_journal_event(
+                    eeprom,
+                    event_type=EVENT_TYPE_STROLL_CAPTURE,
+                    walking_species=walking_species,
+                    caught_species=int(capture_summary["speciesId"]),
+                    route_image_idx=route_image_index,
+                    friendship=walking_friendship_before,
+                    step_count=int(args.walked_steps),
+                    watts=total_watts_gain,
+                )
+            )
+            journal_entries_added.append(
+                append_journal_event(
+                    eeprom,
+                    event_type=EVENT_TYPE_STROLL_RETURN,
+                    walking_species=walking_species,
+                    caught_species=0,
+                    route_image_idx=route_image_index,
+                    friendship=walking_friendship_after,
+                    step_count=int(args.walked_steps),
+                    watts=total_watts_gain,
+                    extra_data=1,
+                )
+            )
+
+        unlock_after = build_course_unlock_state(eeprom, **unlock_opts)
+        pokewalker_steps = int(read_steps(eeprom))
+        pokewalker_watts = int(read_current_watts(eeprom))
+
+        hgss_state_before = inspect_hgss_save(args.save)
+        existing_flags = _parse_u32_like(hgss_state_before["pokewalker"]["courseFlags"])
+        computed_flags = int(unlock_after.get("unlockFlags", 0))
+        pokewalker_course_flags = (existing_flags | computed_flags) & 0x07FFFFFF
+
+        save_eeprom(eeprom_path, eeprom)
+
+        eeprom_progress = {
+            "synced": True,
+            "eepromPath": str(eeprom_path),
+            "stepsBefore": steps_before,
+            "stepsAfter": pokewalker_steps,
+            "wattsBefore": watts_before,
+            "wattsAfter": pokewalker_watts,
+            "tick": tick,
+            "bonusWatts": bonus_watts,
+            "totalWattsGain": total_watts_gain,
+            "unlocksBefore": unlock_before,
+            "unlocksAfter": unlock_after,
+            "journalEntriesAdded": journal_entries_added,
+            "courseFlagsMergedForHGSS": f"0x{int(pokewalker_course_flags):08X}",
+            "courseFlagsHGSSBefore": f"0x{int(existing_flags):08X}",
+            "courseFlagsComputedFromEEPROM": f"0x{int(computed_flags):08X}",
+        }
+    else:
+        eeprom_progress = {
+            "synced": False,
+            "reason": "--no-sync-eeprom-progress was provided",
+        }
+
     result, payload = apply_hgss_stroll_box_return(
         args.save,
         box_number=args.box,
@@ -876,8 +1060,13 @@ def cmd_hgss_stroll_box_return(args: argparse.Namespace) -> int:
         target_slot_number=args.target_slot,
         source_species=args.source_species,
         extra_species=args.extra_species,
-        level_gain=1,
+        walked_steps=args.walked_steps,
+        extra_capture_summary=capture_summary,
         seed=args.seed,
+        pokewalker_steps=pokewalker_steps,
+        pokewalker_watts=pokewalker_watts,
+        pokewalker_course_flags=pokewalker_course_flags,
+        increment_pokewalker_trip_counter=sync_trip_counter,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -886,6 +1075,31 @@ def cmd_hgss_stroll_box_return(args: argparse.Namespace) -> int:
         {
             "status": "ok",
             "output": str(output_path),
+            "eepromCapture": {
+                "eepromPath": str(eeprom_path),
+                "slot": int(capture_summary["slot"]),
+                "speciesId": int(capture_summary["speciesId"]),
+                "speciesName": str(capture_summary["speciesName"]),
+                "level": int(capture_summary["level"]),
+                "moves": [int(move) for move in capture_summary["moves"]],
+                "variantFlags": int(capture_summary["variantFlags"]),
+                "specialFlags": int(capture_summary["specialFlags"]),
+            },
+            "hgssDiary": {
+                "persistedInSave": False,
+                "source": "pokewalker_eeprom_event_log",
+                "requiresLinkSyncToDisplay": True,
+                "entriesPreparedInEEPROM": len(journal_entries_added),
+                "note": (
+                    "HGSS diary text is generated from Pokewalker EEPROM events during sync; "
+                    "it is not stored as persistent diary text inside the HGSS .sav"
+                ),
+            },
+            "hgssTripCounterSync": {
+                "enabled": sync_trip_counter,
+                "reason": None if sync_trip_counter else "--no-sync-trip-counter was provided",
+            },
+            "eepromProgress": eeprom_progress,
             "scenario": result,
         }
     )
@@ -1002,9 +1216,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_hgss_stroll_box = sub.add_parser(
         "hgss-stroll-box-return",
-        help="Raise one boxed Pokemon by +1 level and add a legal hatched Pidgey in same box",
+        help=(
+            "Apply stroll-return EXP/friendship to one boxed Pokemon "
+            "(1 step = 1 EXP, capped to +1 level) and add a Pokewalker-captured Pokemon from EEPROM"
+        ),
     )
     p_hgss_stroll_box.add_argument("--save", required=True, help="Input HGSS .sav path")
+    p_hgss_stroll_box.add_argument(
+        "--eeprom",
+        default=default_eeprom,
+        help="EEPROM path used to read inventory.caught capture data",
+    )
     p_hgss_stroll_box.add_argument("--output", default=None, help="Output save path")
     p_hgss_stroll_box.add_argument(
         "--in-place",
@@ -1025,6 +1247,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="1-based target slot for extra Pokemon (default: first empty)",
     )
     p_hgss_stroll_box.add_argument(
+        "--walked-steps",
+        type=int,
+        default=0,
+        help="Walked steps to apply to source Pokemon EXP/friendship (1 step = 1 EXP, +1 level cap)",
+    )
+    p_hgss_stroll_box.add_argument(
+        "--bonus-watts",
+        type=int,
+        default=0,
+        help="Extra watts granted on return in addition to step-derived watts",
+    )
+    p_hgss_stroll_box.add_argument(
+        "--caught-slot",
+        type=int,
+        default=None,
+        help="EEPROM caught slot index (0..2). Default: first slot matching --extra-species",
+    )
+    p_hgss_stroll_box.add_argument(
         "--source-species",
         type=int,
         default=250,
@@ -1034,13 +1274,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--extra-species",
         type=int,
         default=16,
-        help="Extra species to add (default Pidgey=16)",
+        help="Expected species in selected EEPROM caught slot (default Pidgey=16)",
     )
     p_hgss_stroll_box.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Deterministic RNG seed for generated extra Pokemon",
+        help="Deterministic seed for Pokewalker PID/IV generation",
+    )
+    p_hgss_stroll_box.add_argument(
+        "--no-sync-eeprom-progress",
+        action="store_true",
+        help="Do not mutate EEPROM steps/watts/journal before applying HGSS return scenario",
+    )
+    p_hgss_stroll_box.add_argument(
+        "--no-trip-journal",
+        action="store_true",
+        help="Skip appending capture/return journal entries during EEPROM progress sync",
+    )
+    p_hgss_stroll_box.add_argument(
+        "--no-sync-trip-counter",
+        action="store_true",
+        help="Do not increment HGSS Pokewalker trip counter during return patch",
+    )
+    p_hgss_stroll_box.add_argument(
+        "--no-national-dex",
+        action="store_true",
+        help="Compute unlocks assuming National Dex is not available",
+    )
+    p_hgss_stroll_box.add_argument(
+        "--unlock-special-courses",
+        action="store_true",
+        help="Allow special unlock-only routes (trade/Jirachi) when syncing course flags",
+    )
+    p_hgss_stroll_box.add_argument(
+        "--unlock-event-courses",
+        action="store_true",
+        help="Allow event-only routes when syncing course flags",
     )
     p_hgss_stroll_box.set_defaults(func=cmd_hgss_stroll_box_return)
 
@@ -1153,6 +1423,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Clear caught/dowsed buffers before sending",
     )
+    p_stroll_send.add_argument(
+        "--allow-locked-course",
+        action="store_true",
+        help="Allow sending to locked courses without watt/special checks",
+    )
+    p_stroll_send.add_argument(
+        "--no-national-dex",
+        action="store_true",
+        help="Compute unlock state assuming National Dex is not available",
+    )
+    p_stroll_send.add_argument(
+        "--unlock-special-courses",
+        action="store_true",
+        help="Treat trade/Jirachi special courses as unlocked",
+    )
+    p_stroll_send.add_argument(
+        "--unlock-event-courses",
+        action="store_true",
+        help="Treat event courses as unlocked",
+    )
     p_stroll_send.set_defaults(func=cmd_stroll_send)
 
     p_stroll_return = sub.add_parser(
@@ -1161,7 +1451,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_target_options(p_stroll_return, default_eeprom)
     p_stroll_return.add_argument("walked_steps", type=int, help="Walked steps during stroll")
-    p_stroll_return.add_argument("--gained-exp", type=int, default=None, help="Explicit EXP gain")
+    p_stroll_return.add_argument(
+        "--gained-exp",
+        type=int,
+        default=None,
+        help="Override requested EXP gain before applying the +1 level cap",
+    )
     p_stroll_return.add_argument("--bonus-watts", type=int, default=0, help="Bonus watts on return")
     p_stroll_return.add_argument(
         "--capture-species-ids",
