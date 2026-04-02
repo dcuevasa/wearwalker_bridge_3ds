@@ -43,6 +43,11 @@ bool ww_api_stroll_send(
 		char *out_json,
 		u32 out_size);
 
+bool ww_api_stroll_send_resolved_json(
+		const char *json_body,
+		char *out_json,
+		u32 out_size);
+
 bool ww_api_stroll_patch_sprite_block(
 		const char *key,
 		const u8 *data,

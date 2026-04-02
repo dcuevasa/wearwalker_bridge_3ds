@@ -2004,6 +2004,147 @@ def _configure_route_items_from_course(eeprom: bytearray, course_id: int) -> lis
     return configured
 
 
+def _apply_resolved_route_slots(
+    eeprom: bytearray,
+    raw_slots: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if len(raw_slots) != ROUTE_POKE_SLOTS:
+        raise ValueError(f"resolvedRouteConfig.slots must contain exactly {ROUTE_POKE_SLOTS} entries")
+
+    by_slot: dict[int, dict[str, Any]] = {}
+    for entry in raw_slots:
+        if not isinstance(entry, dict):
+            raise ValueError("resolvedRouteConfig.slots entries must be objects")
+
+        slot = int(entry.get("slot", -1))
+        if slot < 0 or slot >= ROUTE_POKE_SLOTS:
+            raise ValueError(f"resolvedRouteConfig.slots.slot out of range (0..{ROUTE_POKE_SLOTS - 1}): {slot}")
+        if slot in by_slot:
+            raise ValueError(f"resolvedRouteConfig.slots has duplicate slot index: {slot}")
+
+        species_id = _validate_u16("resolvedRouteConfig.slots.speciesId", int(entry.get("speciesId", 0)))
+        level = max(1, min(int(entry.get("level", 1)), 100))
+        raw_moves = entry.get("moves")
+        if not isinstance(raw_moves, list) or len(raw_moves) != 4:
+            raise ValueError("resolvedRouteConfig.slots.moves must contain exactly 4 move IDs")
+
+        moves = [_validate_u16(f"resolvedRouteConfig.slots.moves[{idx}]", int(value)) for idx, value in enumerate(raw_moves)]
+        min_steps = _validate_u16("resolvedRouteConfig.slots.minSteps", int(entry.get("minSteps", 0)))
+        chance = _validate_u8("resolvedRouteConfig.slots.chance", int(entry.get("chance", 0)))
+
+        summary = _pokemon_summary_from_values(
+            species_id,
+            level=level,
+            moves=moves,
+        )
+        _write_route_slot(
+            eeprom,
+            slot,
+            summary,
+            min_steps=min_steps,
+            chance=chance,
+        )
+        by_slot[slot] = {
+            "slot": slot,
+            "sourcePairIndex": entry.get("sourcePairIndex"),
+            "speciesId": species_id,
+            "speciesName": _species_name(species_id),
+            "level": level,
+            "chance": chance,
+            "minSteps": min_steps,
+        }
+
+    return [by_slot[idx] for idx in range(ROUTE_POKE_SLOTS)]
+
+
+def _apply_resolved_route_items(
+    eeprom: bytearray,
+    raw_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if len(raw_items) != ROUTE_ITEM_SLOTS:
+        raise ValueError(f"resolvedRouteConfig.items must contain exactly {ROUTE_ITEM_SLOTS} entries")
+
+    by_index: dict[int, dict[str, Any]] = {}
+    for entry in raw_items:
+        if not isinstance(entry, dict):
+            raise ValueError("resolvedRouteConfig.items entries must be objects")
+
+        item_index = int(entry.get("routeItemIndex", -1))
+        if item_index < 0 or item_index >= ROUTE_ITEM_SLOTS:
+            raise ValueError(
+                f"resolvedRouteConfig.items.routeItemIndex out of range (0..{ROUTE_ITEM_SLOTS - 1}): {item_index}"
+            )
+        if item_index in by_index:
+            raise ValueError(f"resolvedRouteConfig.items has duplicate routeItemIndex: {item_index}")
+
+        item_id = _validate_u16("resolvedRouteConfig.items.itemId", int(entry.get("itemId", 0)))
+        min_steps = _validate_u16("resolvedRouteConfig.items.minSteps", int(entry.get("minSteps", 0)))
+        chance = _validate_u8("resolvedRouteConfig.items.chance", int(entry.get("chance", 0)))
+
+        _write_route_item(
+            eeprom,
+            item_index,
+            item_id=item_id,
+            min_steps=min_steps,
+            chance=chance,
+        )
+        by_index[item_index] = {
+            "routeItemIndex": item_index,
+            "itemId": item_id,
+            "itemName": _item_name(item_id),
+            "minSteps": min_steps,
+            "chance": chance,
+        }
+
+    return [by_index[idx] for idx in range(ROUTE_ITEM_SLOTS)]
+
+
+def _apply_resolved_route_config(
+    eeprom: bytearray,
+    course_id: int,
+    resolved_route_config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, dict[str, Any]]:
+    if not isinstance(resolved_route_config, dict):
+        raise ValueError("resolvedRouteConfig must be an object")
+
+    schema_version = int(resolved_route_config.get("schemaVersion", 0))
+    if schema_version < 1:
+        raise ValueError("resolvedRouteConfig.schemaVersion must be >= 1")
+
+    route_image_index = _validate_u8(
+        "resolvedRouteConfig.routeImageIndex",
+        int(resolved_route_config.get("routeImageIndex", course_id)),
+    )
+    raw_slots = resolved_route_config.get("slots")
+    raw_items = resolved_route_config.get("items")
+    raw_advantaged_types = resolved_route_config.get("advantagedTypes")
+    if not isinstance(raw_slots, list):
+        raise ValueError("resolvedRouteConfig.slots must be a list")
+    if not isinstance(raw_items, list):
+        raise ValueError("resolvedRouteConfig.items must be a list")
+    if not isinstance(raw_advantaged_types, list) or len(raw_advantaged_types) != 3:
+        raise ValueError("resolvedRouteConfig.advantagedTypes must contain exactly 3 entries")
+
+    advantaged_types = [
+        _validate_u8(f"resolvedRouteConfig.advantagedTypes[{index}]", int(value))
+        for index, value in enumerate(raw_advantaged_types)
+    ]
+
+    route_cfg = _apply_resolved_route_slots(eeprom, raw_slots)
+    route_items_cfg = _apply_resolved_route_items(eeprom, raw_items)
+
+    eeprom[ROUTE_IMAGE_INDEX_OFFSET] = route_image_index
+    _write_device_text_fixed(eeprom, ROUTE_NAME_OFFSET, ROUTE_NAME_CHARS, COURSE_NAMES[course_id])
+
+    metadata = {
+        "schemaVersion": schema_version,
+        "romSize": int(resolved_route_config.get("romSize", 0)),
+        "romMtime": int(resolved_route_config.get("romMtime", 0)),
+        "advantagedTypes": advantaged_types,
+    }
+    return route_cfg, route_items_cfg, route_image_index, metadata
+
+
 def read_inventory_section(eeprom: bytearray) -> Dict[str, Any]:
     _check_size(eeprom)
 
@@ -2384,6 +2525,7 @@ def send_pokemon_to_stroll(
     assume_national_dex: bool = True,
     unlock_special_courses: bool = False,
     unlock_event_courses: bool = False,
+    resolved_route_config: dict[str, Any] | None = None,
     existing_course_flags: int = 0,
 ) -> Dict[str, Any]:
     _check_size(eeprom)
@@ -2457,9 +2599,17 @@ def send_pokemon_to_stroll(
             selected_course = 0
             course_note = "No unlocked courses detected; defaulted to route 0"
 
-    route_cfg: list[dict[str, Any]] = _configure_route_from_course(eeprom, selected_course, rng=rng)
-    route_items_cfg = _configure_route_items_from_course(eeprom, selected_course)
-    selected_route_image_index = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
+    resolved_route_meta: dict[str, Any] | None = None
+    if resolved_route_config is not None:
+        route_cfg, route_items_cfg, selected_route_image_index, resolved_route_meta = _apply_resolved_route_config(
+            eeprom,
+            selected_course,
+            resolved_route_config,
+        )
+    else:
+        route_cfg = _configure_route_from_course(eeprom, selected_course, rng=rng)
+        route_items_cfg = _configure_route_items_from_course(eeprom, selected_course)
+        selected_route_image_index = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
 
     if friendship is None:
         friendship = _species_base_friendship(sid)
@@ -2549,6 +2699,8 @@ def send_pokemon_to_stroll(
         },
         "configuredRouteSlots": route_cfg,
         "configuredRouteItems": route_items_cfg,
+        "resolvedRouteSource": "3ds-local" if resolved_route_meta is not None else "server-generated",
+        "resolvedRouteMeta": resolved_route_meta,
         "stroll": read_stroll_section(eeprom),
         "routes": read_routes_section(eeprom),
         "journalEntry": journal_entry,

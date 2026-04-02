@@ -1,39 +1,252 @@
-# WearWalker Bridge WiFi Protocol v2
+# WearWalker Bridge Protocol (v1 + v2)
 
-Status: Draft (implemented incrementally on top of v1)
+Status: Draft, implemented incrementally.
 
 ## Goal
 
-Add a non-destructive way to update dynamic Pokewalker sprite blocks without replacing the full EEPROM image.
+The current protocol has two coordinated parts:
 
-v2 is an additive extension:
-- v1 endpoints remain valid and unchanged.
-- v2 introduces one new endpoint for block-level sprite updates.
+1. `POST /api/v1/stroll/send` for semantic stroll setup.
+2. `POST /api/v2/stroll/sprite-patches` for non-destructive sprite block updates.
 
-## Compatibility Model
+The important architectural change is now **strict 3DS ROM-first route resolution**:
 
-The bridge keeps the existing v1 stroll flow:
-1. Send core stroll data to /api/v1/stroll/send.
-2. Apply dynamic sprite blocks with /api/v2/stroll/sprite-patches.
-
-This split avoids breaking existing clients and keeps v1 behavior stable.
+- The 3DS is the only side that parses HGSS `.nds` route tables.
+- The 3DS sends the resolved route payload (`resolvedRouteConfig`) in each send request.
+- The Python backend does not read `.nds` and does not choose route slots/items/encounters.
 
 ## Transport
 
 - Protocol: HTTP/1.1
-- Payload type: application/json
-- Base path for this extension: /api/v2
+- Payload type: `application/json`
+- Paths used here:
+  - `v1`: semantic stroll send
+  - `v2`: sprite block patching
 
-## Endpoint
+## Strict Send Endpoint
+
+### POST /api/v1/stroll/send
+
+Purpose:
+
+- Start a stroll session with dynamic data from `.sav` plus route data resolved on-device from `.nds`.
+- Apply (not derive) resolved slots/items/route image to EEPROM.
+
+### Required request shape
+
+`resolvedRouteConfig` is required.
+
+If it is missing, the server returns:
+
+```json
+{
+  "error": "missing_resolved_route_config",
+  "message": "resolvedRouteConfig is required; route/items/encounters must be resolved by 3DS"
+}
+```
+
+### Request example
+
+```json
+{
+  "speciesId": 157,
+  "level": 36,
+  "courseId": 1,
+  "nickname": "TYPHLOSION",
+  "friendship": 120,
+  "heldItem": 0,
+  "moves": [53, 52, 46, 33],
+  "variantFlags": 0,
+  "specialFlags": 0,
+  "clearBuffers": true,
+  "allowLockedCourse": false,
+  "resolvedRouteConfig": {
+    "schemaVersion": 1,
+    "romSize": 134217728,
+    "romMtime": 1712064000,
+    "routeImageIndex": 1,
+    "routeSeed": 3311798421,
+    "advantagedTypes": [11, 15, 10],
+    "slots": [
+      {
+        "slot": 0,
+        "sourcePairIndex": 0,
+        "speciesId": 115,
+        "level": 8,
+        "gender": 1,
+        "moves": [4, 43, 252, 0],
+        "minSteps": 3000,
+        "chance": 50
+      },
+      {
+        "slot": 1,
+        "sourcePairIndex": 2,
+        "speciesId": 29,
+        "level": 5,
+        "gender": 1,
+        "moves": [45, 10, 0, 0],
+        "minSteps": 500,
+        "chance": 75
+      },
+      {
+        "slot": 2,
+        "sourcePairIndex": 4,
+        "speciesId": 43,
+        "level": 5,
+        "gender": 0,
+        "moves": [33, 28, 0, 0],
+        "minSteps": 0,
+        "chance": 100
+      }
+    ],
+    "items": [
+      {"routeItemIndex": 0, "itemId": 28, "minSteps": 2500, "chance": 20},
+      {"routeItemIndex": 1, "itemId": 27, "minSteps": 2000, "chance": 20},
+      {"routeItemIndex": 2, "itemId": 19, "minSteps": 1000, "chance": 30},
+      {"routeItemIndex": 3, "itemId": 20, "minSteps": 900, "chance": 30},
+      {"routeItemIndex": 4, "itemId": 150, "minSteps": 800, "chance": 30},
+      {"routeItemIndex": 5, "itemId": 21, "minSteps": 700, "chance": 40},
+      {"routeItemIndex": 6, "itemId": 149, "minSteps": 600, "chance": 50},
+      {"routeItemIndex": 7, "itemId": 22, "minSteps": 500, "chance": 50},
+      {"routeItemIndex": 8, "itemId": 155, "minSteps": 300, "chance": 50},
+      {"routeItemIndex": 9, "itemId": 17, "minSteps": 0, "chance": 100}
+    ]
+  }
+}
+```
+
+### Validation summary
+
+- `resolvedRouteConfig` required.
+- `schemaVersion >= 1`.
+- `romSize` currently validated as `u32` by backend model (`0..0xFFFFFFFF`).
+- `romMtime` currently validated as `u64` by backend model (`0..0xFFFFFFFFFFFFFFFF`).
+- `routeImageIndex` is `u8`.
+- `advantagedTypes` length must be exactly 3 (`u8` values).
+- `slots` length must be exactly 3 with unique slot indexes `0..2`.
+- `items` length must be exactly 10 with unique indexes `0..9`.
+- Unknown extra fields are currently ignored by backend model parsing (for example `routeSeed`).
+
+### Response additions
+
+When resolved config is used, response includes:
+
+- `resolvedRouteSource: "3ds-local"`
+- `resolvedRouteMeta` with at least:
+  - `schemaVersion`
+  - `romSize`
+  - `romMtime`
+  - `advantagedTypes`
+
+## Data Provenance For Strict Send
+
+This section documents where each `resolvedRouteConfig` field comes from.
+
+### Route table source
+
+From HGSS overlay 112 route table (`overlay9_112`) at DS virtual address `0x021F4138`.
+
+This layout is consistent with reverse-engineering notes in:
+
+- `Pokewalker hacking - Dmitry.GR` (`DS-side things` section)
+
+Route record layout (`0xC0` bytes):
+
+```c
+struct RouteInfo {
+    uint32_t wattsToUnlock;         // +0x00
+    uint32_t imageIdx;              // +0x04
+    struct RoutePokeInfo pokes[6];  // +0x08
+    struct RouteItemInfo items[10]; // +0x80
+    uint8_t advantagedTypes[3];     // +0xBC
+    uint8_t padding;                // +0xBF
+};
+```
+
+`advantagedTypes` indexes map to type names via `mTypeNames` in the same reverse notes:
+
+| Index | Type |
+|---:|---|
+| 0 | Normal |
+| 1 | Fighting |
+| 2 | Flying |
+| 3 | Poison |
+| 4 | Ground |
+| 5 | Rock |
+| 6 | Bug |
+| 7 | Ghost |
+| 8 | Steel |
+| 9 | Unknown (`(? ? ?)` placeholder) |
+| 10 | Fire |
+| 11 | Water |
+| 12 | Grass |
+| 13 | Electric |
+| 14 | Psychic |
+| 15 | Ice |
+| 16 | Dragon |
+| 17 | Dark |
+
+### Mapping used by the 3DS payload builder
+
+- `resolvedRouteConfig.routeImageIndex`
+  - from `imageIdx - 1` (`+0x04`, little-endian)
+- `resolvedRouteConfig.routeSeed`
+  - generated on 3DS (system tick seed) and used for local pair selection in `pokes[6]`
+  - currently informational for backend (ignored by model parsing)
+- `resolvedRouteConfig.advantagedTypes[0..2]`
+  - from `+0xBC..+0xBE`
+- `resolvedRouteConfig.slots[*]`
+  - selected from `pokes[6]` (`+0x08`, stride `0x14`)
+  - one entry per pair `(0/1), (2/3), (4/5)`
+- slot fields
+  - `speciesId`: `+0x00` (`u16`)
+  - `level`: `+0x02` (`u8`)
+  - `gender`: flags byte at `+0x07` (low bit indicates female in reverse notes)
+  - `moves[4]`: `+0x08..+0x0F`
+  - `minSteps`: `+0x10` (`u16`)
+  - `chance`: `+0x12` (`u8` chance + `u8` padding in reverse layout; client reads LE16 and clamps to `u8`)
+- `resolvedRouteConfig.items[*]`
+  - from `items[10]` (`+0x80`, stride `0x06`)
+  - `itemId`: `+0x00`
+  - `minSteps`: `+0x02`
+  - `chance`: `+0x04` (`u8` chance + `u8` padding in reverse layout; client reads LE16 and clamps to `u8`)
+
+### Dynamic fields from save
+
+The following are still read per-send from `.sav` and are not cached from ROM:
+
+- walking species/level/moves/friendship
+- trainer identity values
+- Pokewalker stats mirrored from save context
+
+## 3DS SD Cache Behavior
+
+To avoid parsing `.nds` every send, the 3DS stores route table cache at:
+
+- `sdmc:/3ds/wearwalker_bridge/rom_course_cache.bin`
+
+Current cache invalidation key:
+
+- ROM file size
+- ROM file mtime
+
+Behavior:
+
+1. On send, if cache matches current ROM identity, reuse cache.
+2. Otherwise parse overlay 112 and rewrite cache.
+3. `.sav` data is still re-read every send.
+
+## Sprite Patch Endpoint (v2)
 
 ### POST /api/v2/stroll/sprite-patches
 
 Purpose:
-- Patch only selected dynamic sprite blocks in EEPROM.
-- Preserve every non-targeted block exactly as-is.
 
-Request body:
+- Non-destructively patch only listed dynamic sprite blocks.
 
+Request shape:
+
+```json
 {
   "patches": [
     {
@@ -42,145 +255,40 @@ Request body:
     }
   ]
 }
+```
 
 Validation rules:
-- patches list length: 1..32
-- key length: 1..64
-- dataHex length: 2..16384
-- dataHex must be valid hex and have even length
-- dataHex decoded byte count must match the exact block size for the selected key
-- unknown keys are rejected
 
-Server error format:
+- patch list length: `1..32`
+- key length: `1..64`
+- `dataHex` length: `2..16384`
+- hex must be valid and even length
+- decoded bytes must match exact block size for key
 
-{
-  "error": "invalid_sprite_patch",
-  "message": "..."
-}
+Allowed keys include:
 
-Success response:
+- `areaSprite`, `areaNameSprite`, `trainerCardName`
+- `walkPokeSmall*`, `walkPokeLarge*`, `joinPokeLarge*`, `walkPokeName`
+- `routePoke*Small*`, `routePoke*Name`
+- `routeItem0Name..routeItem9Name`
 
-{
-  "status": "ok",
-  "patches": {
-    "applied": [
-      {
-        "index": 0,
-        "key": "walkPokeName",
-        "offset": 39230,
-        "size": 320
-      }
-    ],
-    "count": 1
-  },
-  "routes": {
-    "routeInfoOffset": 36608,
-    "routeImageIndex": 0,
-    "routeCourseName": "Refreshing Field"
-  }
-}
+Non-destructive guarantee:
 
-Notes:
-- offset and size are returned for traceability/debugging.
-- routes is returned as a convenience snapshot after patching.
+- only the exact offsets for requested keys are overwritten
+- all other EEPROM ranges remain unchanged
 
-## Allowed Patch Keys
+## Current End-to-End Sequence
 
-These keys are validated against a fixed whitelist and mapped to explicit EEPROM offsets.
-
-| Key | Offset | Size (bytes) | Logical Sprite |
-|---|---:|---:|---|
-| areaSprite | 0x8FBE | 0x00C0 | Route area image (32x24) |
-| areaNameSprite | 0x907E | 0x0140 | Route area name (80x16) |
-| trainerCardName | 0x1250 | 0x0140 | Trainer Card name (80x16) |
-| walkPokeSmall0 | 0x91BE | 0x00C0 | Walking Pokemon small frame 0 (32x24) |
-| walkPokeSmall1 | 0x927E | 0x00C0 | Walking Pokemon small frame 1 (32x24) |
-| walkPokeLarge0 | 0x933E | 0x0300 | Walking Pokemon large frame 0 (64x48) |
-| walkPokeLarge1 | 0x963E | 0x0300 | Walking Pokemon large frame 1 (64x48) |
-| joinPokeLarge0 | 0x9EFE | 0x0300 | Route/join Pokemon large frame 0 (64x48) |
-| joinPokeLarge1 | 0xA1FE | 0x0300 | Route/join Pokemon large frame 1 (64x48) |
-| walkPokeName | 0x993E | 0x0140 | Walking Pokemon name (80x16) |
-| routePoke0Small0 | 0x9A7E | 0x00C0 | Route slot 0 small frame 0 (32x24) |
-| routePoke0Small1 | 0x9B3E | 0x00C0 | Route slot 0 small frame 1 (32x24) |
-| routePoke1Small0 | 0x9BFE | 0x00C0 | Route slot 1 small frame 0 (32x24) |
-| routePoke1Small1 | 0x9CBE | 0x00C0 | Route slot 1 small frame 1 (32x24) |
-| routePoke2Small0 | 0x9D7E | 0x00C0 | Route slot 2 small frame 0 (32x24) |
-| routePoke2Small1 | 0x9E3E | 0x00C0 | Route slot 2 small frame 1 (32x24) |
-| routePoke0Name | 0xA4FE | 0x0140 | Route slot 0 name (80x16) |
-| routePoke1Name | 0xA63E | 0x0140 | Route slot 1 name (80x16) |
-| routePoke2Name | 0xA77E | 0x0140 | Route slot 2 name (80x16) |
-| routeItem0Name | 0xA8BE | 0x0180 | Route item 0 name (96x16) |
-| routeItem1Name | 0xAA3E | 0x0180 | Route item 1 name (96x16) |
-| routeItem2Name | 0xABBE | 0x0180 | Route item 2 name (96x16) |
-| routeItem3Name | 0xAD3E | 0x0180 | Route item 3 name (96x16) |
-| routeItem4Name | 0xAEBE | 0x0180 | Route item 4 name (96x16) |
-| routeItem5Name | 0xB03E | 0x0180 | Route item 5 name (96x16) |
-| routeItem6Name | 0xB1BE | 0x0180 | Route item 6 name (96x16) |
-| routeItem7Name | 0xB33E | 0x0180 | Route item 7 name (96x16) |
-| routeItem8Name | 0xB4BE | 0x0180 | Route item 8 name (96x16) |
-| routeItem9Name | 0xB63E | 0x0180 | Route item 9 name (96x16) |
-
-## Non-Destructive Behavior
-
-The server applies patch data only to the exact ranges identified by key.
-
-Equivalent behavior:
-- EEPROM[offset:offset+size] = decoded_patch_data
-
-Everything outside those ranges is untouched. This is the key v2 guarantee for existing EEPROM files.
-
-## Current 3DS Client Behavior (Implemented)
-
-The 3DS app currently uses v2 in this sequence:
-1. Select HGSS .sav and HGSS .nds in the send menu.
-2. Run /api/v1/stroll/send.
-3. Read configuredRouteSlots and configuredRouteItems from the send response.
-4. Extract dynamic sprites from ROM (areaSprite from ARM9 overlay id 112 route image table; Pokemon small from a/2/4/8; Pokemon large from a/2/5/6), generate name sprites locally (80x16 or 96x16, 2bpp), and call /api/v2/stroll/sprite-patches.
-
-Currently patched keys from the 3DS client:
-- walkPokeSmall0
-- walkPokeSmall1
-- walkPokeLarge0
-- walkPokeLarge1
-- joinPokeLarge0
-- joinPokeLarge1
-- walkPokeName
-- trainerCardName
-- routePoke0Small0
-- routePoke0Small1
-- routePoke1Small0
-- routePoke1Small1
-- routePoke2Small0
-- routePoke2Small1
-- areaSprite
-- areaNameSprite
-- routePoke0Name
-- routePoke1Name
-- routePoke2Name
-- routeItem0Name
-- routeItem1Name
-- routeItem2Name
-- routeItem3Name
-- routeItem4Name
-- routeItem5Name
-- routeItem6Name
-- routeItem7Name
-- routeItem8Name
-- routeItem9Name
-
-Data sources used by the client:
-- walkPokeSmall* and routePoke*Small*: species sprites from HG/SS NARC a/2/4/8
-- walkPokeLarge*: species sprites from HG/SS NARC a/2/5/6
-- joinPokeLarge*: species sprite from HG/SS NARC a/2/5/6 using configuredRouteSlots highest-chance species
-- areaSprite: route area image from HG/SS ARM9 overlay id 112 route image table (selectedRouteImageIndex)
-- walkPokeName: nickname from HGSS send context
-- trainerCardName: trainer name from HGSS send context
-- areaNameSprite: selectedCourseName from /api/v1/stroll/send response
-- routePoke{0,1,2}Name: configuredRouteSlots[*].speciesName from /api/v1/stroll/send response
-- routeItem{0..9}Name: configuredRouteItems[*].itemName from /api/v1/stroll/send response
+1. User selects `.sav` and `.nds` on 3DS.
+2. 3DS loads or rebuilds ROM route cache from overlay 112.
+3. 3DS reads dynamic send context from `.sav`.
+4. 3DS sends strict `/api/v1/stroll/send` with `resolvedRouteConfig`.
+5. Backend applies resolved slots/items/route image into EEPROM.
+6. 3DS generates/loads sprite blocks and patches through `/api/v2/stroll/sprite-patches`.
+7. 3DS applies resulting send mutation back into `.sav`.
 
 ## Versioning
 
-- Keep v1 endpoints under /api/v1.
-- Additive sprite patch protocol is under /api/v2.
-- Any future breaking schema change for sprite patching must move to /api/v3.
+- Keep semantic send under `v1` path for compatibility with existing flow.
+- Keep sprite block patching under `v2`.
+- If strict send schema requires a breaking change, increment schema (`resolvedRouteConfig.schemaVersion`) and document the migration path.

@@ -8,6 +8,7 @@
 #include <3ds/util/decompress.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,7 @@ void call_stroll_return_to_save();
 #define WW_BROWSER_ENTRY_NAME_MAX 256
 #define WW_BROWSER_MAX_ENTRIES 384
 #define WW_ASYNC_LOG_MAX 1024
+#define WW_STROLL_SEND_BODY_MAX 12288
 
 typedef struct {
 	char name[WW_BROWSER_ENTRY_NAME_MAX];
@@ -122,8 +124,38 @@ static s32 g_ui_thread_prio = 0x30;
 #define WW_NDS_OVERLAY_ENTRY_SIZE 32u
 #define WW_NDS_OV112_ID 112u
 #define WW_OV112_ROUTE_IMAGE_TABLE_ADDR 0x021FF528u
+#define WW_OV112_COURSE_TABLE_ADDR 0x021F4138u
+#define WW_OV112_COURSE_RECORD_SIZE 0x0C0u
+#define WW_OV112_COURSE_COUNT 27u
+#define WW_OV112_COURSE_TABLE_SIZE (WW_OV112_COURSE_RECORD_SIZE * WW_OV112_COURSE_COUNT)
+#define WW_OV112_SLOT_OFFSET 0x008u
+#define WW_OV112_SLOT_SIZE 0x014u
+#define WW_OV112_SLOT_COUNT 6u
+#define WW_OV112_ITEMS_OFFSET 0x080u
+#define WW_OV112_ITEM_SIZE 0x006u
+#define WW_OV112_ITEM_COUNT 10u
+#define WW_OV112_ADV_TYPES_OFFSET 0x0BCu
+#define WW_OV112_ADV_TYPES_COUNT 3u
 #define WW_OV112_ROUTE_IMAGE_COUNT 8u
 #define WW_OV112_ROUTE_IMAGE_SIZE 0x0C0u
+#define WW_OV112_MAX_SPECIES_ID 2048u
+#define WW_OV112_MAX_TYPE_ID 17u
+#define WW_OV112_MAX_SLOT_CHANCE 100u
+#define WW_OV112_MAX_ITEM_CHANCE 100u
+
+#define WW_ROM_CACHE_MAGIC 0x48524357u /* WRCH */
+#define WW_ROM_CACHE_VERSION 2u
+#define WW_ROM_CACHE_PATH "sdmc:/3ds/wearwalker_bridge/rom_course_cache.bin"
+
+typedef struct {
+	u32 magic;
+	u16 version;
+	u16 reserved;
+	u64 rom_size;
+	u64 rom_mtime;
+	u32 table_size;
+	u32 course_count;
+} ww_rom_cache_header;
 
 static const char *ww_async_task_name(ww_async_task task)
 {
@@ -772,6 +804,96 @@ static u32 ww_read_u32_le(const u8 *ptr)
 static bool ww_nds_get_file_bounds_from_fat(const u8 *fat, u32 fat_size, u32 file_id, u32 *out_start, u32 *out_end);
 static bool ww_read_file_range(FILE *f, u32 offset, u8 *out_buffer, u32 size);
 
+static bool ww_course_record_is_plausible(const u8 *record)
+{
+	u32 route_plus_one;
+	u32 slot;
+	u32 valid_species = 0;
+	u32 item;
+	u32 adv_idx;
+
+	if (!record)
+		return false;
+
+	route_plus_one = ww_read_u32_le(record + 0x04);
+	if (route_plus_one == 0 || route_plus_one > WW_OV112_ROUTE_IMAGE_COUNT)
+		return false;
+
+	for (slot = 0; slot < WW_OV112_SLOT_COUNT; slot++) {
+		u32 base = WW_OV112_SLOT_OFFSET + slot * WW_OV112_SLOT_SIZE;
+		u16 species_id = ww_read_u16_le(record + base + 0x00);
+		u8 level = record[base + 0x02];
+		u16 chance = ww_read_u16_le(record + base + 0x12);
+
+		if (species_id > WW_OV112_MAX_SPECIES_ID)
+			return false;
+		if (species_id != 0)
+			valid_species++;
+		if (level > 100)
+			return false;
+		if (species_id != 0 && level == 0)
+			return false;
+		if (chance > WW_OV112_MAX_SLOT_CHANCE)
+			return false;
+	}
+
+	if (valid_species < 4)
+		return false;
+
+	for (item = 0; item < WW_OV112_ITEM_COUNT; item++) {
+		u32 base = WW_OV112_ITEMS_OFFSET + item * WW_OV112_ITEM_SIZE;
+		u16 chance = ww_read_u16_le(record + base + 0x04);
+
+		if (chance > WW_OV112_MAX_ITEM_CHANCE)
+			return false;
+	}
+
+	for (adv_idx = 0; adv_idx < WW_OV112_ADV_TYPES_COUNT; adv_idx++) {
+		u8 type_id = record[WW_OV112_ADV_TYPES_OFFSET + adv_idx];
+
+		if (type_id > WW_OV112_MAX_TYPE_ID)
+			return false;
+	}
+
+	return true;
+}
+
+static bool ww_course_table_is_plausible(const u8 *table)
+{
+	u32 course_id;
+
+	if (!table)
+		return false;
+
+	for (course_id = 0; course_id < WW_OV112_COURSE_COUNT; course_id++) {
+		const u8 *record = table + course_id * WW_OV112_COURSE_RECORD_SIZE;
+
+		if (!ww_course_record_is_plausible(record))
+			return false;
+	}
+
+	return true;
+}
+
+static bool ww_find_course_table_offset_in_overlay(const u8 *overlay_data, u32 overlay_size, u32 *out_offset)
+{
+	u32 offset;
+
+	if (!overlay_data || !out_offset)
+		return false;
+	if (overlay_size < WW_OV112_COURSE_TABLE_SIZE)
+		return false;
+
+	for (offset = 0; (u64)offset + (u64)WW_OV112_COURSE_TABLE_SIZE <= (u64)overlay_size; offset += 4u) {
+		if (ww_course_table_is_plausible(overlay_data + offset)) {
+			*out_offset = offset;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static bool ww_nds_find_arm9_overlay_entry(
 		const u8 *overlay_table,
 		u32 overlay_table_size,
@@ -886,10 +1008,28 @@ static bool ww_overlay_uncompress_backwards(u8 **in_out_data, u32 *in_out_size)
 	return true;
 }
 
-static bool ww_extract_route_area_sprite_from_nds(
+static bool ww_get_file_identity(const char *path, u64 *out_size, u64 *out_mtime)
+{
+	struct stat info;
+
+	if (!path || !out_size || !out_mtime)
+		return false;
+
+	if (stat(path, &info) != 0)
+		return false;
+	if (!S_ISREG(info.st_mode))
+		return false;
+
+	*out_size = (u64)info.st_size;
+	*out_mtime = (u64)info.st_mtime;
+	return true;
+}
+
+static bool ww_load_overlay112_from_nds(
 		const char *nds_path,
-		u32 route_image_index,
-		u8 out_sprite[WW_OV112_ROUTE_IMAGE_SIZE])
+		u8 **out_overlay_data,
+		u32 *out_overlay_size,
+		u32 *out_ram_address)
 {
 	FILE *f = NULL;
 	u8 header[0x58];
@@ -906,17 +1046,15 @@ static bool ww_extract_route_area_sprite_from_nds(
 	u32 ov112_compression;
 	u32 file_start;
 	u32 file_end;
-	u32 pointer_table_offset;
-	u32 pointer_offset;
-	u32 sprite_address;
-	u32 sprite_offset;
 	long nds_size;
 	bool ok = false;
 
-	if (!nds_path || !out_sprite)
+	if (!nds_path || !out_overlay_data || !out_overlay_size || !out_ram_address)
 		return false;
-	if (route_image_index >= WW_OV112_ROUTE_IMAGE_COUNT)
-		return false;
+
+	*out_overlay_data = NULL;
+	*out_overlay_size = 0;
+	*out_ram_address = 0;
 
 	f = fopen(nds_path, "rb");
 	if (!f)
@@ -983,6 +1121,197 @@ static bool ww_extract_route_area_sprite_from_nds(
 			goto cleanup;
 	}
 
+	*out_overlay_data = overlay_file;
+	*out_overlay_size = overlay_file_size;
+	*out_ram_address = ov112_ram_address;
+	overlay_file = NULL;
+	ok = true;
+
+cleanup:
+	if (f)
+		fclose(f);
+	if (fat_data)
+		free(fat_data);
+	if (overlay_table)
+		free(overlay_table);
+	if (overlay_file)
+		free(overlay_file);
+	return ok;
+}
+
+static bool ww_extract_course_table_from_nds(
+		const char *nds_path,
+		u8 out_table[WW_OV112_COURSE_TABLE_SIZE])
+{
+	u8 *overlay_data = NULL;
+	u32 overlay_size = 0;
+	u32 ov112_ram_address = 0;
+	u32 table_offset;
+	u8 candidate_table[WW_OV112_COURSE_TABLE_SIZE];
+	bool ok = false;
+
+	if (!nds_path || !out_table)
+		return false;
+
+	if (!ww_load_overlay112_from_nds(nds_path, &overlay_data, &overlay_size, &ov112_ram_address))
+		goto cleanup;
+
+	if (ov112_ram_address < WW_OV112_COURSE_TABLE_ADDR) {
+		table_offset = WW_OV112_COURSE_TABLE_ADDR - ov112_ram_address;
+		if ((u64)table_offset + (u64)WW_OV112_COURSE_TABLE_SIZE <= (u64)overlay_size) {
+			memcpy(candidate_table, overlay_data + table_offset, WW_OV112_COURSE_TABLE_SIZE);
+			if (ww_course_table_is_plausible(candidate_table)) {
+				memcpy(out_table, candidate_table, WW_OV112_COURSE_TABLE_SIZE);
+				ok = true;
+				goto cleanup;
+			}
+		}
+	}
+
+	if (!ww_find_course_table_offset_in_overlay(overlay_data, overlay_size, &table_offset))
+		goto cleanup;
+
+	memcpy(out_table, overlay_data + table_offset, WW_OV112_COURSE_TABLE_SIZE);
+	ok = true;
+
+cleanup:
+	if (overlay_data)
+		free(overlay_data);
+	return ok;
+}
+
+static void ww_ensure_rom_cache_dirs(void)
+{
+	mkdir("sdmc:/3ds", 0777);
+	mkdir("sdmc:/3ds/wearwalker_bridge", 0777);
+}
+
+static bool ww_load_course_table_cache(
+		u64 rom_size,
+		u64 rom_mtime,
+		u8 out_table[WW_OV112_COURSE_TABLE_SIZE])
+{
+	FILE *f = NULL;
+	ww_rom_cache_header header;
+	bool ok = false;
+
+	if (!out_table)
+		return false;
+
+	f = fopen(WW_ROM_CACHE_PATH, "rb");
+	if (!f)
+		goto cleanup;
+
+	if (fread(&header, sizeof(header), 1, f) != 1)
+		goto cleanup;
+	if (header.magic != WW_ROM_CACHE_MAGIC)
+		goto cleanup;
+	if (header.version != WW_ROM_CACHE_VERSION)
+		goto cleanup;
+	if (header.course_count != WW_OV112_COURSE_COUNT)
+		goto cleanup;
+	if (header.table_size != WW_OV112_COURSE_TABLE_SIZE)
+		goto cleanup;
+	if (header.rom_size != rom_size || header.rom_mtime != rom_mtime)
+		goto cleanup;
+
+	if (fread(out_table, 1, WW_OV112_COURSE_TABLE_SIZE, f) != WW_OV112_COURSE_TABLE_SIZE)
+		goto cleanup;
+	if (!ww_course_table_is_plausible(out_table))
+		goto cleanup;
+
+	ok = true;
+
+cleanup:
+	if (f)
+		fclose(f);
+	return ok;
+}
+
+static void ww_save_course_table_cache(
+		u64 rom_size,
+		u64 rom_mtime,
+		const u8 table[WW_OV112_COURSE_TABLE_SIZE])
+{
+	FILE *f;
+	ww_rom_cache_header header;
+
+	if (!table)
+		return;
+
+	ww_ensure_rom_cache_dirs();
+	f = fopen(WW_ROM_CACHE_PATH, "wb");
+	if (!f)
+		return;
+
+	memset(&header, 0, sizeof(header));
+	header.magic = WW_ROM_CACHE_MAGIC;
+	header.version = WW_ROM_CACHE_VERSION;
+	header.rom_size = rom_size;
+	header.rom_mtime = rom_mtime;
+	header.table_size = WW_OV112_COURSE_TABLE_SIZE;
+	header.course_count = WW_OV112_COURSE_COUNT;
+
+	if (fwrite(&header, sizeof(header), 1, f) == 1)
+		fwrite(table, 1, WW_OV112_COURSE_TABLE_SIZE, f);
+
+	fclose(f);
+}
+
+static bool ww_get_course_table_cached(
+		const char *nds_path,
+		u8 out_table[WW_OV112_COURSE_TABLE_SIZE],
+		bool *out_cache_hit)
+{
+	u64 rom_size;
+	u64 rom_mtime;
+
+	if (!nds_path || !out_table)
+		return false;
+
+	if (out_cache_hit)
+		*out_cache_hit = false;
+
+	if (!ww_get_file_identity(nds_path, &rom_size, &rom_mtime))
+		return false;
+
+	if (ww_load_course_table_cache(rom_size, rom_mtime, out_table)) {
+		if (out_cache_hit)
+			*out_cache_hit = true;
+		return true;
+	}
+
+	if (!ww_extract_course_table_from_nds(nds_path, out_table))
+		return false;
+	if (!ww_course_table_is_plausible(out_table))
+		return false;
+
+	ww_save_course_table_cache(rom_size, rom_mtime, out_table);
+	return true;
+}
+
+static bool ww_extract_route_area_sprite_from_nds(
+		const char *nds_path,
+		u32 route_image_index,
+		u8 out_sprite[WW_OV112_ROUTE_IMAGE_SIZE])
+{
+	u8 *overlay_file = NULL;
+	u32 overlay_file_size = 0;
+	u32 ov112_ram_address = 0;
+	u32 pointer_table_offset;
+	u32 pointer_offset;
+	u32 sprite_address;
+	u32 sprite_offset;
+	bool ok = false;
+
+	if (!nds_path || !out_sprite)
+		return false;
+	if (route_image_index >= WW_OV112_ROUTE_IMAGE_COUNT)
+		return false;
+
+	if (!ww_load_overlay112_from_nds(nds_path, &overlay_file, &overlay_file_size, &ov112_ram_address))
+		goto cleanup;
+
 	if (ov112_ram_address >= WW_OV112_ROUTE_IMAGE_TABLE_ADDR)
 		goto cleanup;
 
@@ -1003,12 +1332,6 @@ static bool ww_extract_route_area_sprite_from_nds(
 	ok = true;
 
 cleanup:
-	if (f)
-		fclose(f);
-	if (fat_data)
-		free(fat_data);
-	if (overlay_table)
-		free(overlay_table);
 	if (overlay_file)
 		free(overlay_file);
 	return ok;
@@ -1505,6 +1828,243 @@ static void ww_patch_species_image_sprites(
 			ww_patch_sprite_block_counted(large1_key, large1, sizeof(large1), applied, failed);
 		}
 	}
+}
+
+static u32 ww_lcg_next(u32 *state)
+{
+	if (!state)
+		return 0;
+
+	*state = (*state * 1664525u) + 1013904223u;
+	return *state;
+}
+
+static void ww_sanitize_json_ascii(const char *src, char *dst, size_t dst_size)
+{
+	size_t pos = 0;
+
+	if (!dst || dst_size == 0)
+		return;
+
+	if (!src) {
+		dst[0] = '\0';
+		return;
+	}
+
+	while (*src && pos + 1 < dst_size) {
+		unsigned char c = (unsigned char)*src++;
+		if (c < 0x20 || c == '"' || c == '\\')
+			dst[pos++] = '?';
+		else
+			dst[pos++] = (char)c;
+	}
+
+	dst[pos] = '\0';
+}
+
+static bool ww_json_append(char **cursor, size_t *remaining, const char *fmt, ...)
+{
+	va_list args;
+	int written;
+
+	if (!cursor || !remaining || !*cursor || !fmt || *remaining == 0)
+		return false;
+
+	va_start(args, fmt);
+	written = vsnprintf(*cursor, *remaining, fmt, args);
+	va_end(args);
+
+	if (written < 0 || (size_t)written >= *remaining)
+		return false;
+
+	*cursor += written;
+	*remaining -= (size_t)written;
+	return true;
+}
+
+static bool ww_build_resolved_stroll_send_json(
+		const hgss_stroll_send_context *send_context,
+		u8 level,
+		u32 course_id,
+		bool clear_buffers,
+		bool allow_locked_course,
+		const u8 course_table[WW_OV112_COURSE_TABLE_SIZE],
+		u64 rom_size,
+		u64 rom_mtime,
+		u32 *out_route_image_index,
+		u32 *out_route_seed,
+		char *out_body,
+		u32 out_body_size)
+{
+	const u8 *record;
+	char safe_nickname[48];
+	char *cursor;
+	size_t remaining;
+	u32 route_plus_one;
+	u32 route_image_index;
+	u32 route_seed;
+	u8 adv_type0;
+	u8 adv_type1;
+	u8 adv_type2;
+	u32 group;
+	u32 item_index;
+
+	if (!send_context || !course_table || !out_body || out_body_size < 256)
+		return false;
+	if (course_id >= WW_OV112_COURSE_COUNT)
+		return false;
+
+	record = course_table + course_id * WW_OV112_COURSE_RECORD_SIZE;
+	route_plus_one = ww_read_u32_le(record + 0x04);
+	if (route_plus_one > 0 && route_plus_one <= WW_OV112_ROUTE_IMAGE_COUNT) {
+		route_image_index = route_plus_one - 1u;
+	} else {
+		u32 route_plus_one_low = route_plus_one & 0xFFu;
+
+		if (route_plus_one_low > 0 && route_plus_one_low <= WW_OV112_ROUTE_IMAGE_COUNT)
+			route_image_index = route_plus_one_low - 1u;
+		else if (course_id < WW_OV112_ROUTE_IMAGE_COUNT)
+			route_image_index = course_id;
+		else
+			route_image_index = course_id % WW_OV112_ROUTE_IMAGE_COUNT;
+	}
+	route_seed = (u32)(svcGetSystemTick() & 0xFFFFFFFFu);
+	adv_type0 = record[WW_OV112_ADV_TYPES_OFFSET + 0u];
+	adv_type1 = record[WW_OV112_ADV_TYPES_OFFSET + 1u];
+	adv_type2 = record[WW_OV112_ADV_TYPES_OFFSET + 2u];
+	if (route_seed == 0)
+		route_seed = 0xA5A55A5Au;
+
+	if (out_route_image_index)
+		*out_route_image_index = route_image_index;
+	if (out_route_seed)
+		*out_route_seed = route_seed;
+
+	ww_sanitize_json_ascii(send_context->nickname, safe_nickname, sizeof(safe_nickname));
+	cursor = out_body;
+	remaining = out_body_size;
+
+	if (!ww_json_append(
+				&cursor,
+				&remaining,
+				"{\"speciesId\":%u,\"level\":%u,\"courseId\":%u,\"nickname\":\"%s\",\"friendship\":%u,\"heldItem\":%u,\"moves\":[%u,%u,%u,%u],\"variantFlags\":%u,\"specialFlags\":%u,\"clearBuffers\":%s,\"allowLockedCourse\":%s,\"resolvedRouteConfig\":{\"schemaVersion\":1,\"romSize\":%llu,\"romMtime\":%llu,\"routeImageIndex\":%u,\"routeSeed\":%u,\"advantagedTypes\":[%u,%u,%u],\"slots\":[",
+				(unsigned)send_context->source_slot.species_id,
+				(unsigned)level,
+				(unsigned)course_id,
+				safe_nickname,
+				(unsigned)send_context->source_slot.friendship,
+				(unsigned)send_context->held_item,
+				(unsigned)send_context->moves[0],
+				(unsigned)send_context->moves[1],
+				(unsigned)send_context->moves[2],
+				(unsigned)send_context->moves[3],
+				(unsigned)send_context->variant_flags,
+				(unsigned)send_context->special_flags,
+				clear_buffers ? "true" : "false",
+				allow_locked_course ? "true" : "false",
+				(unsigned long long)rom_size,
+				(unsigned long long)rom_mtime,
+				(unsigned)route_image_index,
+				(unsigned)route_seed,
+				(unsigned)adv_type0,
+				(unsigned)adv_type1,
+				(unsigned)adv_type2)) {
+		return false;
+	}
+
+	for (group = 0; group < 3; group++) {
+		u32 pair_base = group * 2u;
+		u32 pair_pick = ww_lcg_next(&route_seed) & 0x1u;
+		u32 source_pair_index = pair_base + pair_pick;
+		u32 base = WW_OV112_SLOT_OFFSET + source_pair_index * WW_OV112_SLOT_SIZE;
+		u16 species_id = ww_read_u16_le(record + base + 0x00);
+		u8 slot_level = record[base + 0x02];
+		u8 gender = record[base + 0x07];
+		u16 move0 = ww_read_u16_le(record + base + 0x08);
+		u16 move1 = ww_read_u16_le(record + base + 0x0A);
+		u16 move2 = ww_read_u16_le(record + base + 0x0C);
+		u16 move3 = ww_read_u16_le(record + base + 0x0E);
+		u16 min_steps = ww_read_u16_le(record + base + 0x10);
+		u16 chance_raw = ww_read_u16_le(record + base + 0x12);
+		u8 chance = chance_raw > 0xFFu ? 0xFFu : (u8)chance_raw;
+
+		if (species_id == 0) {
+			u32 alt_pair_index = pair_base + (pair_pick ^ 0x1u);
+			u32 alt_base = WW_OV112_SLOT_OFFSET + alt_pair_index * WW_OV112_SLOT_SIZE;
+			u16 alt_species_id = ww_read_u16_le(record + alt_base + 0x00);
+
+			if (alt_species_id != 0) {
+				source_pair_index = alt_pair_index;
+				base = alt_base;
+				species_id = alt_species_id;
+				slot_level = record[base + 0x02];
+				gender = record[base + 0x07];
+				move0 = ww_read_u16_le(record + base + 0x08);
+				move1 = ww_read_u16_le(record + base + 0x0A);
+				move2 = ww_read_u16_le(record + base + 0x0C);
+				move3 = ww_read_u16_le(record + base + 0x0E);
+				min_steps = ww_read_u16_le(record + base + 0x10);
+				chance_raw = ww_read_u16_le(record + base + 0x12);
+				chance = chance_raw > 0xFFu ? 0xFFu : (u8)chance_raw;
+			} else {
+				species_id = send_context->source_slot.species_id;
+				if (species_id == 0)
+					species_id = 1;
+			}
+		}
+
+		if (slot_level == 0)
+			slot_level = 1;
+		if (slot_level > 100)
+			slot_level = 100;
+
+		if (!ww_json_append(
+					&cursor,
+					&remaining,
+					"%s{\"slot\":%u,\"sourcePairIndex\":%u,\"speciesId\":%u,\"level\":%u,\"gender\":%u,\"moves\":[%u,%u,%u,%u],\"minSteps\":%u,\"chance\":%u}",
+					group == 0 ? "" : ",",
+					(unsigned)group,
+					(unsigned)source_pair_index,
+					(unsigned)species_id,
+					(unsigned)slot_level,
+					(unsigned)gender,
+					(unsigned)move0,
+					(unsigned)move1,
+					(unsigned)move2,
+					(unsigned)move3,
+					(unsigned)min_steps,
+					(unsigned)chance)) {
+			return false;
+		}
+	}
+
+	if (!ww_json_append(&cursor, &remaining, "],\"items\":["))
+		return false;
+
+	for (item_index = 0; item_index < WW_OV112_ITEM_COUNT; item_index++) {
+		u32 base = WW_OV112_ITEMS_OFFSET + item_index * WW_OV112_ITEM_SIZE;
+		u16 item_id = ww_read_u16_le(record + base + 0x00);
+		u16 min_steps = ww_read_u16_le(record + base + 0x02);
+		u16 chance_raw = ww_read_u16_le(record + base + 0x04);
+		u8 chance = chance_raw > 0xFFu ? 0xFFu : (u8)chance_raw;
+
+		if (!ww_json_append(
+					&cursor,
+					&remaining,
+					"%s{\"routeItemIndex\":%u,\"itemId\":%u,\"minSteps\":%u,\"chance\":%u}",
+					item_index == 0 ? "" : ",",
+					(unsigned)item_index,
+					(unsigned)item_id,
+					(unsigned)min_steps,
+					(unsigned)chance)) {
+			return false;
+		}
+	}
+
+	if (!ww_json_append(&cursor, &remaining, "]}}"))
+		return false;
+
+	return true;
 }
 
 static void ww_apply_dynamic_pokemon_sprite_patches(
@@ -2177,13 +2737,23 @@ static void ww_async_worker(void *arg)
 				hgss_stroll_send_context send_context;
 				hgss_box_slot_summary verify_source_slot;
 				hgss_stroll_send_report send_report;
+				u8 course_table[WW_OV112_COURSE_TABLE_SIZE];
+				char seed_trainer_name[24];
+				char backend_error[64];
+				char backend_message[192];
 				char slot_error[128];
 				char patch_error[128];
+				char *send_body = NULL;
 				u32 eeprom_watts;
+				u32 resolved_route_image_index = 0;
+				u32 resolved_route_seed = 0;
 				u32 sprite_name_patches_applied = 0;
 				u32 sprite_name_patches_failed = 0;
 				u32 sprite_image_patches_applied = 0;
 				u32 sprite_image_patches_failed = 0;
+				u64 rom_size = 0;
+				u64 rom_mtime = 0;
+				bool route_cache_hit = false;
 				u8 level;
 
 				if (!pending_nds_path[0]) {
@@ -2209,17 +2779,27 @@ static void ww_async_worker(void *arg)
 					break;
 				}
 
+				ww_sanitize_json_ascii(send_context.trainer_name, seed_trainer_name, sizeof(seed_trainer_name));
+				if (!seed_trainer_name[0])
+					snprintf(seed_trainer_name, sizeof(seed_trainer_name), "WWBRIDGE");
+
 				level = ww_estimate_level_from_exp(send_context.source_slot.exp);
 
 				if (!ww_api_patch_identity(
-						send_context.trainer_name,
+						seed_trainer_name,
 						send_context.trainer_tid,
 						send_context.trainer_sid,
 						NULL,
 						0)) {
-					success = ww_api_command_set_trainer(send_context.trainer_name, NULL, NULL, 0);
+					success = ww_api_command_set_trainer(seed_trainer_name, NULL, NULL, 0);
+					if (!success && strcmp(seed_trainer_name, "WWBRIDGE") != 0)
+						success = ww_api_command_set_trainer("WWBRIDGE", NULL, NULL, 0);
 					if (!success) {
-						snprintf(json, WW_API_RESPONSE_MAX, "failed to seed EEPROM trainer from HGSS save");
+						snprintf(
+								json,
+								WW_API_RESPONSE_MAX,
+								"failed to seed EEPROM trainer from HGSS save (trainer=\"%s\")",
+								seed_trainer_name);
 						break;
 					}
 				}
@@ -2240,22 +2820,70 @@ static void ww_async_worker(void *arg)
 					break;
 				}
 
-				success = ww_api_stroll_send(
-						send_context.source_slot.species_id,
-						level,
-						(u8)pending_send_course,
-						pending_send_clear_buffers,
-						pending_send_allow_locked,
-						send_context.nickname,
-						send_context.source_slot.friendship,
-						send_context.held_item,
-						send_context.moves,
-						send_context.variant_flags,
-						send_context.special_flags,
-						json,
-						WW_API_RESPONSE_MAX);
+				if (pending_send_course >= WW_OV112_COURSE_COUNT) {
+					snprintf(json, WW_API_RESPONSE_MAX, "course index out of range for ROM route table");
+					success = false;
+					break;
+				}
+
+				if (!ww_get_course_table_cached(pending_nds_path, course_table, &route_cache_hit)) {
+					snprintf(json, WW_API_RESPONSE_MAX, "failed to load course table from HGSS ROM/cache");
+					success = false;
+					break;
+				}
+
+				if (!ww_get_file_identity(pending_nds_path, &rom_size, &rom_mtime)) {
+					snprintf(json, WW_API_RESPONSE_MAX, "failed to read HGSS ROM metadata");
+					success = false;
+					break;
+				}
+
+				send_body = (char *)malloc(WW_STROLL_SEND_BODY_MAX);
+				if (!send_body) {
+					snprintf(json, WW_API_RESPONSE_MAX, "failed to allocate resolved send payload buffer");
+					success = false;
+					break;
+				}
+
+				if (!ww_build_resolved_stroll_send_json(
+							&send_context,
+							level,
+							pending_send_course,
+							pending_send_clear_buffers,
+							pending_send_allow_locked,
+							course_table,
+							rom_size,
+							rom_mtime,
+							&resolved_route_image_index,
+							&resolved_route_seed,
+							send_body,
+							WW_STROLL_SEND_BODY_MAX)) {
+					free(send_body);
+					send_body = NULL;
+					snprintf(json, WW_API_RESPONSE_MAX, "failed to build resolved stroll/send payload");
+					success = false;
+					break;
+				}
+
+				success = ww_api_stroll_send_resolved_json(send_body, json, WW_API_RESPONSE_MAX);
+				free(send_body);
+				send_body = NULL;
 				if (!success) {
-					snprintf(json, WW_API_RESPONSE_MAX, "stroll send request failed");
+					bool has_error = ww_json_get_string_from(json, "error", backend_error, sizeof(backend_error));
+					bool has_message = ww_json_get_string_from(json, "message", backend_message, sizeof(backend_message));
+
+					if (has_error && has_message) {
+						snprintf(
+								json,
+								WW_API_RESPONSE_MAX,
+								"stroll send request failed (%s): %s",
+								backend_error,
+								backend_message);
+					} else if (has_message) {
+						snprintf(json, WW_API_RESPONSE_MAX, "stroll send request failed: %s", backend_message);
+					} else if (!json[0]) {
+						snprintf(json, WW_API_RESPONSE_MAX, "stroll send request failed");
+					}
 					break;
 				}
 
@@ -2312,17 +2940,20 @@ static void ww_async_worker(void *arg)
 				snprintf(
 						json,
 						WW_API_RESPONSE_MAX,
-						"Sent species %u (Lv~%u) from box %lu slot %lu to route %lu | EEPROM seeded (trainer=%s tid=%u sid=%u steps=%lu watts=%lu) | dynamic-name patches applied=%lu failed=%lu | dynamic-image patches applied=%lu failed=%lu (ROM=%s) | save updated (%s, pair=%s)",
+						"Sent species %u (Lv~%u) from box %lu slot %lu to course %lu (route image %lu, seed %lu) | EEPROM seeded (trainer=%s tid=%u sid=%u steps=%lu watts=%lu) | route cache=%s | dynamic-name patches applied=%lu failed=%lu | dynamic-image patches applied=%lu failed=%lu (ROM=%s) | save updated (%s, pair=%s)",
 						(unsigned)send_context.source_slot.species_id,
 						(unsigned)level,
 						(unsigned long)pending_send_box,
 						(unsigned long)pending_send_slot,
 						(unsigned long)pending_send_course,
+						(unsigned long)resolved_route_image_index,
+						(unsigned long)resolved_route_seed,
 						send_context.trainer_name,
 						(unsigned)send_context.trainer_tid,
 						(unsigned)send_context.trainer_sid,
 						(unsigned long)send_context.pokewalker_steps,
 						(unsigned long)eeprom_watts,
+						route_cache_hit ? "hit" : "rebuilt",
 						(unsigned long)sprite_name_patches_applied,
 						(unsigned long)sprite_name_patches_failed,
 						(unsigned long)sprite_image_patches_applied,

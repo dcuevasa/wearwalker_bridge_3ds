@@ -247,6 +247,34 @@ static bool ww_http_extract_text_body(const u8 *response, u32 response_size, cha
 	if (parsed.status_code < 200 || parsed.status_code >= 300)
 		return false;
 
+	if (parsed.chunked)
+		return ww_http_decode_chunked(parsed.body, parsed.body_size, out, out_size, NULL);
+
+	if (parsed.content_length >= 0) {
+		if ((u32)parsed.content_length > parsed.body_size)
+			return false;
+		copy_size = (u32)parsed.content_length;
+	} else {
+		copy_size = parsed.body_size;
+	}
+
+	copy_size = copy_size < out_size - 1 ? copy_size : out_size - 1;
+	memcpy(out, parsed.body, copy_size);
+	out[copy_size] = '\0';
+
+	return true;
+}
+
+static bool ww_http_extract_text_body_any_status(const u8 *response, u32 response_size, char *out, u32 out_size)
+{
+	ww_http_response parsed;
+	u32 copy_size;
+
+	if (!out || out_size == 0)
+		return false;
+	if (!ww_http_parse_response(response, response_size, &parsed))
+		return false;
+
 	if (parsed.chunked) {
 		return ww_http_decode_chunked(parsed.body, parsed.body_size, out, out_size, NULL);
 	}
@@ -469,8 +497,19 @@ static bool ww_api_command_request_json(const char *method, const char *path, co
 	if (!ww_http_request_json(method, path, body_json, response, WW_API_RESPONSE_MAX, &response_size))
 		goto cleanup;
 
-	if (!ww_http_extract_text_body(response, response_size, json_buf, WW_API_RESPONSE_MAX))
+	if (!ww_http_extract_text_body(response, response_size, json_buf, WW_API_RESPONSE_MAX)) {
+		/* Keep backend error JSON for callers even when HTTP status is not 2xx. */
+		ww_http_extract_text_body_any_status(response, response_size, json_buf, WW_API_RESPONSE_MAX);
+
+		if (out_json && out_size > 0) {
+			u32 json_copy_size = (u32)strlen(json_buf);
+			if (json_copy_size >= out_size)
+				json_copy_size = out_size - 1;
+			memcpy(out_json, json_buf, json_copy_size);
+			out_json[json_copy_size] = '\0';
+		}
 		goto cleanup;
+	}
 
 	if (out_snapshot)
 		ww_snapshot_from_json(json_buf, out_snapshot);
@@ -772,6 +811,14 @@ bool ww_api_stroll_send(
 		return false;
 
 	return ww_api_command_request_json("POST", "/api/v1/stroll/send", body, NULL, out_json, out_size);
+}
+
+bool ww_api_stroll_send_resolved_json(const char *json_body, char *out_json, u32 out_size)
+{
+	if (!json_body || !json_body[0])
+		return false;
+
+	return ww_api_command_request_json("POST", "/api/v1/stroll/send", json_body, NULL, out_json, out_size);
 }
 
 bool ww_api_stroll_patch_sprite_block(

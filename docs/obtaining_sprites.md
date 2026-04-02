@@ -3,99 +3,152 @@
 ## Scope
 
 This document explains:
-- how dynamic sprite addresses are determined,
-- where each sprite comes from (name, small Pokemon, large Pokemon, route area),
-- and how route-specific sprites are selected.
 
-It also distinguishes what is implemented now versus what is planned.
+- where each dynamic Pokewalker sprite block comes from,
+- how the 3DS resolves route-dependent data from HGSS `.nds`,
+- how that data is sent to `/api/v1/stroll/send`,
+- and how sprite bytes are patched through `/api/v2/stroll/sprite-patches`.
 
-It also separates confirmed facts from current inferences when ROM origin is not fully traced.
+It documents the current strict architecture: route semantics are resolved on 3DS from ROM data, and the backend applies validated values to EEPROM.
 
 ## Current Implementation Status
 
 Implemented now:
-- Name sprites are generated directly on 3DS and patched through /api/v2/stroll/sprite-patches.
-- This includes walking Pokemon name, trainer card name, route area name, the 3 encounter Pokemon names, and the 10 route item-name sprites.
-- Pokemon animated sprites are extracted from ROM and patched through /api/v2/stroll/sprite-patches.
-- This includes walking Pokemon small/large frames, the 3 route encounter small-frame pairs, and the route/join large-frame pair.
 
-Implemented now (route profile semantics):
-- Per-course route image mapping and per-course route item tables are loaded from HGSS overlay data (not inferred from course id).
-- send flow returns both selectedCourseId and selectedRouteImageIndex (they can differ).
-- send flow returns configuredRouteItems (itemId/itemName/minSteps/chance for 10 entries).
+- Name sprites are generated directly on 3DS and patched via `/api/v2/stroll/sprite-patches`.
+- Pokemon animated sprites are extracted from ROM and patched via `/api/v2/stroll/sprite-patches`.
+- Route area image sprite (`areaSprite`) is extracted from ARM9 overlay 112 and patched via `/api/v2/stroll/sprite-patches`.
+- `/api/v1/stroll/send` requires `resolvedRouteConfig`; 3DS sends full resolved route slots/items/image metadata every send.
+- `resolvedRouteConfig.advantagedTypes` is included and validated.
 
-Planned next (offsets and protocol already prepared):
-- Route area image sprite.
+Design rule:
 
-Design rule in both stages:
-- If a block is not explicitly updated, it must remain unchanged in EEPROM.
+- If a block is not explicitly patched, it remains unchanged in EEPROM.
 
-## Confirmed vs Inferred
+## Responsibility Split (Current)
 
-Confirmed from code and references in this repository:
-- EEPROM offsets and sizes listed below are stable and validated by multiple tools.
-- Pokemon animated sprite extraction workflow exists for HG/SS NARC paths a/2/4/8 (small) and a/2/5/6 (large).
-- Name sprites can be generated on 3DS and written as valid 2bpp blocks.
+3DS responsibilities:
 
-Inferred or not yet fully mapped in this repository:
-- Exact HG/SS ROM path used by the original game for course area image tiles (areaSprite).
-- Whether the retail game pre-bakes some course name sprites or always rasterizes them at transfer time.
+- Parse HGSS `.nds` data needed for route resolution.
+- Resolve route image index, route slots, route items, and advantaged types.
+- Build/send `resolvedRouteConfig` inside `/api/v1/stroll/send`.
+- Extract sprite assets and push patch batches.
 
-## How We Know The Addresses
+Backend responsibilities:
 
-We use two independent references, then mirror them in bridge constants:
+- Validate the resolved payload contract.
+- Apply provided route slots/items/image to EEPROM.
+- Return normalized API response fields (`configuredRouteSlots`, `configuredRouteItems`, `courseSelection`, etc.).
 
-1. Structural source of truth:
-- pokewalker-eeprom-editor/src/pokewalker/spec.ts
-- The format Struct defines field order and dimensions, so offsets are deterministic.
+Important endpoint behavior:
 
-2. Runtime cross-check source:
-- PokewalkerUtils/pokewalker_flask.py
-- pngMap/gifMap uses explicit offsets used by live renderer utilities.
+- `/api/v1/stroll/send` returns `missing_resolved_route_config` if `resolvedRouteConfig` is omitted.
 
-Bridge constants are stored in:
-- scripts/eeprom_common.py (SPRITE_PATCH_LAYOUT and related constants)
+## Route Data Provenance
 
-Canonical route-profile data source is stored in:
-- pokeheartgold/asm/overlay_112.s, table block between labels ov112_021F4138 and ov112_021F5578.
-- scripts/eeprom_common.py parses this block in _load_hgss_course_profiles().
+### Canonical ROM source used by 3DS
 
-Example derivation:
-- routeInfo starts at 0x8F00 and has size 0x00BD.
-- Next byte is 0x8FBE, so areaSprite starts at 0x8FBE.
+HGSS ARM9 overlay 112 (`overlay9_112`):
 
-Size formula for 2bpp sprites:
-- bytes = width * height / 4
-- 80x16 = 320 bytes (0x140)
-- 96x16 = 384 bytes (0x180)
-- 32x24 = 192 bytes (0x0C0)
-- 64x48 = 768 bytes (0x300)
+- Route table DS virtual address: `0x021F4138`
+- Record size: `0xC0`
+- Record count currently used: 27 courses
 
-## Canonical Source For Route Profiles
+Route area image pointer table:
 
-The route-profile source used by the backend is HGSS overlay data:
-- File: pokeheartgold/asm/overlay_112.s
-- Table start label: ov112_021F4138
-- Table end anchor used by parser: ov112_021F5578
-- Record size: 0xC0 bytes per course
-- Record count used: 27 courses (same as COURSE_NAMES)
+- DS virtual address: `0x021FF528`
+- Entry lookup uses `routeImageIndex + 1`
 
-Current parser implementation:
-- scripts/eeprom_common.py:_extract_asm_byte_block(...)
-- scripts/eeprom_common.py:_load_hgss_course_profiles(...)
+### Reverse-engineering reference used for schema validation
 
-Per-course record fields currently consumed by the bridge:
-- +0x04..+0x07 (u32 LE): route image selector encoded as routeImageIndex + 1
-- +0x80..+0xBB: route item table (10 entries, 6 bytes each)
+The struct and field meaning are aligned with the provided reverse notes (`Pokewalker hacking - Dmitry.GR`, DS-side section), including `RouteInfo` and `advantagedTypes`.
 
-Route item entry layout at +0x80 + index * 6:
-- +0x00..+0x01 (u16 LE): itemId
-- +0x02..+0x03 (u16 LE): minSteps
-- +0x04..+0x05 (u16 LE): chance (bridge clamps to u8 for EEPROM write)
+```c
+struct RouteInfo {
+    uint32_t wattsToUnlock;         // +0x00
+    uint32_t imageIdx;              // +0x04
+    struct RoutePokeInfo pokes[6];  // +0x08 (6 * 0x14)
+    struct RouteItemInfo items[10]; // +0x80 (10 * 0x06)
+    uint8_t advantagedTypes[3];     // +0xBC
+    uint8_t padding;                // +0xBF
+};
+```
 
-Why this matters:
-- selectedCourseId and routeImageIndex are not always equal.
-- Using this table removes guesswork and follows the same source used by game logic.
+`advantagedTypes` values correspond to type indexes from `mTypeNames` in the same reverse notes:
+
+| Index | Type |
+|---:|---|
+| 0 | Normal |
+| 1 | Fighting |
+| 2 | Flying |
+| 3 | Poison |
+| 4 | Ground |
+| 5 | Rock |
+| 6 | Bug |
+| 7 | Ghost |
+| 8 | Steel |
+| 9 | Unknown (`(? ? ?)` placeholder) |
+| 10 | Fire |
+| 11 | Water |
+| 12 | Grass |
+| 13 | Electric |
+| 14 | Psychic |
+| 15 | Ice |
+| 16 | Dragon |
+| 17 | Dark |
+
+## How 3DS Builds `resolvedRouteConfig`
+
+Source file:
+
+- `source/ui.c` (`ww_build_resolved_stroll_send_json`)
+
+Mapping summary:
+
+- `routeImageIndex`: `imageIdx - 1` from `+0x04` (fallback to course id when zero)
+- `advantagedTypes[3]`: bytes `+0xBC..+0xBE`
+- `slots[3]`: chosen from pairs inside `pokes[6]`
+- `items[10]`: copied from `items[10]`
+
+Slot pair selection rule:
+
+- For each output slot group `(0/1), (2/3), (4/5)`, one pair member is chosen by a local LCG bit.
+- The chosen source index is serialized as `sourcePairIndex`.
+
+Field-level extraction:
+
+- Slot entry base: `+0x08 + sourcePairIndex * 0x14`
+- Slot fields:
+  - `speciesId`: `+0x00` (`u16`)
+  - `level`: `+0x02` (`u8`, clamped to minimum 1)
+  - `gender`: `+0x07` (`u8`, raw forwarded)
+  - `moves[4]`: `+0x08..+0x0F` (`u16` each)
+  - `minSteps`: `+0x10` (`u16`)
+  - `chance`: `+0x12` (`u8` chance + `u8` padding in reverse layout; client reads LE16 and clamps to `u8`)
+- Item entry base: `+0x80 + routeItemIndex * 0x06`
+- Item fields:
+  - `itemId`: `+0x00` (`u16`)
+  - `minSteps`: `+0x02` (`u16`)
+  - `chance`: `+0x04` (`u8` chance + `u8` padding in reverse layout; client reads LE16 and clamps to `u8`)
+
+Additional metadata:
+
+- `romSize` and `romMtime` come from selected ROM file metadata.
+- Client also emits `routeSeed` for reproducibility/traceability.
+
+## 3DS ROM Route Cache
+
+To avoid reparsing overlay 112 every send, 3DS stores a local cache:
+
+- Path: `sdmc:/3ds/wearwalker_bridge/rom_course_cache.bin`
+- Key fields: ROM size + ROM mtime
+- Cached payload: full `0xC0 * 27` route table block
+
+Behavior:
+
+1. Try cache load by ROM identity.
+2. If miss, read overlay 112 from `.nds`, extract table, save cache.
+3. Continue send with resolved payload.
 
 ## Dynamic Sprite Address Map
 
@@ -143,185 +196,79 @@ Why this matters:
 | routeItem8Name | 0xB4BE | 0x180 | Route item 8 name (96x16) |
 | routeItem9Name | 0xB63E | 0x180 | Route item 9 name (96x16) |
 
-### Additional known large route block (documented)
+## Source Map By Sprite Family
 
-This block exists in layout references and utility renderers:
-- join/route large frame block starts at 0x9EFE (2 frames, each 0x300)
-- frame 0: 0x9EFE
-- frame 1: 0xA1FE
-
-Reference names:
-- spec.ts: joinPokeAnimatedSprite
-- pokewalker_flask.py gifMap: route_pokemon_big
-
-## Where Each Sprite Comes From
-
-### Source map by block type
-
-| Block family | Source in our pipeline | ROM path currently used | Selection rule |
+| Block family | Source in pipeline | ROM path used | Selection rule |
 |---|---|---|---|
-| walkPokeSmall* | Pokemon sprite assets | a/2/4/8 | walking species id |
-| walkPokeLarge* | Pokemon sprite assets | a/2/5/6 | walking species id |
-| routePoke0/1/2Small* | Pokemon sprite assets | a/2/4/8 | configuredRouteSlots species ids |
-| joinPokeLarge* | Pokemon sprite assets | a/2/5/6 | configuredRouteSlots highest-chance species |
-| routePoke0/1/2Name | Generated text sprite | none (generated) | configuredRouteSlots speciesName |
-| routeItem0..9Name | Generated text sprite | none (generated) | configuredRouteItems itemName |
-| walkPokeName | Generated text sprite | none (generated) | HGSS nickname/source Pokemon name |
-| trainerCardName | Generated text sprite | none (generated) | HGSS trainer name |
-| areaNameSprite | Generated text sprite | none (generated) | selectedCourseName |
-| areaSprite | ARM9 overlay route image table | ARM9 overlay id 112 (table at 0x021FF528) | selectedRouteImageIndex |
+| walkPokeSmall* | Pokemon sprite assets | `a/2/4/8` | walking species id |
+| walkPokeLarge* | Pokemon sprite assets | `a/2/5/6` | walking species id |
+| routePoke0/1/2Small* | Pokemon sprite assets | `a/2/4/8` | resolved slot species ids |
+| joinPokeLarge* | Pokemon sprite assets | `a/2/5/6` | highest-chance resolved route slot |
+| routePoke0/1/2Name | 3DS text rasterization | n/a | species names from send response |
+| routeItem0..9Name | 3DS text rasterization | n/a | item names from send response |
+| walkPokeName | 3DS text rasterization | n/a | source Pokemon nickname |
+| trainerCardName | 3DS text rasterization | n/a | trainer name from save context |
+| areaNameSprite | 3DS text rasterization | n/a | selected course name from send response |
+| areaSprite | overlay 112 route image table | ARM9 overlay id 112 | `selectedRouteImageIndex` |
 
-Important clarification about route sprites:
-- Route encounter Pokemon sprites come from the same Pokemon sprite families as walking Pokemon (a/2/4/8 for small, a/2/5/6 for large-capable mappings), because they are still species sprites.
-- areaSprite (the 32x24 course card image) is resolved from HG/SS ARM9 overlay data, using the route image pointer table and selectedRouteImageIndex.
+## Name Sprites (3DS-generated)
 
-## 1) Name sprites (implemented)
+Name sprites are generated on 3DS using local text rasterization (`string_to_img`) and sent as 2bpp patch blocks:
 
-Generated on 3DS using local text rasterization:
-- source function: source/utils.c -> string_to_img(...)
-- output format: 2bpp tile buffer ready for EEPROM block write
+- `walkPokeName`
+- `trainerCardName`
+- `areaNameSprite`
+- `routePoke0Name`, `routePoke1Name`, `routePoke2Name`
+- `routeItem0Name` .. `routeItem9Name`
 
-Current text sources:
-- walkPokeName: HGSS send context nickname
-- areaNameSprite: selectedCourseName from /api/v1/stroll/send response
-- routePoke{0,1,2}Name: configuredRouteSlots[*].speciesName from /api/v1/stroll/send response
-- routeItem{0..9}Name: configuredRouteItems[*].itemName from /api/v1/stroll/send response
+This guarantees exact text output for dynamic content.
 
-Why we generate them:
-- These are dynamic values in real gameplay (especially Pokemon nickname and per-send route composition).
-- Generating on device guarantees we can always render the exact text we are sending.
+## Pokemon Image Sprites (ROM extracted)
 
-## 2) Pokemon image sprites (small/large)
+ROM asset archives used:
 
-ROM asset source:
-- HG/SS ROM NARC package a/2/4/8 for small animated species sprites (2x32x24 frames)
-- HG/SS ROM NARC package a/2/5/6 for large animated species sprites (2x64x48 frames)
-- tool reference: Pokewalker-Scripts/dump-sprites.py
-- data is LZ10-compressed per file, decompressed before conversion
+- Small animations: `a/2/4/8` (2 x 32x24 frames, LZ10 payload)
+- Large animations: `a/2/5/6` (2 x 64x48 frames, LZ10 payload)
 
-These asset sources are used for:
-- walking Pokemon animated sprites,
-- route encounter Pokemon animated sprites (slot 0/1/2),
-- and the route/join large animated block (joinPokeLarge0/1).
+Index convention used by the client:
 
-Important mapping note for this bridge implementation:
-- small archive (a/2/4/8): file index uses direct HGSS species id
-- large archive (a/2/5/6): file index uses HGSS species id - 1
+- Small archive index: direct HGSS species id
+- Large archive index: HGSS species id - 1
 
-Extraction helper command:
+The extracted frames are remapped with a neutral 2bpp shade map (`{0,1,2,3}`) before patching.
 
-```bash
-python3 /root/emulated_pokewalker/Pokewalker-Scripts/dump-sprites.py /path/to/a_2_4_8.narc
-# or
-python3 /root/emulated_pokewalker/Pokewalker-Scripts/dump-sprites.py /path/to/a_2_5_6.narc
-```
+## Route Area Image Extraction
 
-This produces PNG previews for each sprite entry and is used to validate index mapping.
+`areaSprite` is extracted from overlay 112, not generated from text.
 
-## 3) Route sprites and route names/images
+Current flow:
 
-Route encounter species source:
-- Backend chooses route slots in scripts/eeprom_common.py via _configure_route_from_course(...)
-- Species data comes from encounter_walker4 tables (or COURSE_SPECIES fallback)
+1. Load/decompress ARM9 overlay 112 from `.nds`.
+2. Convert DS pointer table address (`0x021FF528`) to file offset using overlay RAM base.
+3. Read pointer table entry `routeImageIndex + 1`.
+4. Resolve pointed sprite bytes and copy `0xC0` block (32x24, 2bpp).
+5. Patch `areaSprite`.
 
-Route image source:
-- Backend resolves routeImageIndex per course from HGSS overlay_112 profile data.
-- routeImageIndex written to EEPROM may differ from selectedCourseId.
+## Strict Send + Patch Flow
 
-Route item table source:
-- Backend loads per-course itemId/minSteps/chance from HGSS overlay_112 profile data.
-- Backend writes the selected course item table into EEPROM during send/start.
-- Backend returns the same table as configuredRouteItems in send response.
+1. 3DS reads `.sav` send context (species, moves, trainer identity, stats).
+2. 3DS loads route table from cache or extracts from overlay 112.
+3. 3DS builds full `/api/v1/stroll/send` payload with `resolvedRouteConfig` (including `advantagedTypes`).
+4. Backend validates and applies resolved route config into EEPROM.
+5. 3DS uses response fields (`configuredRouteSlots`, `configuredRouteItems`, `selectedRouteImageIndex`) to select sprite targets and names.
+6. 3DS patches dynamic image/text blocks through `/api/v2/stroll/sprite-patches`.
+7. Non-patched EEPROM data remains untouched.
 
-That means route sprite selection is deterministic from:
-- selected course id,
-- configured route slot species ids returned by /api/v1/stroll/send.
+## Confirmed vs Inferred
 
-For route encounter Pokemon animated sprites specifically:
-- species id -> sprite file index mapping follows the same Pokemon sprite index convention used by a/2/4/8 and a/2/5/6 workflows.
-- therefore route Pokemon images are sourced from Pokemon sprite assets, not from a separate "route Pokemon" archive.
+Confirmed in this repository:
 
-Route textual data source:
-- route area name: selectedCourseName
-- route Pokemon names: configuredRouteSlots[*].speciesName
-- route item names: configuredRouteItems[*].itemName
+- EEPROM dynamic sprite offsets/sizes listed above.
+- 3DS extraction paths for Pokemon sprites and route area sprite.
+- strict `/api/v1/stroll/send` requirement for `resolvedRouteConfig`.
+- inclusion and backend validation of `advantagedTypes` length/value bounds.
 
-Route item display name dictionary source:
-- pokewalker-eeprom-editor/src/pokewalker/types/items.ts
-- parsed by scripts/eeprom_common.py:_load_item_names()
+Still inferred or not consumed yet:
 
-Route area image source:
-- areaSprite block (0x8FBE) is the route card image block in EEPROM.
-- In this bridge implementation, the 3DS client extracts this sprite directly from the selected HG/SS .nds.
-- Source is ARM9 overlay id 112 route image pointer table (runtime address 0x021FF528).
-- selectedRouteImageIndex (0..7) maps to table entry index selectedRouteImageIndex + 1; each entry points to a 0xC0 32x24 2bpp block copied to areaSprite.
-
-## Does The Original Game Generate Text Sprites?
-
-Short answer:
-- It uses both pre-existing assets and generated text, depending on sprite type.
-
-What is clearly pre-existing:
-- Pokemon animation assets (small/large frames) exist in ROM assets (a/2/4/8 and a/2/5/6 workflows).
-- Many fixed UI graphics are static assets.
-
-What is very likely generated at send time:
-- walkPokeName and routePokeNameSprites (nickname/species text can vary per send and per language).
-- areaNameSprite can also be produced from the selected course name string.
-
-Why this is the most plausible model:
-- EEPROM stores both text fields and rendered text sprite blocks for the same logical names.
-- Dynamic nickname content is not practical to store as fully pre-baked sprites for all possibilities.
-- The bridge reproduces this behavior by rasterizing text into the exact 2bpp target buffers.
-
-## Item Probabilities And EEPROM Item Table
-
-This section documents exactly where item probabilities come from and what is written to EEPROM.
-
-Source of item probabilities and thresholds:
-- HGSS overlay profile table (overlay_112) per course, per item entry.
-- item chance is read from each 6-byte item entry and written to route item chance bytes.
-
-Related note about Pokemon encounter chances:
-- Route Pokemon slot chances (configuredRouteSlots) continue to come from COURSE_SLOT_PROFILES / encounter logic.
-- Route item chances (configuredRouteItems) come from overlay_112 item entries.
-
-EEPROM destinations used by the bridge:
-- route item ids: ROUTE_INFO + 140 (0x8F8C), 10 entries, u16 each
-- route item min steps: ROUTE_INFO + 160 (0x8FA0), 10 entries, u16 each
-- route item chance: ROUTE_INFO + 180 (0x8FB4), 10 entries, u8 each
-
-Write path on send/start:
-- scripts/eeprom_common.py:_configure_route_items_from_course(...)
-- then _write_route_item(...) writes itemId/minSteps/chance to EEPROM offsets above.
-
-Read path for dowsing rolls:
-- scripts/eeprom_common.py:_roll_dowsed_items(...)
-- uses ROUTE_ITEM_IDS_OFFSET / ROUTE_ITEM_MIN_STEPS_OFFSET / ROUTE_ITEM_CHANCE_OFFSET.
-
-What is returned to API clients:
-- /api/v1/stroll/send includes configuredRouteItems with fields:
-  - routeItemIndex
-  - itemId
-  - itemName
-  - minSteps
-  - chance
-
-## Current Image Update Flow
-
-With current ROM extraction wiring in the 3DS app, the flow is:
-
-1. Read selected .sav and .nds.
-2. Call /api/v1/stroll/send and obtain configuredRouteSlots, configuredRouteItems, selectedCourseName, and selectedRouteImageIndex.
-3. Resolve species ids:
-- walking species from HGSS send context
-- route species from configuredRouteSlots[0..2]
-- join large species from configuredRouteSlots highest chance
-4. Resolve route item names from configuredRouteItems[0..9].
-5. Extract/convert image frames from ROM assets and rasterize text sprites.
-6. Patch sprite blocks through /api/v2/stroll/sprite-patches using exact key/size matches.
-   - Pokemon images: walkPoke*, routePoke*Small*, joinPokeLarge*
-   - Text sprites: walkPokeName, trainerCardName, areaNameSprite, routePoke*Name, routeItem*Name
-7. Keep every non-patched block unchanged.
-
-This preserves existing EEPROM visual data while allowing deterministic dynamic updates.
+- semantic use of `advantagedTypes` beyond metadata/traceability in current bridge behavior.
+- exact gameplay meaning of all route slot flag bits beyond fields already serialized.

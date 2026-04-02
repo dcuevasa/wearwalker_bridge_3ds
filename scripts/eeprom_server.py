@@ -24,6 +24,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Path as ApiPath, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -260,6 +261,7 @@ class WearWalkerMockState:
         assume_national_dex: bool = True,
         unlock_special_courses: bool = False,
         unlock_event_courses: bool = False,
+        resolved_route_config: dict[str, Any] | None = None,
     ) -> dict:
         with self._lock:
             payload = send_pokemon_to_stroll(
@@ -280,6 +282,7 @@ class WearWalkerMockState:
                 assume_national_dex=assume_national_dex,
                 unlock_special_courses=unlock_special_courses,
                 unlock_event_courses=unlock_event_courses,
+                resolved_route_config=resolved_route_config,
             )
             save_eeprom(self.eeprom_path, self._eeprom)
             return payload
@@ -470,11 +473,39 @@ class StrollTickRequest(BaseModel):
     steps: int = Field(ge=0, le=0xFFFFFFFF)
 
 
+class ResolvedRouteSlotRequest(BaseModel):
+    slot: int = Field(ge=0, le=2)
+    sourcePairIndex: int | None = Field(default=None, ge=0, le=5)
+    speciesId: int = Field(ge=0, le=0xFFFF)
+    level: int = Field(ge=0, le=0xFF)
+    gender: int = Field(default=0, ge=0, le=0xFF)
+    moves: list[int] = Field(min_length=4, max_length=4)
+    minSteps: int = Field(ge=0, le=0xFFFF)
+    chance: int = Field(ge=0, le=0xFF)
+
+
+class ResolvedRouteItemRequest(BaseModel):
+    routeItemIndex: int = Field(ge=0, le=9)
+    itemId: int = Field(ge=0, le=0xFFFF)
+    minSteps: int = Field(ge=0, le=0xFFFF)
+    chance: int = Field(ge=0, le=0xFF)
+
+
+class ResolvedRouteConfigRequest(BaseModel):
+    schemaVersion: int = Field(ge=1, le=0xFFFF)
+    romSize: int = Field(ge=0, le=0xFFFFFFFFFFFFFFFF)
+    romMtime: int = Field(ge=0, le=0xFFFFFFFFFFFFFFFF)
+    routeImageIndex: int = Field(ge=0, le=0xFF)
+    advantagedTypes: list[int] = Field(min_length=3, max_length=3)
+    slots: list[ResolvedRouteSlotRequest] = Field(min_length=3, max_length=3)
+    items: list[ResolvedRouteItemRequest] = Field(min_length=10, max_length=10)
+
+
 class StrollSendRequest(BaseModel):
     speciesId: int = Field(ge=0, le=0xFFFF)
     level: int = Field(default=10, ge=1, le=100)
     routeImageIndex: int | None = Field(default=None, ge=0, le=0xFF)
-    courseId: int | None = Field(default=None, ge=0, le=26)
+    courseId: int | None = Field(default=None, ge=0, le=0xFF)
     nickname: str | None = Field(default=None, min_length=1, max_length=32)
     friendship: int | None = Field(default=None, ge=0, le=0xFF)
     heldItem: int = Field(default=0, ge=0, le=0xFFFF)
@@ -487,6 +518,7 @@ class StrollSendRequest(BaseModel):
     assumeNationalDex: bool = True
     unlockSpecialCourses: bool = False
     unlockEventCourses: bool = False
+    resolvedRouteConfig: ResolvedRouteConfigRequest | None = None
 
 
 class SpritePatchEntryRequest(BaseModel):
@@ -541,6 +573,17 @@ def create_app(eeprom_path: Path) -> FastAPI:
     def ensure_patch_has_values(body: BaseModel) -> None:
         if not any(value is not None for value in body.model_dump().values()):
             raise ValueError("At least one field must be provided")
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        details = exc.errors()
+        print(f"[request-validation] {request.method} {request.url.path}: {details}")
+        return json_error(
+            422,
+            "request_validation_error",
+            "Request payload failed schema validation",
+            detail=details,
+        )
 
     @app.get("/")
     def root() -> dict:
@@ -704,6 +747,13 @@ def create_app(eeprom_path: Path) -> FastAPI:
     @app.post("/api/v1/stroll/send")
     def stroll_send(body: StrollSendRequest) -> dict:
         try:
+            if body.resolvedRouteConfig is None:
+                return json_error(
+                    400,
+                    "missing_resolved_route_config",
+                    "resolvedRouteConfig is required; route/items/encounters must be resolved by 3DS",
+                )
+
             payload = app.state.ww_state.mutate_stroll_send(
                 species_id=body.speciesId,
                 level=body.level,
@@ -721,6 +771,7 @@ def create_app(eeprom_path: Path) -> FastAPI:
                 assume_national_dex=body.assumeNationalDex,
                 unlock_special_courses=body.unlockSpecialCourses,
                 unlock_event_courses=body.unlockEventCourses,
+                resolved_route_config=body.resolvedRouteConfig.model_dump(),
             )
             return {"status": "ok", **payload}
         except ValueError as exc:
