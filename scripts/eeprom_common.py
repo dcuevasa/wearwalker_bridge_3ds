@@ -44,6 +44,72 @@ ROUTE_INFO_SIZE = 0x00BD
 ROUTE_WALKING_SPECIES_OFFSET = ROUTE_INFO_OFFSET
 ROUTE_IMAGE_INDEX_OFFSET = ROUTE_INFO_OFFSET + 39
 
+AREA_SPRITE_OFFSET = 0x8FBE
+AREA_SPRITE_SIZE = 0x00C0
+AREA_NAME_SPRITE_OFFSET = 0x907E
+AREA_NAME_SPRITE_SIZE = 0x0140
+TRAINER_CARD_NAME_SPRITE_OFFSET = 0x1250
+TRAINER_CARD_NAME_SPRITE_SIZE = 0x0140
+
+WALK_POKE_SMALL_FRAME_SIZE = 0x00C0
+WALK_POKE_LARGE_FRAME_SIZE = 0x0300
+
+WALK_POKE_SMALL_FRAME0_OFFSET = 0x91BE
+WALK_POKE_SMALL_FRAME1_OFFSET = 0x927E
+WALK_POKE_LARGE_FRAME0_OFFSET = 0x933E
+WALK_POKE_LARGE_FRAME1_OFFSET = 0x963E
+WALK_POKE_NAME_SPRITE_OFFSET = 0x993E
+JOIN_POKE_LARGE_FRAME0_OFFSET = 0x9EFE
+JOIN_POKE_LARGE_FRAME1_OFFSET = 0xA1FE
+
+ROUTE_POKE_SMALL_FRAME_SIZE = 0x00C0
+ROUTE_POKE_NAME_SPRITE_SIZE = 0x0140
+ROUTE_ITEM_NAME_SPRITE_SIZE = 0x0180
+ROUTE_ITEM_NAME_SPRITES_OFFSET = 0xA8BE
+ROUTE_ITEM_SLOTS = 10
+
+ROUTE_POKE0_SMALL_FRAME0_OFFSET = 0x9A7E
+ROUTE_POKE0_SMALL_FRAME1_OFFSET = 0x9B3E
+ROUTE_POKE1_SMALL_FRAME0_OFFSET = 0x9BFE
+ROUTE_POKE1_SMALL_FRAME1_OFFSET = 0x9CBE
+ROUTE_POKE2_SMALL_FRAME0_OFFSET = 0x9D7E
+ROUTE_POKE2_SMALL_FRAME1_OFFSET = 0x9E3E
+ROUTE_POKE0_NAME_OFFSET = 0xA4FE
+ROUTE_POKE1_NAME_OFFSET = 0xA63E
+ROUTE_POKE2_NAME_OFFSET = 0xA77E
+
+SPRITE_PATCH_LAYOUT: dict[str, tuple[int, int]] = {
+    "trainerCardName": (TRAINER_CARD_NAME_SPRITE_OFFSET, TRAINER_CARD_NAME_SPRITE_SIZE),
+    "areaSprite": (AREA_SPRITE_OFFSET, AREA_SPRITE_SIZE),
+    "areaNameSprite": (AREA_NAME_SPRITE_OFFSET, AREA_NAME_SPRITE_SIZE),
+    "walkPokeSmall0": (WALK_POKE_SMALL_FRAME0_OFFSET, WALK_POKE_SMALL_FRAME_SIZE),
+    "walkPokeSmall1": (WALK_POKE_SMALL_FRAME1_OFFSET, WALK_POKE_SMALL_FRAME_SIZE),
+    "walkPokeLarge0": (WALK_POKE_LARGE_FRAME0_OFFSET, WALK_POKE_LARGE_FRAME_SIZE),
+    "walkPokeLarge1": (WALK_POKE_LARGE_FRAME1_OFFSET, WALK_POKE_LARGE_FRAME_SIZE),
+    "joinPokeLarge0": (JOIN_POKE_LARGE_FRAME0_OFFSET, WALK_POKE_LARGE_FRAME_SIZE),
+    "joinPokeLarge1": (JOIN_POKE_LARGE_FRAME1_OFFSET, WALK_POKE_LARGE_FRAME_SIZE),
+    "walkPokeName": (WALK_POKE_NAME_SPRITE_OFFSET, ROUTE_POKE_NAME_SPRITE_SIZE),
+    "routePoke0Small0": (ROUTE_POKE0_SMALL_FRAME0_OFFSET, ROUTE_POKE_SMALL_FRAME_SIZE),
+    "routePoke0Small1": (ROUTE_POKE0_SMALL_FRAME1_OFFSET, ROUTE_POKE_SMALL_FRAME_SIZE),
+    "routePoke1Small0": (ROUTE_POKE1_SMALL_FRAME0_OFFSET, ROUTE_POKE_SMALL_FRAME_SIZE),
+    "routePoke1Small1": (ROUTE_POKE1_SMALL_FRAME1_OFFSET, ROUTE_POKE_SMALL_FRAME_SIZE),
+    "routePoke2Small0": (ROUTE_POKE2_SMALL_FRAME0_OFFSET, ROUTE_POKE_SMALL_FRAME_SIZE),
+    "routePoke2Small1": (ROUTE_POKE2_SMALL_FRAME1_OFFSET, ROUTE_POKE_SMALL_FRAME_SIZE),
+    "routePoke0Name": (ROUTE_POKE0_NAME_OFFSET, ROUTE_POKE_NAME_SPRITE_SIZE),
+    "routePoke1Name": (ROUTE_POKE1_NAME_OFFSET, ROUTE_POKE_NAME_SPRITE_SIZE),
+    "routePoke2Name": (ROUTE_POKE2_NAME_OFFSET, ROUTE_POKE_NAME_SPRITE_SIZE),
+    "routeItem0Name": (ROUTE_ITEM_NAME_SPRITES_OFFSET + ROUTE_ITEM_NAME_SPRITE_SIZE * 0, ROUTE_ITEM_NAME_SPRITE_SIZE),
+    "routeItem1Name": (ROUTE_ITEM_NAME_SPRITES_OFFSET + ROUTE_ITEM_NAME_SPRITE_SIZE * 1, ROUTE_ITEM_NAME_SPRITE_SIZE),
+    "routeItem2Name": (ROUTE_ITEM_NAME_SPRITES_OFFSET + ROUTE_ITEM_NAME_SPRITE_SIZE * 2, ROUTE_ITEM_NAME_SPRITE_SIZE),
+    "routeItem3Name": (ROUTE_ITEM_NAME_SPRITES_OFFSET + ROUTE_ITEM_NAME_SPRITE_SIZE * 3, ROUTE_ITEM_NAME_SPRITE_SIZE),
+    "routeItem4Name": (ROUTE_ITEM_NAME_SPRITES_OFFSET + ROUTE_ITEM_NAME_SPRITE_SIZE * 4, ROUTE_ITEM_NAME_SPRITE_SIZE),
+    "routeItem5Name": (ROUTE_ITEM_NAME_SPRITES_OFFSET + ROUTE_ITEM_NAME_SPRITE_SIZE * 5, ROUTE_ITEM_NAME_SPRITE_SIZE),
+    "routeItem6Name": (ROUTE_ITEM_NAME_SPRITES_OFFSET + ROUTE_ITEM_NAME_SPRITE_SIZE * 6, ROUTE_ITEM_NAME_SPRITE_SIZE),
+    "routeItem7Name": (ROUTE_ITEM_NAME_SPRITES_OFFSET + ROUTE_ITEM_NAME_SPRITE_SIZE * 7, ROUTE_ITEM_NAME_SPRITE_SIZE),
+    "routeItem8Name": (ROUTE_ITEM_NAME_SPRITES_OFFSET + ROUTE_ITEM_NAME_SPRITE_SIZE * 8, ROUTE_ITEM_NAME_SPRITE_SIZE),
+    "routeItem9Name": (ROUTE_ITEM_NAME_SPRITES_OFFSET + ROUTE_ITEM_NAME_SPRITE_SIZE * 9, ROUTE_ITEM_NAME_SPRITE_SIZE),
+}
+
 INVENTORY_CAUGHT_OFFSET = 0xCE8C
 INVENTORY_CAUGHT_SLOTS = 3
 INVENTORY_CAUGHT_ENTRY_SIZE = 16
@@ -84,6 +150,9 @@ ROUTE_POKES_OFFSET = ROUTE_INFO_OFFSET + 82
 ROUTE_POKE_SLOTS = 3
 ROUTE_POKE_MIN_STEPS_OFFSET = ROUTE_INFO_OFFSET + 130
 ROUTE_POKE_CHANCE_OFFSET = ROUTE_INFO_OFFSET + 136
+ROUTE_ITEM_IDS_OFFSET = ROUTE_INFO_OFFSET + 140
+ROUTE_ITEM_MIN_STEPS_OFFSET = ROUTE_INFO_OFFSET + 160
+ROUTE_ITEM_CHANCE_OFFSET = ROUTE_INFO_OFFSET + 180
 
 TEAM_OFFSET = 0xCC00
 TEAM_UNIQ_OFFSET = TEAM_OFFSET + 8
@@ -144,6 +213,15 @@ SPECIES_TS_PATH = (
     / "types"
     / "species.ts"
 )
+ITEMS_TS_PATH = (
+    MONOREPO_ROOT
+    / "pokewalker-eeprom-editor"
+    / "src"
+    / "pokewalker"
+    / "types"
+    / "items.ts"
+)
+POKEHEARTGOLD_OV112_PATH = MONOREPO_ROOT / "pokeheartgold" / "asm" / "overlay_112.s"
 
 COURSE_NAMES: tuple[str, ...] = (
     "Refreshing Field",
@@ -655,8 +733,10 @@ NATURE_EFFECTS: tuple[tuple[int, int], ...] = (
 )
 
 _SPECIES_NAMES_CACHE: list[str] | None = None
+_ITEM_NAMES_CACHE: list[str] | None = None
 _PERSONAL_HGSS_CACHE: bytes | None = None
 _WALKER_ENCOUNTERS_CACHE: dict[int, list[dict[str, Any]]] | None = None
+_HGSS_COURSE_PROFILES_CACHE: list[dict[str, Any]] | None = None
 
 
 MAX_TRAINER_CHARS = 8
@@ -709,6 +789,150 @@ def _species_name(species_id: int) -> str:
     if 0 <= species_id < len(names):
         return names[species_id]
     return f"SPECIES_{species_id}"
+
+
+def _load_item_names() -> list[str]:
+    global _ITEM_NAMES_CACHE
+    if _ITEM_NAMES_CACHE is not None:
+        return _ITEM_NAMES_CACHE
+
+    names: list[str] = []
+    if ITEMS_TS_PATH.exists():
+        pattern = re.compile(r'^\s*"([^"]+)"\s*,?\s*$')
+        text = ITEMS_TS_PATH.read_text(encoding="utf-8", errors="ignore")
+        for line in text.splitlines():
+            match = pattern.match(line)
+            if match:
+                names.append(match.group(1))
+
+    if not names:
+        names = ["None"]
+
+    _ITEM_NAMES_CACHE = names
+    return names
+
+
+def _item_name(item_id: int) -> str:
+    names = _load_item_names()
+    if 0 <= item_id < len(names):
+        return names[item_id]
+    return f"ITEM_{item_id}"
+
+
+def _extract_asm_byte_block(text: str, start_label: str, end_label: str) -> list[int]:
+    try:
+        start = text.index(start_label)
+        end = text.index(end_label, start)
+    except ValueError:
+        return []
+
+    values: list[int] = []
+    chunk = text[start:end]
+    for match in re.finditer(r"\.byte\s+([^\n]+)", chunk):
+        for token in match.group(1).split(","):
+            raw = token.strip()
+            if not raw:
+                continue
+            try:
+                values.append(int(raw, 0))
+            except ValueError:
+                return []
+
+    return values
+
+
+def _load_hgss_course_profiles() -> list[dict[str, Any]] | None:
+    global _HGSS_COURSE_PROFILES_CACHE
+    if _HGSS_COURSE_PROFILES_CACHE is not None:
+        return _HGSS_COURSE_PROFILES_CACHE
+
+    if not POKEHEARTGOLD_OV112_PATH.exists():
+        _HGSS_COURSE_PROFILES_CACHE = []
+        return None
+
+    table_bytes = _extract_asm_byte_block(
+        POKEHEARTGOLD_OV112_PATH.read_text(encoding="utf-8", errors="ignore"),
+        "ov112_021F4138:",
+        "ov112_021F5578:",
+    )
+    record_size = 0xC0
+    expected_size = len(COURSE_NAMES) * record_size
+    if len(table_bytes) < expected_size:
+        _HGSS_COURSE_PROFILES_CACHE = []
+        return None
+
+    profiles: list[dict[str, Any]] = []
+    for course_id in range(len(COURSE_NAMES)):
+        base = course_id * record_size
+        route_plus_one = int.from_bytes(
+            bytes(table_bytes[base + 0x04 : base + 0x08]),
+            "little",
+        )
+        route_image_index = route_plus_one - 1 if route_plus_one > 0 else course_id
+
+        items: list[dict[str, int]] = []
+        for item_index in range(ROUTE_ITEM_SLOTS):
+            item_base = base + 0x80 + item_index * 6
+            item_id = int.from_bytes(bytes(table_bytes[item_base : item_base + 2]), "little")
+            min_steps = int.from_bytes(bytes(table_bytes[item_base + 2 : item_base + 4]), "little")
+            chance = int.from_bytes(bytes(table_bytes[item_base + 4 : item_base + 6]), "little")
+            items.append(
+                {
+                    "routeItemIndex": item_index,
+                    "itemId": item_id,
+                    "minSteps": min_steps,
+                    "chance": max(0, min(chance, 0xFF)),
+                }
+            )
+
+        profiles.append(
+            {
+                "courseId": course_id,
+                "routeImageIndex": route_image_index & 0xFF,
+                "items": items,
+            }
+        )
+
+    _HGSS_COURSE_PROFILES_CACHE = profiles
+    return profiles
+
+
+def _hgss_course_profile(course_id: int) -> dict[str, Any] | None:
+    profiles = _load_hgss_course_profiles()
+    if not profiles:
+        return None
+    if 0 <= course_id < len(profiles):
+        return profiles[course_id]
+    return None
+
+
+def _route_image_index_for_course(course_id: int) -> int:
+    profile = _hgss_course_profile(course_id)
+    if profile is not None:
+        return int(profile.get("routeImageIndex", course_id)) & 0xFF
+    return course_id & 0xFF
+
+
+def _course_id_for_route_image_index(route_image_index: int) -> int | None:
+    profiles = _load_hgss_course_profiles()
+    if profiles:
+        for profile in profiles:
+            if int(profile.get("routeImageIndex", -1)) == route_image_index:
+                return int(profile.get("courseId", 0))
+
+    if 0 <= route_image_index < len(COURSE_NAMES):
+        return route_image_index
+    return None
+
+
+def _course_id_from_route_name(route_name: str) -> int | None:
+    clean = route_name.strip()
+    if not clean:
+        return None
+    for course_id, course_name in enumerate(COURSE_NAMES):
+        if course_name == clean:
+            return course_id
+    return None
 
 
 def _load_personal_hgss_table() -> bytes | None:
@@ -1553,12 +1777,65 @@ def set_stats_section(
         _write_step_history(eeprom, step_history)
 
 
+def _resolve_route_course_id(eeprom: bytearray) -> int | None:
+    route_name = _read_device_text_fixed(eeprom, ROUTE_NAME_OFFSET, ROUTE_NAME_CHARS)
+    from_name = _course_id_from_route_name(route_name)
+    if from_name is not None:
+        return from_name
+    return _course_id_for_route_image_index(int(eeprom[ROUTE_IMAGE_INDEX_OFFSET]))
+
+
+def _read_route_item(eeprom: bytearray, item_index: int) -> dict[str, Any]:
+    if item_index < 0 or item_index >= ROUTE_ITEM_SLOTS:
+        raise ValueError(f"route item index out of range (0..{ROUTE_ITEM_SLOTS - 1}): {item_index}")
+
+    item_id = read_u16_le(eeprom, ROUTE_ITEM_IDS_OFFSET + item_index * 2)
+    min_steps = read_u16_le(eeprom, ROUTE_ITEM_MIN_STEPS_OFFSET + item_index * 2)
+    chance = eeprom[ROUTE_ITEM_CHANCE_OFFSET + item_index]
+    return {
+        "routeItemIndex": item_index,
+        "itemId": item_id,
+        "itemName": _item_name(item_id),
+        "minSteps": min_steps,
+        "chance": chance,
+    }
+
+
+def _write_route_item(
+    eeprom: bytearray,
+    item_index: int,
+    *,
+    item_id: int,
+    min_steps: int,
+    chance: int,
+) -> None:
+    if item_index < 0 or item_index >= ROUTE_ITEM_SLOTS:
+        raise ValueError(f"route item index out of range (0..{ROUTE_ITEM_SLOTS - 1}): {item_index}")
+
+    write_u16_le(eeprom, ROUTE_ITEM_IDS_OFFSET + item_index * 2, _validate_u16("itemId", item_id))
+    write_u16_le(
+        eeprom,
+        ROUTE_ITEM_MIN_STEPS_OFFSET + item_index * 2,
+        _validate_u16("minSteps", min_steps),
+    )
+    eeprom[ROUTE_ITEM_CHANCE_OFFSET + item_index] = _validate_u8("chance", chance)
+
+
+def _read_route_items(eeprom: bytearray) -> list[dict[str, Any]]:
+    return [_read_route_item(eeprom, item_index) for item_index in range(ROUTE_ITEM_SLOTS)]
+
+
 def read_stroll_section(eeprom: bytearray) -> Dict[str, Any]:
     _check_size(eeprom)
     walking = _read_pokemon_summary(eeprom, ROUTE_INFO_OFFSET)
     route_index = eeprom[ROUTE_IMAGE_INDEX_OFFSET]
+    route_course_id = _resolve_route_course_id(eeprom)
     route_name = _read_device_text_fixed(eeprom, ROUTE_NAME_OFFSET, ROUTE_NAME_CHARS)
-    route_course_name = COURSE_NAMES[route_index] if 0 <= route_index < len(COURSE_NAMES) else None
+    route_course_name = (
+        COURSE_NAMES[route_course_id]
+        if route_course_id is not None and 0 <= route_course_id < len(COURSE_NAMES)
+        else None
+    )
     return {
         "sessionWatts": read_u16_be(eeprom, SESSION_WATTS_OFFSET),
         "walkingSpecies": walking["speciesId"],
@@ -1567,8 +1844,10 @@ def read_stroll_section(eeprom: bytearray) -> Dict[str, Any]:
         "walkingNickname": _read_device_text_fixed(eeprom, ROUTE_NICKNAME_OFFSET, ROUTE_NICKNAME_CHARS),
         "walkingFriendship": eeprom[ROUTE_FRIENDSHIP_OFFSET],
         "routeImageIndex": route_index,
+        "routeCourseId": route_course_id,
         "routeCourseName": route_course_name,
         "routeName": route_name,
+        "routeItems": _read_route_items(eeprom),
         "routeInfoOffset": ROUTE_INFO_OFFSET,
         "routeInfoSize": ROUTE_INFO_SIZE,
         "routeInfoPreviewHex": eeprom[
@@ -1680,8 +1959,48 @@ def _configure_route_from_course(
             }
         )
 
-    eeprom[ROUTE_IMAGE_INDEX_OFFSET] = course_id & 0xFF
+    eeprom[ROUTE_IMAGE_INDEX_OFFSET] = _validate_u8(
+        "routeImageIndex",
+        _route_image_index_for_course(course_id),
+    )
     _write_device_text_fixed(eeprom, ROUTE_NAME_OFFSET, ROUTE_NAME_CHARS, COURSE_NAMES[course_id])
+    return configured
+
+
+def _configure_route_items_from_course(eeprom: bytearray, course_id: int) -> list[dict[str, Any]]:
+    profile = _hgss_course_profile(course_id)
+    configured: list[dict[str, Any]] = []
+
+    if profile is None:
+        return _read_route_items(eeprom)
+
+    raw_items = profile.get("items")
+    if not isinstance(raw_items, list) or len(raw_items) < ROUTE_ITEM_SLOTS:
+        return _read_route_items(eeprom)
+
+    for item_index in range(ROUTE_ITEM_SLOTS):
+        entry = raw_items[item_index]
+        item_id = int(entry.get("itemId", 0)) if isinstance(entry, dict) else 0
+        min_steps = int(entry.get("minSteps", 0)) if isinstance(entry, dict) else 0
+        chance = int(entry.get("chance", 0)) if isinstance(entry, dict) else 0
+
+        _write_route_item(
+            eeprom,
+            item_index,
+            item_id=item_id,
+            min_steps=min_steps,
+            chance=chance,
+        )
+        configured.append(
+            {
+                "routeItemIndex": item_index,
+                "itemId": _validate_u16("itemId", item_id),
+                "itemName": _item_name(item_id),
+                "minSteps": _validate_u16("minSteps", min_steps),
+                "chance": _validate_u8("chance", chance),
+            }
+        )
+
     return configured
 
 
@@ -1842,7 +2161,8 @@ def add_inventory_caught_species(
     eeprom: bytearray, species_id: int, replace_slot: int | None = None
 ) -> Dict[str, int]:
     _check_size(eeprom)
-    preferred_course = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
+    resolved_course_id = _resolve_route_course_id(eeprom)
+    preferred_course = int(resolved_course_id) if resolved_course_id is not None else 0
     legal_entry = _find_walker_encounter_by_species(species_id, preferred_course=preferred_course)
 
     if legal_entry is None:
@@ -2120,7 +2440,11 @@ def send_pokemon_to_stroll(
                 "Both courseId and routeImageIndex were provided; courseId was used for route configuration"
             )
     else:
-        current_course = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
+        current_course = _resolve_route_course_id(eeprom)
+        if current_course is None:
+            current_route_index = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
+            current_course = current_route_index if current_route_index < len(COURSE_NAMES) else 0
+
         if current_course in unlocked_courses:
             selected_course = current_course
         elif unlocked_courses:
@@ -2134,8 +2458,8 @@ def send_pokemon_to_stroll(
             course_note = "No unlocked courses detected; defaulted to route 0"
 
     route_cfg: list[dict[str, Any]] = _configure_route_from_course(eeprom, selected_course, rng=rng)
-    route_image_index = selected_course
-    eeprom[ROUTE_IMAGE_INDEX_OFFSET] = _validate_u8("routeImageIndex", route_image_index)
+    route_items_cfg = _configure_route_items_from_course(eeprom, selected_course)
+    selected_route_image_index = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
 
     if friendship is None:
         friendship = _species_base_friendship(sid)
@@ -2185,7 +2509,7 @@ def send_pokemon_to_stroll(
         eeprom,
         event_type=EVENT_TYPE_STROLL_DEPART,
         walking_species=sid,
-        route_image_idx=route_image_index,
+        route_image_idx=selected_route_image_index,
         friendship=friendship_u8,
         companion_name=display_name,
     )
@@ -2206,17 +2530,17 @@ def send_pokemon_to_stroll(
             "level": lvl,
             "friendship": friendship_u8,
             "nickname": display_name,
-            "routeImageIndex": int(eeprom[ROUTE_IMAGE_INDEX_OFFSET]),
-            "routeCourseName": COURSE_NAMES[int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])]
-            if int(eeprom[ROUTE_IMAGE_INDEX_OFFSET]) < len(COURSE_NAMES)
-            else None,
+            "routeImageIndex": selected_route_image_index,
+            "routeCourseId": selected_course,
+            "routeCourseName": COURSE_NAMES[selected_course],
         },
         "courseSelection": {
             "requestedCourseId": requested_course,
-            "selectedCourseId": int(eeprom[ROUTE_IMAGE_INDEX_OFFSET]),
-            "selectedCourseName": COURSE_NAMES[int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])],
+            "selectedCourseId": selected_course,
+            "selectedCourseName": COURSE_NAMES[selected_course],
+            "selectedRouteImageIndex": selected_route_image_index,
             "allowLockedCourse": bool(allow_locked_course),
-            "autoSelected": requested_course is None or int(eeprom[ROUTE_IMAGE_INDEX_OFFSET]) != requested_course,
+            "autoSelected": requested_course is None or selected_course != requested_course,
             "note": course_note,
         },
         "courseUnlocks": {
@@ -2224,11 +2548,15 @@ def send_pokemon_to_stroll(
             "after": unlock_state_after,
         },
         "configuredRouteSlots": route_cfg,
+        "configuredRouteItems": route_items_cfg,
         "stroll": read_stroll_section(eeprom),
         "routes": read_routes_section(eeprom),
         "journalEntry": journal_entry,
         "consoleLog": [
-            f"[DEPART] {_species_name(sid)} Lv{lvl} sent to route {int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])}",
+            (
+                f"[DEPART] {_species_name(sid)} Lv{lvl} sent to course {selected_course} "
+                f"(route image {selected_route_image_index})"
+            ),
         ],
     }
 
@@ -2687,6 +3015,7 @@ def clear_stroll_buffers(
 def _stroll_status(eeprom: bytearray) -> dict[str, Any]:
     walking = _read_pokemon_summary(eeprom, ROUTE_INFO_OFFSET)
     route_index = eeprom[ROUTE_IMAGE_INDEX_OFFSET]
+    route_course_id = _resolve_route_course_id(eeprom)
     team_levels = []
     for slot in range(TEAM_POKE_COUNT):
         offset = TEAM_POKES_OFFSET + slot * TEAM_POKE_ENTRY_SIZE
@@ -2701,9 +3030,15 @@ def _stroll_status(eeprom: bytearray) -> dict[str, Any]:
         "walkingNickname": _read_device_text_fixed(eeprom, ROUTE_NICKNAME_OFFSET, ROUTE_NICKNAME_CHARS),
         "walkingFriendship": eeprom[ROUTE_FRIENDSHIP_OFFSET],
         "routeImageIndex": route_index,
-        "routeCourseName": COURSE_NAMES[route_index] if 0 <= route_index < len(COURSE_NAMES) else None,
+        "routeCourseId": route_course_id,
+        "routeCourseName": (
+            COURSE_NAMES[route_course_id]
+            if route_course_id is not None and 0 <= route_course_id < len(COURSE_NAMES)
+            else None
+        ),
         "routeName": _read_device_text_fixed(eeprom, ROUTE_NAME_OFFSET, ROUTE_NAME_CHARS),
         "routeSlots": _read_route_slots(eeprom),
+        "routeItems": _read_route_items(eeprom),
         "teamLevels": team_levels,
         "inventory": read_inventory_section(eeprom),
     }
@@ -2748,6 +3083,8 @@ def start_stroll(
     rng_seed = int(seed) if seed is not None else int(time.time())
     rng = random.Random(rng_seed)
     configured_slots = _configure_route_from_course(eeprom, course_id, rng=rng)
+    configured_items = _configure_route_items_from_course(eeprom, course_id)
+    selected_route_image_index = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
 
     walking_summary = _pokemon_summary_from_values(
         species_id,
@@ -2776,7 +3113,7 @@ def start_stroll(
             "eventType": EVENT_TYPE_STROLL_DEPART,
             "walkingSpecies": species_id,
             "caughtSpecies": 0,
-            "routeImageIndex": course_id,
+            "routeImageIndex": selected_route_image_index,
             "friendship": base_friendship,
             "stepCount": read_steps(eeprom),
             "watts": read_current_watts(eeprom),
@@ -2790,11 +3127,13 @@ def start_stroll(
         "teamSlot": team_slot,
         "courseId": course_id,
         "courseName": COURSE_NAMES[course_id],
+        "routeImageIndex": selected_route_image_index,
         "seed": rng_seed,
         "walkingCompanion": _read_pokemon_summary(eeprom, ROUTE_INFO_OFFSET),
         "walkingNickname": _read_device_text_fixed(eeprom, ROUTE_NICKNAME_OFFSET, ROUTE_NICKNAME_CHARS),
         "walkingFriendship": eeprom[ROUTE_FRIENDSHIP_OFFSET],
         "routeSlots": configured_slots,
+        "routeItems": configured_items,
         "buffers": clear_result,
         "journalEntry": log_entry,
     }
@@ -2849,12 +3188,12 @@ def _roll_dowsed_items(
     rng: random.Random,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    for item_index in range(10):
-        item_id = read_u16_le(eeprom, ROUTE_INFO_OFFSET + 140 + item_index * 2)
+    for item_index in range(ROUTE_ITEM_SLOTS):
+        item_id = read_u16_le(eeprom, ROUTE_ITEM_IDS_OFFSET + item_index * 2)
         if item_id == 0:
             continue
-        min_steps = read_u16_le(eeprom, ROUTE_INFO_OFFSET + 160 + item_index * 2)
-        chance = eeprom[ROUTE_INFO_OFFSET + 180 + item_index]
+        min_steps = read_u16_le(eeprom, ROUTE_ITEM_MIN_STEPS_OFFSET + item_index * 2)
+        chance = eeprom[ROUTE_ITEM_CHANCE_OFFSET + item_index]
         if steps_delta < min_steps:
             continue
         if chance <= 0:
@@ -2869,6 +3208,7 @@ def _roll_dowsed_items(
             {
                 "routeItemIndex": item_index,
                 "itemId": item_id,
+                "itemName": _item_name(item_id),
                 "minSteps": min_steps,
                 "chance": chance,
                 "placement": placement,
@@ -2953,6 +3293,7 @@ def return_from_stroll(
                 {
                     "routeItemIndex": None,
                     "itemId": int(item_id),
+                    "itemName": _item_name(int(item_id)),
                     "minSteps": 0,
                     "chance": 100,
                     "placement": placement,
@@ -3082,18 +3423,26 @@ def stroll_report(eeprom: bytearray) -> dict[str, Any]:
 def read_routes_section(eeprom: bytearray) -> Dict[str, Any]:
     _check_size(eeprom)
     route_index = eeprom[ROUTE_IMAGE_INDEX_OFFSET]
+    route_course_id = _resolve_route_course_id(eeprom)
     unlocks = build_course_unlock_state(eeprom)
+    unlocked_courses = [int(value) for value in unlocks.get("unlockedCourses", [])]
     return {
         "routeInfoOffset": ROUTE_INFO_OFFSET,
         "routeInfoSize": ROUTE_INFO_SIZE,
         "walkingSpecies": read_u16_le(eeprom, ROUTE_WALKING_SPECIES_OFFSET),
         "walkingSpeciesName": _species_name(read_u16_le(eeprom, ROUTE_WALKING_SPECIES_OFFSET)),
         "routeImageIndex": route_index,
-        "routeCourseName": COURSE_NAMES[route_index] if 0 <= route_index < len(COURSE_NAMES) else None,
+        "routeCourseId": route_course_id,
+        "routeCourseName": (
+            COURSE_NAMES[route_course_id]
+            if route_course_id is not None and 0 <= route_course_id < len(COURSE_NAMES)
+            else None
+        ),
         "routeName": _read_device_text_fixed(eeprom, ROUTE_NAME_OFFSET, ROUTE_NAME_CHARS),
-        "routeCourseUnlocked": route_index in [int(value) for value in unlocks.get("unlockedCourses", [])],
+        "routeCourseUnlocked": route_course_id in unlocked_courses if route_course_id is not None else False,
         "courseUnlocks": unlocks,
         "routeSlots": _read_route_slots(eeprom),
+        "routeItems": _read_route_items(eeprom),
         "routeInfoPreviewHex": eeprom[
             ROUTE_INFO_OFFSET : ROUTE_INFO_OFFSET + min(64, ROUTE_INFO_SIZE)
         ].hex(),
@@ -3121,6 +3470,69 @@ def build_sync_package(eeprom: bytearray) -> Dict[str, Any]:
     }
 
 
+def _decode_hex_payload(name: str, payload_hex: str) -> bytes:
+    if not isinstance(payload_hex, str) or not payload_hex.strip():
+        raise ValueError(f"{name} must be a non-empty hex string")
+
+    clean = payload_hex.strip()
+    if clean.startswith(("0x", "0X")):
+        clean = clean[2:]
+    if len(clean) % 2 != 0:
+        raise ValueError(f"{name} hex payload must have even length")
+
+    try:
+        return bytes.fromhex(clean)
+    except ValueError as exc:
+        raise ValueError(f"{name} has invalid hex payload") from exc
+
+
+def apply_sprite_patches(eeprom: bytearray, patches: list[Dict[str, Any]]) -> Dict[str, Any]:
+    _check_size(eeprom)
+    if not isinstance(patches, list) or not patches:
+        raise ValueError("patches must be a non-empty list")
+
+    resolved: list[tuple[int, str, int, int, bytes]] = []
+    for index, patch in enumerate(patches):
+        if not isinstance(patch, dict):
+            raise ValueError(f"patch at index {index} must be an object")
+
+        key = patch.get("key")
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"patch at index {index} missing key")
+
+        layout = SPRITE_PATCH_LAYOUT.get(key)
+        if layout is None:
+            raise ValueError(f"unknown sprite patch key: {key}")
+
+        payload = _decode_hex_payload(f"patch[{index}].dataHex", patch.get("dataHex"))
+        offset, expected_size = layout
+        if len(payload) != expected_size:
+            raise ValueError(
+                (
+                    f"sprite patch {key} has invalid size {len(payload)}; "
+                    f"expected {expected_size} bytes"
+                )
+            )
+
+        resolved.append((index, key, offset, expected_size, payload))
+
+    for _, _, offset, expected_size, payload in resolved:
+        eeprom[offset : offset + expected_size] = payload
+
+    return {
+        "applied": [
+            {
+                "index": index,
+                "key": key,
+                "offset": offset,
+                "size": expected_size,
+            }
+            for index, key, offset, expected_size, _ in resolved
+        ],
+        "count": len(resolved),
+    }
+
+
 def apply_sync_package(eeprom: bytearray, package: Dict[str, Any]) -> Dict[str, Any]:
     _check_size(eeprom)
     if not isinstance(package, dict):
@@ -3132,9 +3544,19 @@ def apply_sync_package(eeprom: bytearray, package: Dict[str, Any]) -> Dict[str, 
 
     identity = raw_domains.get("identity")
     if isinstance(identity, dict):
+        trainer_tid = identity.get("trainerTid")
+        if trainer_tid is None:
+            trainer_tid = identity.get("trainerTidBE", identity.get("trainerTidLE"))
+
+        trainer_sid = identity.get("trainerSid")
+        if trainer_sid is None:
+            trainer_sid = identity.get("trainerSidBE", identity.get("trainerSidLE"))
+
         set_identity_section(
             eeprom,
             trainer_name=identity.get("trainerName"),
+            trainer_tid=trainer_tid,
+            trainer_sid=trainer_sid,
             protocol_version=identity.get("protocolVersion"),
             protocol_sub_version=identity.get("protocolSubVersion"),
             last_sync_epoch_seconds=identity.get("lastSyncEpochSeconds"),
@@ -3166,8 +3588,33 @@ def apply_sync_package(eeprom: bytearray, package: Dict[str, Any]) -> Dict[str, 
         caught = inventory.get("caught", [])
         if isinstance(caught, list):
             for entry in caught:
-                if isinstance(entry, dict) and "slot" in entry and "species" in entry:
-                    set_inventory_caught_species(eeprom, int(entry["slot"]), int(entry["species"]))
+                if not isinstance(entry, dict) or "slot" not in entry:
+                    continue
+
+                slot = int(entry["slot"])
+                species_id = int(entry.get("speciesId", entry.get("species", 0)))
+                has_summary_fields = any(
+                    key in entry
+                    for key in ("level", "heldItem", "moves", "variantFlags", "specialFlags")
+                )
+
+                if species_id == 0 and not has_summary_fields:
+                    set_inventory_caught_species(eeprom, slot, 0)
+                    continue
+
+                if has_summary_fields:
+                    raw_moves = entry.get("moves")
+                    summary = _pokemon_summary_from_values(
+                        species_id,
+                        level=int(entry.get("level", 10)),
+                        held_item=int(entry.get("heldItem", 0)),
+                        moves=raw_moves if isinstance(raw_moves, list) else None,
+                        variant_flags=int(entry.get("variantFlags", 0)),
+                        special_flags=int(entry.get("specialFlags", 0)),
+                    )
+                    set_inventory_caught_summary(eeprom, slot, summary)
+                else:
+                    set_inventory_caught_species(eeprom, slot, species_id)
 
         dowsed_items = inventory.get("dowsedItems", [])
         if isinstance(dowsed_items, list):
@@ -3244,6 +3691,11 @@ def apply_semantic_operations(eeprom: bytearray, operations: list[Dict[str, Any]
                 route_image_index=op.get("routeImageIndex"),
             )
             op_result = read_stroll_section(eeprom)
+        elif op_name == "patch-sprites":
+            raw_patches = op.get("patches")
+            if not isinstance(raw_patches, list):
+                raise ValueError("patch-sprites requires patches list")
+            op_result = apply_sprite_patches(eeprom, raw_patches)
         elif op_name == "set-dowsed-item":
             set_inventory_dowsed_item(
                 eeprom,

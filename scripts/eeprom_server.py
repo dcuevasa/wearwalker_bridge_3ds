@@ -33,6 +33,7 @@ from eeprom_common import (
     add_inventory_dowsed_item,
     add_inventory_gifted_item,
     add_walked_steps,
+    apply_sprite_patches,
     apply_semantic_operations,
     apply_sync_package,
     build_sync_package,
@@ -360,6 +361,15 @@ class WearWalkerMockState:
                 "journal": read_journal_section(self._eeprom),
             }
 
+    def mutate_sprite_patches(self, patches: list[dict[str, Any]]) -> dict:
+        with self._lock:
+            result = apply_sprite_patches(self._eeprom, patches)
+            save_eeprom(self.eeprom_path, self._eeprom)
+            return {
+                "patches": result,
+                "routes": read_routes_section(self._eeprom),
+            }
+
     def mutate_apply_sync_package(self, package: dict[str, Any]) -> dict:
         with self._lock:
             domains = apply_sync_package(self._eeprom, package)
@@ -477,6 +487,15 @@ class StrollSendRequest(BaseModel):
     assumeNationalDex: bool = True
     unlockSpecialCourses: bool = False
     unlockEventCourses: bool = False
+
+
+class SpritePatchEntryRequest(BaseModel):
+    key: str = Field(min_length=1, max_length=64)
+    dataHex: str = Field(min_length=2, max_length=16384)
+
+
+class SpritePatchBatchRequest(BaseModel):
+    patches: list[SpritePatchEntryRequest] = Field(min_length=1, max_length=32)
 
 
 class StrollReturnRequest(BaseModel):
@@ -706,6 +725,16 @@ def create_app(eeprom_path: Path) -> FastAPI:
             return {"status": "ok", **payload}
         except ValueError as exc:
             return json_error(400, "invalid_stroll_send", str(exc))
+
+    @app.post("/api/v2/stroll/sprite-patches")
+    def stroll_sprite_patches(body: SpritePatchBatchRequest) -> dict:
+        try:
+            payload = app.state.ww_state.mutate_sprite_patches(
+                [entry.model_dump() for entry in body.patches]
+            )
+            return {"status": "ok", **payload}
+        except ValueError as exc:
+            return json_error(400, "invalid_sprite_patch", str(exc))
 
     @app.post("/api/v1/stroll/return")
     def stroll_return(body: StrollReturnRequest) -> dict:

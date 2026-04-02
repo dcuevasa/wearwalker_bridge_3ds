@@ -1,9 +1,11 @@
 #include "ui.h"
 #include "hgss_patcher.h"
 #include "hgss_storage.h"
+#include "utils.h"
 #include "wearwalker_api.h"
 
 #include <3ds.h>
+#include <3ds/util/decompress.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <stdint.h>
@@ -25,7 +27,9 @@ void call_wearwalker_command_set_watts();
 void call_wearwalker_command_set_sync();
 void call_wearwalker_command_set_trainer();
 void call_select_hgss_save();
+void call_select_hgss_rom();
 void call_show_hgss_save_path();
+void call_show_hgss_rom_path();
 void call_patch_hgss_manual();
 void call_patch_hgss_from_sync();
 void call_apply_stroll_send_endpoint();
@@ -45,6 +49,11 @@ typedef struct {
 	bool is_dir;
 } ww_browser_entry;
 
+typedef enum {
+	WW_BROWSER_FILTER_SAV = 0,
+	WW_BROWSER_FILTER_NDS,
+} ww_browser_filter;
+
 static char g_wearwalker_host[64] = WW_API_DEFAULT_HOST;
 static char g_wearwalker_trainer[32] = "WWBRIDGE";
 static u32 g_pending_steps = 1000;
@@ -52,7 +61,9 @@ static u32 g_pending_watts = 100;
 static u32 g_pending_sync = 0;
 static char g_pending_trainer[32] = "WWBRIDGE";
 static char g_selected_hgss_save_path[WW_SAVE_PATH_MAX];
+static char g_selected_hgss_nds_path[WW_SAVE_PATH_MAX];
 static char g_pending_save_path[WW_SAVE_PATH_MAX];
+static char g_pending_nds_path[WW_SAVE_PATH_MAX];
 static u32 g_pending_hgss_steps = 2400;
 static u32 g_pending_hgss_watts = 100;
 static u32 g_pending_hgss_course_flags = 0;
@@ -74,6 +85,7 @@ static u32 g_browser_entry_count;
 static s32 g_browser_selected;
 static u32 g_browser_first;
 static char g_browser_cwd[WW_SAVE_PATH_MAX] = "sdmc:/";
+static ww_browser_filter g_browser_filter = WW_BROWSER_FILTER_SAV;
 
 typedef enum {
 	WW_TASK_NONE = 0,
@@ -106,6 +118,12 @@ static ww_async_context g_ww_async;
 static s32 g_ui_thread_prio = 0x30;
 
 #define WW_ASYNC_STACK_SIZE (24 * 1024)
+
+#define WW_NDS_OVERLAY_ENTRY_SIZE 32u
+#define WW_NDS_OV112_ID 112u
+#define WW_OV112_ROUTE_IMAGE_TABLE_ADDR 0x021FF528u
+#define WW_OV112_ROUTE_IMAGE_COUNT 8u
+#define WW_OV112_ROUTE_IMAGE_SIZE 0x0C0u
 
 static const char *ww_async_task_name(ww_async_task task)
 {
@@ -244,6 +262,14 @@ static bool ww_json_get_string_from_range(
 	memcpy(out_str, start, len);
 	out_str[len] = '\0';
 	return true;
+}
+
+static bool ww_json_get_string_from(const char *json, const char *key, char *out_str, u32 out_size)
+{
+	if (!json)
+		return false;
+
+	return ww_json_get_string_from_range(json, json + strlen(json), key, out_str, out_size);
 }
 
 static const char *ww_json_find_object_end(const char *object_start, const char *limit)
@@ -543,23 +569,1212 @@ static bool ww_json_get_first_capture(
 	return true;
 }
 
+static bool ww_json_get_configured_route_species_name(
+		const char *json,
+		u32 route_slot,
+		char *out_name,
+		u32 out_name_size)
+{
+	const char *anchor;
+	const char *cursor;
+	const char *limit;
+
+	if (!json || !out_name || out_name_size == 0)
+		return false;
+
+	anchor = strstr(json, "\"configuredRouteSlots\"");
+	if (!anchor)
+		return false;
+
+	limit = json + strlen(json);
+	cursor = anchor;
+	while ((cursor = strchr(cursor, '{')) != NULL && cursor < limit) {
+		const char *entry_end;
+		u32 slot_value;
+
+		entry_end = ww_json_find_object_end(cursor, limit);
+		if (!entry_end)
+			return false;
+
+		if (ww_json_get_u32_from_range(cursor, entry_end + 1, "slot", &slot_value) && slot_value == route_slot)
+			return ww_json_get_string_from_range(cursor, entry_end + 1, "speciesName", out_name, out_name_size);
+
+		cursor = entry_end + 1;
+	}
+
+	return false;
+}
+
+static bool ww_json_get_configured_route_species_id(const char *json, u32 route_slot, u16 *out_species)
+{
+	const char *anchor;
+	const char *cursor;
+	const char *limit;
+	u32 species_id;
+
+	if (!json || !out_species)
+		return false;
+
+	anchor = strstr(json, "\"configuredRouteSlots\"");
+	if (!anchor)
+		return false;
+
+	limit = json + strlen(json);
+	cursor = anchor;
+	while ((cursor = strchr(cursor, '{')) != NULL && cursor < limit) {
+		const char *entry_end;
+		u32 slot_value;
+
+		entry_end = ww_json_find_object_end(cursor, limit);
+		if (!entry_end)
+			return false;
+
+		if (ww_json_get_u32_from_range(cursor, entry_end + 1, "slot", &slot_value) && slot_value == route_slot) {
+			if (!ww_json_get_u32_from_range(cursor, entry_end + 1, "speciesId", &species_id))
+				return false;
+			if (species_id == 0 || species_id > 0xFFFFu)
+				return false;
+
+			*out_species = (u16)species_id;
+			return true;
+		}
+
+		cursor = entry_end + 1;
+	}
+
+	return false;
+}
+
+static bool ww_json_get_configured_route_slot_u32(
+		const char *json,
+		u32 route_slot,
+		const char *field_name,
+		u32 *out_value)
+{
+	const char *anchor;
+	const char *cursor;
+	const char *limit;
+
+	if (!json || !field_name || !out_value)
+		return false;
+
+	anchor = strstr(json, "\"configuredRouteSlots\"");
+	if (!anchor)
+		return false;
+
+	limit = json + strlen(json);
+	cursor = anchor;
+	while ((cursor = strchr(cursor, '{')) != NULL && cursor < limit) {
+		const char *entry_end;
+		u32 slot_value;
+
+		entry_end = ww_json_find_object_end(cursor, limit);
+		if (!entry_end)
+			return false;
+
+		if (ww_json_get_u32_from_range(cursor, entry_end + 1, "slot", &slot_value) && slot_value == route_slot)
+			return ww_json_get_u32_from_range(cursor, entry_end + 1, field_name, out_value);
+
+		cursor = entry_end + 1;
+	}
+
+	return false;
+}
+
+static bool ww_json_get_configured_route_item_name(
+		const char *json,
+		u32 route_item_index,
+		char *out_name,
+		u32 out_name_size)
+{
+	const char *anchor;
+	const char *cursor;
+	const char *limit;
+
+	if (!json || !out_name || out_name_size == 0)
+		return false;
+
+	anchor = strstr(json, "\"configuredRouteItems\"");
+	if (!anchor)
+		return false;
+
+	limit = json + strlen(json);
+	cursor = anchor;
+	while ((cursor = strchr(cursor, '{')) != NULL && cursor < limit) {
+		const char *entry_end;
+		u32 item_index_value;
+
+		entry_end = ww_json_find_object_end(cursor, limit);
+		if (!entry_end)
+			return false;
+
+		if (ww_json_get_u32_from_range(cursor, entry_end + 1, "routeItemIndex", &item_index_value)
+				&& item_index_value == route_item_index) {
+			return ww_json_get_string_from_range(cursor, entry_end + 1, "itemName", out_name, out_name_size);
+		}
+
+		cursor = entry_end + 1;
+	}
+
+	return false;
+}
+
+static bool ww_json_get_configured_route_item_id(
+		const char *json,
+		u32 route_item_index,
+		u32 *out_item_id)
+{
+	const char *anchor;
+	const char *cursor;
+	const char *limit;
+
+	if (!json || !out_item_id)
+		return false;
+
+	anchor = strstr(json, "\"configuredRouteItems\"");
+	if (!anchor)
+		return false;
+
+	limit = json + strlen(json);
+	cursor = anchor;
+	while ((cursor = strchr(cursor, '{')) != NULL && cursor < limit) {
+		const char *entry_end;
+		u32 item_index_value;
+
+		entry_end = ww_json_find_object_end(cursor, limit);
+		if (!entry_end)
+			return false;
+
+		if (ww_json_get_u32_from_range(cursor, entry_end + 1, "routeItemIndex", &item_index_value)
+				&& item_index_value == route_item_index) {
+			return ww_json_get_u32_from_range(cursor, entry_end + 1, "itemId", out_item_id);
+		}
+
+		cursor = entry_end + 1;
+	}
+
+	return false;
+}
+
+static u16 ww_read_u16_le(const u8 *ptr)
+{
+	return (u16)ptr[0] | ((u16)ptr[1] << 8);
+}
+
+static u32 ww_read_u32_le(const u8 *ptr)
+{
+	return (u32)ptr[0] |
+			((u32)ptr[1] << 8) |
+			((u32)ptr[2] << 16) |
+			((u32)ptr[3] << 24);
+}
+
+static bool ww_nds_get_file_bounds_from_fat(const u8 *fat, u32 fat_size, u32 file_id, u32 *out_start, u32 *out_end);
+static bool ww_read_file_range(FILE *f, u32 offset, u8 *out_buffer, u32 size);
+
+static bool ww_nds_find_arm9_overlay_entry(
+		const u8 *overlay_table,
+		u32 overlay_table_size,
+		u32 overlay_id,
+		u32 *out_ram_address,
+		u32 *out_file_id,
+		u32 *out_compression)
+{
+	u32 entry_count;
+	u32 idx;
+
+	if (!overlay_table || !out_ram_address || !out_file_id || !out_compression)
+		return false;
+	if (overlay_table_size < WW_NDS_OVERLAY_ENTRY_SIZE)
+		return false;
+
+	entry_count = overlay_table_size / WW_NDS_OVERLAY_ENTRY_SIZE;
+	for (idx = 0; idx < entry_count; idx++) {
+		u32 entry_offset = idx * WW_NDS_OVERLAY_ENTRY_SIZE;
+		u32 entry_overlay_id = ww_read_u32_le(overlay_table + entry_offset);
+
+		if (entry_overlay_id != overlay_id)
+			continue;
+
+		*out_ram_address = ww_read_u32_le(overlay_table + entry_offset + 4);
+		*out_file_id = ww_read_u32_le(overlay_table + entry_offset + 24);
+		*out_compression = ww_read_u32_le(overlay_table + entry_offset + 28);
+		return true;
+	}
+
+	return false;
+}
+
+static bool ww_overlay_uncompress_backwards(u8 **in_out_data, u32 *in_out_size)
+{
+	u8 *buffer;
+	u32 compressed_size;
+	u32 footer_size;
+	u32 extra_size;
+	u32 output_size;
+	u8 *expanded;
+	u8 *end_ptr;
+	u8 *end;
+	u8 *start;
+	u8 *dest;
+
+	if (!in_out_data || !in_out_size || !*in_out_data)
+		return false;
+
+	buffer = *in_out_data;
+	compressed_size = *in_out_size;
+	if (compressed_size < 8)
+		return false;
+
+	footer_size = ww_read_u32_le(buffer + compressed_size - 8);
+	extra_size = ww_read_u32_le(buffer + compressed_size - 4);
+	output_size = compressed_size + extra_size;
+	if (output_size <= compressed_size)
+		return false;
+
+	expanded = (u8 *)realloc(buffer, output_size);
+	if (!expanded)
+		return false;
+
+	buffer = expanded;
+	*in_out_data = buffer;
+	end_ptr = buffer + compressed_size;
+	dest = end_ptr + extra_size;
+	end = end_ptr - (u8)(footer_size >> 24);
+	start = end_ptr - (footer_size & 0x00FFFFFFu);
+
+	if (start < buffer || end < buffer || end > end_ptr || start > end)
+		return false;
+
+	while (end > start) {
+		u8 flags = *--end;
+		int bit;
+
+		for (bit = 0; bit < 8; bit++) {
+			if ((flags & 0x80u) == 0) {
+				if (end <= start)
+					return false;
+				*--dest = *--end;
+			} else {
+				int ip;
+				int disp;
+
+				if ((end - start) < 2)
+					return false;
+
+				ip = *--end;
+				disp = *--end;
+				disp = ((disp | (ip << 8)) & ~0xF000) + 2;
+				ip += 0x20;
+
+				while (ip >= 0) {
+					dest[-1] = dest[disp];
+					dest--;
+					ip -= 0x10;
+				}
+			}
+
+			if (end <= start)
+				break;
+
+			flags <<= 1;
+		}
+	}
+
+	*in_out_data = buffer;
+	*in_out_size = output_size;
+	return true;
+}
+
+static bool ww_extract_route_area_sprite_from_nds(
+		const char *nds_path,
+		u32 route_image_index,
+		u8 out_sprite[WW_OV112_ROUTE_IMAGE_SIZE])
+{
+	FILE *f = NULL;
+	u8 header[0x58];
+	u8 *fat_data = NULL;
+	u8 *overlay_table = NULL;
+	u8 *overlay_file = NULL;
+	u32 overlay_file_size = 0;
+	u32 fat_offset;
+	u32 fat_size;
+	u32 ovt_offset;
+	u32 ovt_size;
+	u32 ov112_ram_address;
+	u32 ov112_file_id;
+	u32 ov112_compression;
+	u32 file_start;
+	u32 file_end;
+	u32 pointer_table_offset;
+	u32 pointer_offset;
+	u32 sprite_address;
+	u32 sprite_offset;
+	long nds_size;
+	bool ok = false;
+
+	if (!nds_path || !out_sprite)
+		return false;
+	if (route_image_index >= WW_OV112_ROUTE_IMAGE_COUNT)
+		return false;
+
+	f = fopen(nds_path, "rb");
+	if (!f)
+		goto cleanup;
+
+	if (fseek(f, 0, SEEK_END) != 0)
+		goto cleanup;
+	nds_size = ftell(f);
+	if (nds_size <= 0)
+		goto cleanup;
+	if (fseek(f, 0, SEEK_SET) != 0)
+		goto cleanup;
+
+	if (fread(header, 1, sizeof(header), f) != sizeof(header))
+		goto cleanup;
+
+	fat_offset = ww_read_u32_le(header + 0x48);
+	fat_size = ww_read_u32_le(header + 0x4C);
+	ovt_offset = ww_read_u32_le(header + 0x50);
+	ovt_size = ww_read_u32_le(header + 0x54);
+
+	if (fat_size == 0 || ovt_size == 0)
+		goto cleanup;
+	if ((u64)fat_offset + (u64)fat_size > (u64)nds_size)
+		goto cleanup;
+	if ((u64)ovt_offset + (u64)ovt_size > (u64)nds_size)
+		goto cleanup;
+
+	fat_data = (u8 *)malloc(fat_size);
+	overlay_table = (u8 *)malloc(ovt_size);
+	if (!fat_data || !overlay_table)
+		goto cleanup;
+
+	if (!ww_read_file_range(f, fat_offset, fat_data, fat_size))
+		goto cleanup;
+	if (!ww_read_file_range(f, ovt_offset, overlay_table, ovt_size))
+		goto cleanup;
+
+	if (!ww_nds_find_arm9_overlay_entry(
+				overlay_table,
+				ovt_size,
+				WW_NDS_OV112_ID,
+				&ov112_ram_address,
+				&ov112_file_id,
+				&ov112_compression)) {
+		goto cleanup;
+	}
+
+	if (!ww_nds_get_file_bounds_from_fat(fat_data, fat_size, ov112_file_id, &file_start, &file_end))
+		goto cleanup;
+	if (file_end > (u32)nds_size)
+		goto cleanup;
+
+	overlay_file_size = file_end - file_start;
+	overlay_file = (u8 *)malloc(overlay_file_size);
+	if (!overlay_file)
+		goto cleanup;
+
+	if (!ww_read_file_range(f, file_start, overlay_file, overlay_file_size))
+		goto cleanup;
+
+	if (((ov112_compression >> 24) & 0x01u) != 0) {
+		if (!ww_overlay_uncompress_backwards(&overlay_file, &overlay_file_size))
+			goto cleanup;
+	}
+
+	if (ov112_ram_address >= WW_OV112_ROUTE_IMAGE_TABLE_ADDR)
+		goto cleanup;
+
+	pointer_table_offset = WW_OV112_ROUTE_IMAGE_TABLE_ADDR - ov112_ram_address;
+	pointer_offset = pointer_table_offset + (route_image_index + 1u) * 4u;
+	if (pointer_offset + 4u > overlay_file_size)
+		goto cleanup;
+
+	sprite_address = ww_read_u32_le(overlay_file + pointer_offset);
+	if (sprite_address < ov112_ram_address)
+		goto cleanup;
+
+	sprite_offset = sprite_address - ov112_ram_address;
+	if (sprite_offset + WW_OV112_ROUTE_IMAGE_SIZE > overlay_file_size)
+		goto cleanup;
+
+	memcpy(out_sprite, overlay_file + sprite_offset, WW_OV112_ROUTE_IMAGE_SIZE);
+	ok = true;
+
+cleanup:
+	if (f)
+		fclose(f);
+	if (fat_data)
+		free(fat_data);
+	if (overlay_table)
+		free(overlay_table);
+	if (overlay_file)
+		free(overlay_file);
+	return ok;
+}
+
+static bool ww_nds_find_file_id_from_fnt(const u8 *fnt, u32 fnt_size, const char *path, u32 *out_file_id)
+{
+	char path_copy[128];
+	char components[8][32];
+	char *saveptr = NULL;
+	char *token;
+	u32 component_count = 0;
+	u16 total_dirs;
+	u16 current_dir_id = 0xF000;
+	u32 part;
+
+	if (!fnt || !path || !out_file_id || fnt_size < 8)
+		return false;
+
+	total_dirs = ww_read_u16_le(fnt + 6);
+	if (total_dirs == 0)
+		return false;
+
+	snprintf(path_copy, sizeof(path_copy), "%s", path);
+	token = strtok_r(path_copy, "/", &saveptr);
+	while (token && component_count < 8) {
+		if (token[0]) {
+			snprintf(components[component_count], sizeof(components[component_count]), "%s", token);
+			component_count++;
+		}
+		token = strtok_r(NULL, "/", &saveptr);
+	}
+
+	if (component_count == 0)
+		return false;
+
+	for (part = 0; part < component_count; part++) {
+		u32 dir_index;
+		u32 dir_entry_offset;
+		u32 subtable_offset;
+		u32 cursor;
+		u16 file_id;
+		bool found = false;
+		bool last_component = (part + 1 == component_count);
+		u32 target_len = (u32)strlen(components[part]);
+
+		if (current_dir_id < 0xF000)
+			return false;
+
+		dir_index = (u32)(current_dir_id - 0xF000);
+		if (dir_index >= total_dirs)
+			return false;
+
+		dir_entry_offset = dir_index * 8;
+		if (dir_entry_offset + 8 > fnt_size)
+			return false;
+
+		subtable_offset = ww_read_u32_le(fnt + dir_entry_offset);
+		file_id = ww_read_u16_le(fnt + dir_entry_offset + 4);
+		cursor = subtable_offset;
+		if (cursor >= fnt_size)
+			return false;
+
+		while (cursor < fnt_size) {
+			u8 type_len;
+			u32 name_len;
+			bool is_dir;
+			bool name_match;
+
+			type_len = fnt[cursor++];
+			if (type_len == 0)
+				break;
+
+			name_len = (u32)(type_len & 0x7F);
+			is_dir = (type_len & 0x80u) != 0;
+			if (cursor + name_len > fnt_size)
+				return false;
+
+			name_match = (target_len == name_len) && (memcmp(fnt + cursor, components[part], name_len) == 0);
+			cursor += name_len;
+
+			if (is_dir) {
+				u16 child_dir_id;
+
+				if (cursor + 2 > fnt_size)
+					return false;
+				child_dir_id = ww_read_u16_le(fnt + cursor);
+				cursor += 2;
+
+				if (name_match) {
+					if (last_component)
+						return false;
+					current_dir_id = child_dir_id;
+					found = true;
+					break;
+				}
+			} else {
+				if (name_match) {
+					if (!last_component)
+						return false;
+					*out_file_id = file_id;
+					return true;
+				}
+				file_id++;
+			}
+		}
+
+		if (!found)
+			return false;
+	}
+
+	return false;
+}
+
+static bool ww_nds_get_file_bounds_from_fat(const u8 *fat, u32 fat_size, u32 file_id, u32 *out_start, u32 *out_end)
+{
+	u32 entry_offset;
+	u32 entry_count;
+	u32 start;
+	u32 end;
+
+	if (!fat || !out_start || !out_end || fat_size < 8)
+		return false;
+
+	entry_count = fat_size / 8;
+	if (file_id >= entry_count)
+		return false;
+
+	entry_offset = file_id * 8;
+	if (entry_offset + 8 > fat_size)
+		return false;
+
+	start = ww_read_u32_le(fat + entry_offset);
+	end = ww_read_u32_le(fat + entry_offset + 4);
+	if (start >= end)
+		return false;
+
+	*out_start = start;
+	*out_end = end;
+	return true;
+}
+
+static bool ww_read_file_range(FILE *f, u32 offset, u8 *out_buffer, u32 size)
+{
+	if (!f || !out_buffer || size == 0)
+		return false;
+
+	if (fseek(f, (long)offset, SEEK_SET) != 0)
+		return false;
+
+	return fread(out_buffer, 1, size, f) == size;
+}
+
+static bool ww_load_narc_from_nds(const char *nds_path, const char *narc_path, u8 **out_narc_data, u32 *out_narc_size)
+{
+	FILE *f = NULL;
+	u8 header[0x50];
+	u8 *fnt_data = NULL;
+	u8 *fat_data = NULL;
+	u8 *narc_data = NULL;
+	u32 fnt_offset;
+	u32 fnt_size;
+	u32 fat_offset;
+	u32 fat_size;
+	u32 file_id;
+	u32 file_start;
+	u32 file_end;
+	long nds_size;
+	bool ok = false;
+
+	if (!nds_path || !narc_path || !out_narc_data || !out_narc_size)
+		return false;
+
+	*out_narc_data = NULL;
+	*out_narc_size = 0;
+
+	f = fopen(nds_path, "rb");
+	if (!f)
+		goto cleanup;
+
+	if (fseek(f, 0, SEEK_END) != 0)
+		goto cleanup;
+	nds_size = ftell(f);
+	if (nds_size <= 0)
+		goto cleanup;
+	if (fseek(f, 0, SEEK_SET) != 0)
+		goto cleanup;
+
+	if (fread(header, 1, sizeof(header), f) != sizeof(header))
+		goto cleanup;
+
+	fnt_offset = ww_read_u32_le(header + 0x40);
+	fnt_size = ww_read_u32_le(header + 0x44);
+	fat_offset = ww_read_u32_le(header + 0x48);
+	fat_size = ww_read_u32_le(header + 0x4C);
+
+	if (fnt_size == 0 || fat_size == 0)
+		goto cleanup;
+	if ((u64)fnt_offset + (u64)fnt_size > (u64)nds_size)
+		goto cleanup;
+	if ((u64)fat_offset + (u64)fat_size > (u64)nds_size)
+		goto cleanup;
+
+	fnt_data = (u8 *)malloc(fnt_size);
+	fat_data = (u8 *)malloc(fat_size);
+	if (!fnt_data || !fat_data)
+		goto cleanup;
+
+	if (!ww_read_file_range(f, fnt_offset, fnt_data, fnt_size))
+		goto cleanup;
+	if (!ww_read_file_range(f, fat_offset, fat_data, fat_size))
+		goto cleanup;
+
+	if (!ww_nds_find_file_id_from_fnt(fnt_data, fnt_size, narc_path, &file_id)) {
+		/* fallback for standard HG/SS ROM order */
+		file_id = 258;
+	}
+
+	if (!ww_nds_get_file_bounds_from_fat(fat_data, fat_size, file_id, &file_start, &file_end))
+		goto cleanup;
+	if (file_end > (u32)nds_size)
+		goto cleanup;
+
+	narc_data = (u8 *)malloc(file_end - file_start);
+	if (!narc_data)
+		goto cleanup;
+	if (!ww_read_file_range(f, file_start, narc_data, file_end - file_start))
+		goto cleanup;
+
+	*out_narc_data = narc_data;
+	*out_narc_size = file_end - file_start;
+	narc_data = NULL;
+	ok = true;
+
+cleanup:
+	if (f)
+		fclose(f);
+	if (fnt_data)
+		free(fnt_data);
+	if (fat_data)
+		free(fat_data);
+	if (narc_data)
+		free(narc_data);
+	return ok;
+}
+
+static bool ww_narc_get_file_by_index(const u8 *narc, u32 narc_size, u32 file_index, const u8 **out_file, u32 *out_size)
+{
+	u32 offset = 16;
+	u16 chunk_count;
+	u32 i;
+	u32 btaf_offset = 0;
+	u32 gmif_offset = 0;
+	u32 btaf_size;
+	u16 num_files;
+	u32 entry_offset;
+	u32 data_start;
+	u32 data_end;
+	u32 gmif_data_start;
+	u32 gmif_size;
+	u32 gmif_data_size;
+
+	if (!narc || !out_file || !out_size || narc_size < 16)
+		return false;
+	if (memcmp(narc, "NARC", 4) != 0)
+		return false;
+
+	chunk_count = ww_read_u16_le(narc + 0x0E);
+	for (i = 0; i < chunk_count; i++) {
+		u32 chunk_size;
+
+		if (offset + 8 > narc_size)
+			return false;
+
+		chunk_size = ww_read_u32_le(narc + offset + 4);
+		if (chunk_size < 8 || offset + chunk_size > narc_size)
+			return false;
+
+		if (memcmp(narc + offset, "BTAF", 4) == 0)
+			btaf_offset = offset;
+		else if (memcmp(narc + offset, "GMIF", 4) == 0)
+			gmif_offset = offset;
+
+		offset += chunk_size;
+	}
+
+	if (!btaf_offset || !gmif_offset)
+		return false;
+
+	btaf_size = ww_read_u32_le(narc + btaf_offset + 4);
+	if (btaf_offset + btaf_size > narc_size || btaf_size < 12)
+		return false;
+
+	num_files = ww_read_u16_le(narc + btaf_offset + 8);
+	if (file_index >= num_files)
+		return false;
+
+	entry_offset = btaf_offset + 12 + file_index * 8;
+	if (entry_offset + 8 > btaf_offset + btaf_size)
+		return false;
+
+	data_start = ww_read_u32_le(narc + entry_offset);
+	data_end = ww_read_u32_le(narc + entry_offset + 4);
+	if (data_start > data_end)
+		return false;
+
+	gmif_size = ww_read_u32_le(narc + gmif_offset + 4);
+	if (gmif_size < 8 || gmif_offset + gmif_size > narc_size)
+		return false;
+
+	gmif_data_start = gmif_offset + 8;
+	gmif_data_size = gmif_size - 8;
+	if (data_end > gmif_data_size)
+		return false;
+
+	*out_file = narc + gmif_data_start + data_start;
+	*out_size = data_end - data_start;
+	return true;
+}
+
+static bool ww_decompress_lz10(const u8 *compressed, u32 compressed_size, u8 **out_data, u32 *out_size)
+{
+	u32 decompressed_size;
+	u8 *output;
+
+	if (!compressed || !out_data || !out_size || compressed_size < 4)
+		return false;
+	if (compressed[0] != 0x10)
+		return false;
+
+	decompressed_size = (u32)compressed[1] |
+			((u32)compressed[2] << 8) |
+			((u32)compressed[3] << 16);
+	if (decompressed_size == 0)
+		return false;
+
+	output = (u8 *)malloc(decompressed_size);
+	if (!output)
+		return false;
+
+	if (!decompress(output, decompressed_size, NULL, (void *)compressed, compressed_size)) {
+		free(output);
+		return false;
+	}
+
+	*out_data = output;
+	*out_size = decompressed_size;
+	return true;
+}
+
+static void ww_remap_sprite_2bpp_contrast(u8 *sprite_data, u32 size)
+{
+	/* Preserve native HGSS 2bpp shades to avoid over-thick black lines on Pokewalker LCD. */
+	static const u8 shade_map[4] = {0, 1, 2, 3};
+	u32 i;
+
+	if (!sprite_data || size == 0)
+		return;
+
+	for (i = 0; i < size; i++) {
+		u8 value = sprite_data[i];
+		u8 p0 = shade_map[value & 0x03u];
+		u8 p1 = shade_map[(value >> 2) & 0x03u];
+		u8 p2 = shade_map[(value >> 4) & 0x03u];
+		u8 p3 = shade_map[(value >> 6) & 0x03u];
+
+		sprite_data[i] = (u8)(p0 | (p1 << 2) | (p2 << 4) | (p3 << 6));
+	}
+}
+
+static bool ww_extract_species_large_frames(
+		const u8 *narc_data,
+		u32 narc_size,
+		u16 species_id,
+		u8 out_large0[0x300],
+		u8 out_large1[0x300])
+{
+	u8 *decompressed = NULL;
+	u32 sprite_index;
+	const u8 *compressed;
+	u32 compressed_size;
+	u32 decompressed_size;
+	bool ok = false;
+
+	if (!narc_data || narc_size == 0 || !out_large0 || !out_large1 || species_id == 0)
+		return false;
+
+	sprite_index = (u32)species_id - 1;
+	if (!ww_narc_get_file_by_index(narc_data, narc_size, sprite_index, &compressed, &compressed_size))
+		goto cleanup;
+
+	if (!ww_decompress_lz10(compressed, compressed_size, &decompressed, &decompressed_size))
+		goto cleanup;
+
+	if (decompressed_size < 0x600)
+		goto cleanup;
+
+	memcpy(out_large0, decompressed, 0x300);
+	memcpy(out_large1, decompressed + 0x300, 0x300);
+	ok = true;
+
+cleanup:
+	if (decompressed)
+		free(decompressed);
+	return ok;
+}
+
+static bool ww_extract_species_small_frames(
+		const u8 *narc_data,
+		u32 narc_size,
+		u16 species_id,
+		u8 out_small0[0x0C0],
+		u8 out_small1[0x0C0])
+{
+	u8 *decompressed = NULL;
+	u32 sprite_index;
+	const u8 *compressed;
+	u32 compressed_size;
+	u32 decompressed_size;
+	bool ok = false;
+
+	if (!narc_data || narc_size == 0 || !out_small0 || !out_small1 || species_id == 0)
+		return false;
+
+	sprite_index = (u32)species_id;
+	if (!ww_narc_get_file_by_index(narc_data, narc_size, sprite_index, &compressed, &compressed_size))
+		goto cleanup;
+
+	if (!ww_decompress_lz10(compressed, compressed_size, &decompressed, &decompressed_size))
+		goto cleanup;
+
+	if (decompressed_size < 0x180)
+		goto cleanup;
+
+	memcpy(out_small0, decompressed, 0x0C0);
+	memcpy(out_small1, decompressed + 0x0C0, 0x0C0);
+	ok = true;
+
+cleanup:
+	if (decompressed)
+		free(decompressed);
+	return ok;
+}
+
+static void ww_patch_sprite_block_counted(const char *key, const u8 *data, u32 size, u32 *applied, u32 *failed)
+{
+	if (ww_api_stroll_patch_sprite_block(key, data, size, NULL, 0)) {
+		if (applied)
+			(*applied)++;
+	} else {
+		if (failed)
+			(*failed)++;
+	}
+}
+
+static void ww_patch_species_image_sprites(
+		const u8 *small_narc_data,
+		u32 small_narc_size,
+		const u8 *large_narc_data,
+		u32 large_narc_size,
+		u16 species_id,
+		const char *small0_key,
+		const char *small1_key,
+		const char *large0_key,
+		const char *large1_key,
+		u32 *applied,
+		u32 *failed)
+{
+	u8 large0[0x300];
+	u8 large1[0x300];
+	u8 small0[0x0C0];
+	u8 small1[0x0C0];
+
+	if (small0_key && small1_key) {
+		if (!ww_extract_species_small_frames(small_narc_data, small_narc_size, species_id, small0, small1)) {
+			if (failed)
+				*failed += 2;
+		} else {
+			ww_remap_sprite_2bpp_contrast(small0, sizeof(small0));
+			ww_remap_sprite_2bpp_contrast(small1, sizeof(small1));
+			ww_patch_sprite_block_counted(small0_key, small0, sizeof(small0), applied, failed);
+			ww_patch_sprite_block_counted(small1_key, small1, sizeof(small1), applied, failed);
+		}
+	}
+
+	if (large0_key && large1_key) {
+		if (!ww_extract_species_large_frames(large_narc_data, large_narc_size, species_id, large0, large1)) {
+			if (failed)
+				*failed += 2;
+		} else {
+			ww_remap_sprite_2bpp_contrast(large0, sizeof(large0));
+			ww_remap_sprite_2bpp_contrast(large1, sizeof(large1));
+			ww_patch_sprite_block_counted(large0_key, large0, sizeof(large0), applied, failed);
+			ww_patch_sprite_block_counted(large1_key, large1, sizeof(large1), applied, failed);
+		}
+	}
+}
+
+static void ww_apply_dynamic_pokemon_sprite_patches(
+		const char *nds_path,
+		const hgss_stroll_send_context *send_context,
+		const char *send_json,
+		u32 *out_applied,
+		u32 *out_failed)
+{
+	const char *small_narc_path = "a/2/4/8";
+	const char *large_narc_path = "a/2/5/6";
+	u8 *small_narc_data = NULL;
+	u8 *large_narc_data = NULL;
+	u8 area_sprite[WW_OV112_ROUTE_IMAGE_SIZE];
+	u32 small_narc_size = 0;
+	u32 large_narc_size = 0;
+	u32 applied = 0;
+	u32 failed = 0;
+	u32 slot;
+	u32 route_image_index;
+	u16 join_species = 0;
+	u32 join_best_chance = 0;
+	bool join_species_found = false;
+	bool join_has_chance = false;
+	bool route_image_index_found = false;
+
+	if (!nds_path || !nds_path[0] || !send_context || !send_json) {
+		if (out_applied)
+			*out_applied = 0;
+		if (out_failed)
+			*out_failed = 0;
+		return;
+	}
+
+	route_image_index_found = ww_json_get_u32_from(send_json, "selectedRouteImageIndex", &route_image_index)
+			|| ww_json_get_u32_from(send_json, "routeImageIndex", &route_image_index);
+
+	if (route_image_index_found
+			&& ww_extract_route_area_sprite_from_nds(nds_path, route_image_index, area_sprite)) {
+		ww_patch_sprite_block_counted("areaSprite", area_sprite, sizeof(area_sprite), &applied, &failed);
+	} else {
+		failed++;
+	}
+
+	ww_load_narc_from_nds(nds_path, small_narc_path, &small_narc_data, &small_narc_size);
+	ww_load_narc_from_nds(nds_path, large_narc_path, &large_narc_data, &large_narc_size);
+
+	if (!small_narc_data && !large_narc_data) {
+		if (out_applied)
+			*out_applied = applied;
+		if (out_failed)
+			*out_failed = failed + 12;
+		return;
+	}
+
+	ww_patch_species_image_sprites(
+			small_narc_data,
+			small_narc_size,
+			large_narc_data,
+			large_narc_size,
+			send_context->source_slot.species_id,
+			"walkPokeSmall0",
+			"walkPokeSmall1",
+			"walkPokeLarge0",
+			"walkPokeLarge1",
+			&applied,
+			&failed);
+
+	for (slot = 0; slot < 3; slot++) {
+		u16 route_species;
+		u32 slot_chance;
+		char small0_key[24];
+		char small1_key[24];
+
+		if (!ww_json_get_configured_route_species_id(send_json, slot, &route_species)) {
+			failed += 2;
+			continue;
+		}
+
+		snprintf(small0_key, sizeof(small0_key), "routePoke%luSmall0", (unsigned long)slot);
+		snprintf(small1_key, sizeof(small1_key), "routePoke%luSmall1", (unsigned long)slot);
+
+		if (!join_species_found) {
+			join_species = route_species;
+			join_species_found = true;
+		}
+
+		if (ww_json_get_configured_route_slot_u32(send_json, slot, "chance", &slot_chance)) {
+			if (!join_has_chance || slot_chance > join_best_chance) {
+				join_species = route_species;
+				join_best_chance = slot_chance;
+				join_has_chance = true;
+			}
+		}
+
+		ww_patch_species_image_sprites(
+				small_narc_data,
+				small_narc_size,
+				NULL,
+				0,
+				route_species,
+				small0_key,
+				small1_key,
+				NULL,
+				NULL,
+				&applied,
+				&failed);
+	}
+
+	if (join_species_found) {
+		ww_patch_species_image_sprites(
+				NULL,
+				0,
+				large_narc_data,
+				large_narc_size,
+				join_species,
+				NULL,
+				NULL,
+				"joinPokeLarge0",
+				"joinPokeLarge1",
+				&applied,
+				&failed);
+	}
+
+	if (out_applied)
+		*out_applied = applied;
+	if (out_failed)
+		*out_failed = failed;
+
+	if (small_narc_data)
+		free(small_narc_data);
+	if (large_narc_data)
+		free(large_narc_data);
+}
+
+static bool ww_patch_text_sprite(const char *key, u8 width, u32 size, const char *text, bool centered)
+{
+	u8 sprite[0x180];
+	const char *value = (text && text[0]) ? text : "?";
+
+	if (size > sizeof(sprite))
+		return false;
+
+	memset(sprite, 0, sizeof(sprite));
+	string_to_img(sprite, width, value, centered);
+	return ww_api_stroll_patch_sprite_block(key, sprite, size, NULL, 0);
+}
+
+static bool ww_patch_text_sprite_80x16(const char *key, const char *text)
+{
+	return ww_patch_text_sprite(key, 80, 0x140, text, true);
+}
+
+static bool ww_patch_text_sprite_96x16(const char *key, const char *text)
+{
+	return ww_patch_text_sprite(key, 96, 0x180, text, false);
+}
+
+static void ww_apply_dynamic_name_sprite_patches(
+		const hgss_stroll_send_context *send_context,
+		const char *send_json,
+		u32 course_id,
+		u32 *out_applied,
+		u32 *out_failed)
+{
+	char area_name[32];
+	char route_name[32];
+	char item_name[48];
+	u32 slot;
+	u32 applied = 0;
+	u32 failed = 0;
+
+	if (!send_context || !send_json) {
+		if (out_applied)
+			*out_applied = 0;
+		if (out_failed)
+			*out_failed = 0;
+		return;
+	}
+
+	if (ww_patch_text_sprite_80x16("walkPokeName", send_context->nickname))
+		applied++;
+	else
+		failed++;
+
+	if (ww_patch_text_sprite_80x16("trainerCardName", send_context->trainer_name))
+		applied++;
+	else
+		failed++;
+
+	if (!ww_json_get_string_from(send_json, "selectedCourseName", area_name, sizeof(area_name)))
+		snprintf(area_name, sizeof(area_name), "COURSE %lu", (unsigned long)course_id);
+
+	if (ww_patch_text_sprite_80x16("areaNameSprite", area_name))
+		applied++;
+	else
+		failed++;
+
+	for (slot = 0; slot < 3; slot++) {
+		const char *patch_key = slot == 0 ? "routePoke0Name" : (slot == 1 ? "routePoke1Name" : "routePoke2Name");
+
+		if (!ww_json_get_configured_route_species_name(send_json, slot, route_name, sizeof(route_name)))
+			snprintf(route_name, sizeof(route_name), "POKE %lu", (unsigned long)(slot + 1));
+
+		if (ww_patch_text_sprite_80x16(patch_key, route_name))
+			applied++;
+		else
+			failed++;
+	}
+
+	for (slot = 0; slot < 10; slot++) {
+		char patch_key[24];
+		u32 item_id;
+
+		snprintf(patch_key, sizeof(patch_key), "routeItem%luName", (unsigned long)slot);
+
+		if (!ww_json_get_configured_route_item_name(send_json, slot, item_name, sizeof(item_name))) {
+			if (ww_json_get_configured_route_item_id(send_json, slot, &item_id))
+				snprintf(item_name, sizeof(item_name), "ITEM %lu", (unsigned long)item_id);
+			else
+				snprintf(item_name, sizeof(item_name), "ITEM %lu", (unsigned long)(slot + 1));
+		}
+
+		if (ww_patch_text_sprite_96x16(patch_key, item_name))
+			applied++;
+		else
+			failed++;
+	}
+
+	if (out_applied)
+		*out_applied = applied;
+	if (out_failed)
+		*out_failed = failed;
+}
+
 static bool ww_path_is_sd_root(const char *path)
 {
 	return path && (strcmp(path, "sdmc:/") == 0 || strcmp(path, "sdmc:") == 0);
 }
 
-static bool ww_name_has_sav_extension(const char *name)
+static bool ww_name_has_extension(const char *name, const char *extension)
 {
 	const char *dot;
 
-	if (!name)
+	if (!name || !extension)
 		return false;
 
 	dot = strrchr(name, '.');
 	if (!dot)
 		return false;
 
-	return strcasecmp(dot, ".sav") == 0;
+	return strcasecmp(dot, extension) == 0;
+}
+
+static bool ww_name_has_sav_extension(const char *name)
+{
+	return ww_name_has_extension(name, ".sav");
+}
+
+static bool ww_name_has_nds_extension(const char *name)
+{
+	return ww_name_has_extension(name, ".nds");
+}
+
+static bool ww_browser_accept_file(const char *name)
+{
+	if (g_browser_filter == WW_BROWSER_FILTER_NDS)
+		return ww_name_has_nds_extension(name);
+
+	return ww_name_has_sav_extension(name);
 }
 
 static void ww_path_join(const char *directory, const char *name, char *out, size_t out_size)
@@ -611,24 +1826,34 @@ static void ww_path_parent(char *path, size_t path_size)
 	*last_slash = '\0';
 }
 
-static void ww_selected_save_directory(char *out, size_t out_size)
+static void ww_selected_directory_from_path(const char *selected_path, char *out, size_t out_size)
 {
 	char *last_slash;
 
 	if (!out || out_size == 0)
 		return;
 
-	if (!g_selected_hgss_save_path[0]) {
+	if (!selected_path || !selected_path[0]) {
 		snprintf(out, out_size, "sdmc:/");
 		return;
 	}
 
-	snprintf(out, out_size, "%s", g_selected_hgss_save_path);
+	snprintf(out, out_size, "%s", selected_path);
 	last_slash = strrchr(out, '/');
 	if (!last_slash || (size_t)(last_slash - out) <= 5)
 		snprintf(out, out_size, "sdmc:/");
 	else
 		*last_slash = '\0';
+}
+
+static void ww_selected_save_directory(char *out, size_t out_size)
+{
+	ww_selected_directory_from_path(g_selected_hgss_save_path, out, out_size);
+}
+
+static void ww_selected_rom_directory(char *out, size_t out_size)
+{
+	ww_selected_directory_from_path(g_selected_hgss_nds_path, out, out_size);
 }
 
 static int ww_browser_entry_cmp(const void *left, const void *right)
@@ -665,7 +1890,7 @@ static bool ww_browser_reload(void)
 			continue;
 
 		is_dir = S_ISDIR(info.st_mode);
-		if (!is_dir && !ww_name_has_sav_extension(entry->d_name))
+		if (!is_dir && !ww_browser_accept_file(entry->d_name))
 			continue;
 
 		if (g_browser_entry_count >= WW_BROWSER_MAX_ENTRIES)
@@ -695,11 +1920,19 @@ static bool ww_browser_reload(void)
 	return true;
 }
 
-static void ww_browser_open(void)
+static void ww_browser_open_for_filter(ww_browser_filter filter)
 {
 	char start_dir[WW_SAVE_PATH_MAX];
 
-	ww_selected_save_directory(start_dir, sizeof(start_dir));
+	g_browser_filter = filter;
+	if (filter == WW_BROWSER_FILTER_NDS) {
+		ww_selected_rom_directory(start_dir, sizeof(start_dir));
+		if (ww_path_is_sd_root(start_dir))
+			ww_selected_save_directory(start_dir, sizeof(start_dir));
+	} else {
+		ww_selected_save_directory(start_dir, sizeof(start_dir));
+	}
+
 	snprintf(g_browser_cwd, sizeof(g_browser_cwd), "%s", start_dir);
 	g_browser_selected = 0;
 	g_browser_first = 0;
@@ -758,7 +1991,10 @@ static bool ww_browser_activate_selected(void)
 		return ww_browser_reload();
 	}
 
-	snprintf(g_selected_hgss_save_path, sizeof(g_selected_hgss_save_path), "%s", path);
+	if (g_browser_filter == WW_BROWSER_FILTER_NDS)
+		snprintf(g_selected_hgss_nds_path, sizeof(g_selected_hgss_nds_path), "%s", path);
+	else
+		snprintf(g_selected_hgss_save_path, sizeof(g_selected_hgss_save_path), "%s", path);
 	return true;
 }
 
@@ -789,9 +2025,11 @@ static void ww_async_worker(void *arg)
 	bool pending_return_increment_trip_counter = g_pending_return_increment_trip_counter;
 	char pending_trainer[sizeof(g_pending_trainer)];
 	char pending_save_path[sizeof(g_pending_save_path)];
+	char pending_nds_path[sizeof(g_pending_nds_path)];
 
 	snprintf(pending_trainer, sizeof(pending_trainer), "%s", g_pending_trainer);
 	snprintf(pending_save_path, sizeof(pending_save_path), "%s", g_pending_save_path);
+	snprintf(pending_nds_path, sizeof(pending_nds_path), "%s", g_pending_nds_path);
 
 	if (!json) {
 		LightLock_Lock(&g_ww_async.lock);
@@ -942,7 +2180,17 @@ static void ww_async_worker(void *arg)
 				char slot_error[128];
 				char patch_error[128];
 				u32 eeprom_watts;
+				u32 sprite_name_patches_applied = 0;
+				u32 sprite_name_patches_failed = 0;
+				u32 sprite_image_patches_applied = 0;
+				u32 sprite_image_patches_failed = 0;
 				u8 level;
+
+				if (!pending_nds_path[0]) {
+					snprintf(json, WW_API_RESPONSE_MAX, "missing HGSS .nds path for dynamic sprite workflow");
+					success = false;
+					break;
+				}
 
 				success = hgss_read_stroll_send_context(
 						pending_save_path,
@@ -1011,6 +2259,20 @@ static void ww_async_worker(void *arg)
 					break;
 				}
 
+				ww_apply_dynamic_name_sprite_patches(
+						&send_context,
+						json,
+						pending_send_course,
+						&sprite_name_patches_applied,
+						&sprite_name_patches_failed);
+
+				ww_apply_dynamic_pokemon_sprite_patches(
+						pending_nds_path,
+						&send_context,
+						json,
+						&sprite_image_patches_applied,
+						&sprite_image_patches_failed);
+
 				success = hgss_apply_stroll_send(
 						pending_save_path,
 						(u8)pending_send_box,
@@ -1050,7 +2312,7 @@ static void ww_async_worker(void *arg)
 				snprintf(
 						json,
 						WW_API_RESPONSE_MAX,
-						"Sent species %u (Lv~%u) from box %lu slot %lu to route %lu | EEPROM seeded (trainer=%s tid=%u sid=%u steps=%lu watts=%lu) | save updated (%s, pair=%s)",
+						"Sent species %u (Lv~%u) from box %lu slot %lu to route %lu | EEPROM seeded (trainer=%s tid=%u sid=%u steps=%lu watts=%lu) | dynamic-name patches applied=%lu failed=%lu | dynamic-image patches applied=%lu failed=%lu (ROM=%s) | save updated (%s, pair=%s)",
 						(unsigned)send_context.source_slot.species_id,
 						(unsigned)level,
 						(unsigned long)pending_send_box,
@@ -1061,6 +2323,11 @@ static void ww_async_worker(void *arg)
 						(unsigned)send_context.trainer_sid,
 						(unsigned long)send_context.pokewalker_steps,
 						(unsigned long)eeprom_watts,
+						(unsigned long)sprite_name_patches_applied,
+						(unsigned long)sprite_name_patches_failed,
+						(unsigned long)sprite_image_patches_applied,
+						(unsigned long)sprite_image_patches_failed,
+						pending_nds_path,
 						send_report.source_slot_cleared ? "source cleared" : "source kept",
 						send_report.walker_pair_written ? "written" : "missing");
 				break;
@@ -1427,6 +2694,8 @@ enum {
 	SEND_MENU_APPLY_ENDPOINT,
 	SEND_MENU_SELECT_SAVE,
 	SEND_MENU_SHOW_SAVE,
+	SEND_MENU_SELECT_ROM,
+	SEND_MENU_SHOW_ROM,
 	SEND_MENU_BOX,
 	SEND_MENU_SLOT,
 	SEND_MENU_SHOW_SLOT,
@@ -1501,6 +2770,8 @@ menu_entry hgss_stroll_send_menu_entries[] = {
 	{"Apply endpoint", ENTRY_ACTION, .callback = call_apply_stroll_send_endpoint},
 	{"Select HGSS save (.sav)", ENTRY_ACTION, .callback = call_select_hgss_save},
 	{"Show selected save path", ENTRY_ACTION, .callback = call_show_hgss_save_path},
+	{"Select HGSS ROM (.nds)", ENTRY_ACTION, .callback = call_select_hgss_rom},
+	{"Show selected ROM path", ENTRY_ACTION, .callback = call_show_hgss_rom_path},
 	{"Source box (1-18)", ENTRY_NUMATTR, .num_attr = {.value = 1, .min = 1, .max = HGSS_BOX_COUNT}},
 	{"Source slot (1-30)", ENTRY_NUMATTR, .num_attr = {.value = 1, .min = 1, .max = HGSS_BOX_SLOTS}},
 	{"Inspect source slot", ENTRY_ACTION, .callback = call_show_stroll_send_slot},
@@ -1599,7 +2870,9 @@ void ui_init()
 	g_pending_sync = wearwalker_wifi_menu_entries[WW_MENU_CMD_SYNC_VALUE].num_attr.value;
 	snprintf(g_pending_trainer, sizeof(g_pending_trainer), "%s", g_wearwalker_trainer);
 	g_selected_hgss_save_path[0] = '\0';
+	g_selected_hgss_nds_path[0] = '\0';
 	g_pending_save_path[0] = '\0';
+	g_pending_nds_path[0] = '\0';
 	g_pending_hgss_steps = hgss_patch_menu_entries[HGSS_MENU_MANUAL_STEPS].num_attr.value;
 	g_pending_hgss_watts = hgss_patch_menu_entries[HGSS_MENU_MANUAL_WATTS].num_attr.value;
 	g_pending_hgss_course_flags = hgss_patch_menu_entries[HGSS_MENU_MANUAL_FLAGS].num_attr.value;
@@ -1620,6 +2893,7 @@ void ui_init()
 	g_browser_selected = 0;
 	g_browser_first = 0;
 	snprintf(g_browser_cwd, sizeof(g_browser_cwd), "sdmc:/");
+	g_browser_filter = WW_BROWSER_FILTER_SAV;
 
 	target = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 	textbuf = C2D_TextBufNew(256);
@@ -1732,6 +3006,8 @@ void draw_file_browser(void)
 {
 	const u16 font_size = 12;
 	const u16 padding = 3;
+	const char *browser_title = g_browser_filter == WW_BROWSER_FILTER_NDS ? "Select HGSS ROM (.nds)" : "Select HGSS save (.sav)";
+	const char *empty_hint = g_browser_filter == WW_BROWSER_FILTER_NDS ? "No folders or .nds files here" : "No folders or .sav files here";
 	u16 height = font_size + padding * 2;
 	u16 avail_lines = (SCREEN_HEIGHT - 52) / height;
 	u16 draw_start = 46;
@@ -1751,11 +3027,11 @@ void draw_file_browser(void)
 		g_browser_first = 0;
 	}
 
-	draw_top("Select HGSS save (.sav)");
+	draw_top(browser_title);
 	draw_string(6, 32, 9, g_browser_cwd, false, 0);
 
 	if (g_browser_entry_count == 0) {
-		draw_string(0, 118, 12, "No folders or .sav files here", true, 0);
+		draw_string(0, 118, 12, empty_hint, true, 0);
 		draw_string(0, 210, 9, "A: open  B: up/back  START: exit", true, 0);
 		return;
 	}
@@ -1984,9 +3260,16 @@ void call_wearwalker_command_set_trainer()
 
 void call_select_hgss_save()
 {
-	ww_browser_open();
+	ww_browser_open_for_filter(WW_BROWSER_FILTER_SAV);
 	g_state = IN_FILE_BROWSER;
 	printf("Browsing for HGSS save on SD...\n");
+}
+
+void call_select_hgss_rom()
+{
+	ww_browser_open_for_filter(WW_BROWSER_FILTER_NDS);
+	g_state = IN_FILE_BROWSER;
+	printf("Browsing for HGSS ROM on SD...\n");
 }
 
 void call_show_hgss_save_path()
@@ -1997,6 +3280,16 @@ void call_show_hgss_save_path()
 	}
 
 	printf("Selected HGSS save: %s\n", g_selected_hgss_save_path);
+}
+
+void call_show_hgss_rom_path()
+{
+	if (!g_selected_hgss_nds_path[0]) {
+		printf("No HGSS ROM selected\n");
+		return;
+	}
+
+	printf("Selected HGSS ROM: %s\n", g_selected_hgss_nds_path);
 }
 
 static bool ww_prepare_selected_save_path(void)
@@ -2019,6 +3312,34 @@ static bool ww_prepare_selected_save_path(void)
 	}
 
 	snprintf(g_pending_save_path, sizeof(g_pending_save_path), "%s", g_selected_hgss_save_path);
+	return true;
+}
+
+static bool ww_prepare_selected_nds_path(void)
+{
+	struct stat info;
+
+	if (!g_selected_hgss_nds_path[0]) {
+		printf("Select a HGSS .nds first\n");
+		return false;
+	}
+
+	if (!ww_name_has_nds_extension(g_selected_hgss_nds_path)) {
+		printf("Selected ROM must use .nds extension\n");
+		return false;
+	}
+
+	if (stat(g_selected_hgss_nds_path, &info) != 0) {
+		printf("Selected ROM path is not accessible\n");
+		return false;
+	}
+
+	if (!S_ISREG(info.st_mode)) {
+		printf("Selected ROM path is not a file\n");
+		return false;
+	}
+
+	snprintf(g_pending_nds_path, sizeof(g_pending_nds_path), "%s", g_selected_hgss_nds_path);
 	return true;
 }
 
@@ -2111,8 +3432,11 @@ void call_stroll_send_from_save()
 {
 	if (!ww_prepare_selected_save_path())
 		return;
+	if (!ww_prepare_selected_nds_path())
+		return;
 
 	printf("Using HGSS save: %s\n", g_pending_save_path);
+	printf("Using HGSS ROM: %s\n", g_pending_nds_path);
 
 	g_pending_send_box = hgss_stroll_send_menu_entries[SEND_MENU_BOX].num_attr.value;
 	g_pending_send_slot = hgss_stroll_send_menu_entries[SEND_MENU_SLOT].num_attr.value;
@@ -2257,7 +3581,10 @@ enum operation ui_update()
 					printf("Failed to open selected entry\n");
 				} else if (!was_dir) {
 					g_state = IN_MENU;
-					printf("Selected HGSS save: %s\n", g_selected_hgss_save_path);
+					if (g_browser_filter == WW_BROWSER_FILTER_NDS)
+						printf("Selected HGSS ROM: %s\n", g_selected_hgss_nds_path);
+					else
+						printf("Selected HGSS save: %s\n", g_selected_hgss_save_path);
 				}
 			} else if (kDown & KEY_B) {
 				if (ww_path_is_sd_root(g_browser_cwd)) {

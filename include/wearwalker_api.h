@@ -43,6 +43,13 @@ bool ww_api_stroll_send(
 		char *out_json,
 		u32 out_size);
 
+bool ww_api_stroll_patch_sprite_block(
+		const char *key,
+		const u8 *data,
+		u32 data_size,
+		char *out_json,
+		u32 out_size);
+
 bool ww_api_stroll_return(
 		u32 walked_steps,
 		u16 bonus_watts,

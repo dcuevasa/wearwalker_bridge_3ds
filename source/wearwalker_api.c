@@ -510,6 +510,25 @@ static bool ww_json_string_is_safe(const char *value)
 	return true;
 }
 
+static bool ww_hex_encode(const u8 *data, u32 data_size, char *out_hex, u32 out_hex_size)
+{
+	static const char hex_chars[] = "0123456789abcdef";
+	u32 index;
+
+	if (!data || !out_hex)
+		return false;
+	if (out_hex_size < data_size * 2 + 1)
+		return false;
+
+	for (index = 0; index < data_size; index++) {
+		u8 value = data[index];
+		out_hex[index * 2] = hex_chars[(value >> 4) & 0x0F];
+		out_hex[index * 2 + 1] = hex_chars[value & 0x0F];
+	}
+	out_hex[data_size * 2] = '\0';
+	return true;
+}
+
 bool ww_api_get_status(char *out_json, u32 out_size)
 {
 	u8 *response;
@@ -753,6 +772,60 @@ bool ww_api_stroll_send(
 		return false;
 
 	return ww_api_command_request_json("POST", "/api/v1/stroll/send", body, NULL, out_json, out_size);
+}
+
+bool ww_api_stroll_patch_sprite_block(
+		const char *key,
+		const u8 *data,
+		u32 data_size,
+		char *out_json,
+		u32 out_size)
+{
+	char *payload_hex = NULL;
+	char *body = NULL;
+	u32 payload_hex_size;
+	u32 body_size;
+	int written;
+	bool ok = false;
+
+	if (!key || !key[0] || !data || data_size == 0)
+		return false;
+	if (!ww_json_string_is_safe(key))
+		return false;
+
+	payload_hex_size = data_size * 2 + 1;
+	if (payload_hex_size < data_size)
+		return false;
+
+	payload_hex = (char *)malloc(payload_hex_size);
+	if (!payload_hex)
+		goto cleanup;
+
+	if (!ww_hex_encode(data, data_size, payload_hex, payload_hex_size))
+		goto cleanup;
+
+	body_size = (u32)strlen(key) + payload_hex_size + 96;
+	body = (char *)malloc(body_size);
+	if (!body)
+		goto cleanup;
+
+	written = snprintf(
+			body,
+			body_size,
+			"{\"patches\":[{\"key\":\"%s\",\"dataHex\":\"%s\"}]}",
+			key,
+			payload_hex);
+	if (written < 0 || (u32)written >= body_size)
+		goto cleanup;
+
+	ok = ww_api_command_request_json("POST", "/api/v2/stroll/sprite-patches", body, NULL, out_json, out_size);
+
+cleanup:
+	if (payload_hex)
+		free(payload_hex);
+	if (body)
+		free(body);
+	return ok;
 }
 
 bool ww_api_stroll_return(
