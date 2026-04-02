@@ -86,10 +86,24 @@ ROUTE_POKE_MIN_STEPS_OFFSET = ROUTE_INFO_OFFSET + 130
 ROUTE_POKE_CHANCE_OFFSET = ROUTE_INFO_OFFSET + 136
 
 TEAM_OFFSET = 0xCC00
+TEAM_UNIQ_OFFSET = TEAM_OFFSET + 8
+TEAM_UNIQ_SIZE = 40
+TEAM_TRAINER_TID_OFFSET = TEAM_OFFSET + 48
+TEAM_TRAINER_SID_OFFSET = TEAM_OFFSET + 50
+TEAM_TRAINER_NAME_OFFSET = TEAM_OFFSET + 56
+TEAM_TRAINER_NAME_CHARS = 8
 TEAM_POKES_OFFSET = TEAM_OFFSET + 96
 TEAM_POKE_ENTRY_SIZE = 56
 TEAM_POKE_COUNT = 6
 TEAM_POKE_SPECIES_OFFSET = 0
+TEAM_POKE_HELD_ITEM_OFFSET = 2
+TEAM_POKE_MOVES_OFFSET = 4
+TEAM_POKE_OT_TID_OFFSET = 12
+TEAM_POKE_OT_SID_OFFSET = 14
+TEAM_POKE_VARIANT_OFFSET = 30
+TEAM_POKE_SOURCE_GAME_OFFSET = 31
+TEAM_POKE_ABILITY_OFFSET = 32
+TEAM_POKE_HAPPINESS_OFFSET = 33
 TEAM_POKE_LEVEL_OFFSET = 34
 TEAM_POKE_NICKNAME_OFFSET = 36
 TEAM_POKE_NICKNAME_CHARS = 10
@@ -360,6 +374,227 @@ COURSE_SPECIES: tuple[int, ...] = (
     440,
     174,
     173,
+)
+
+# Per-course per-slot capture thresholds and probability (from HGSS Pokewalker course data).
+# Ordering matches encounter_walker4 slot ordering used by `_load_walker_encounters()`.
+COURSE_SLOT_PROFILES: tuple[tuple[tuple[int, int], ...], ...] = (
+    (
+        (3000, 50),
+        (2000, 70),
+        (500, 75),
+        (500, 75),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (4000, 30),
+        (3000, 70),
+        (700, 89),
+        (700, 89),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 50),
+        (4000, 80),
+        (1000, 92),
+        (1000, 92),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (4000, 70),
+        (5000, 60),
+        (1000, 87),
+        (1500, 35),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 15),
+        (4000, 40),
+        (1000, 85),
+        (1000, 45),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 50),
+        (5000, 20),
+        (1000, 92),
+        (1000, 92),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 30),
+        (4000, 60),
+        (500, 72),
+        (500, 92),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 40),
+        (3000, 60),
+        (1500, 75),
+        (1500, 92),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (7500, 50),
+        (5000, 75),
+        (2000, 84),
+        (2000, 84),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (7000, 50),
+        (5000, 50),
+        (1500, 84),
+        (1500, 84),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 70),
+        (5000, 60),
+        (2000, 85),
+        (2000, 85),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 30),
+        (5000, 30),
+        (1000, 85),
+        (1000, 85),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 45),
+        (5000, 45),
+        (500, 65),
+        (1000, 55),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (7000, 40),
+        (7000, 45),
+        (3000, 55),
+        (3000, 55),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (10000, 50),
+        (10000, 50),
+        (3000, 55),
+        (3000, 75),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (6000, 50),
+        (5000, 40),
+        (1000, 55),
+        (1000, 55),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 50),
+        (6000, 50),
+        (500, 55),
+        (1000, 65),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (4000, 30),
+        (5000, 55),
+        (500, 65),
+        (1500, 65),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (8000, 45),
+        (8000, 45),
+        (4000, 55),
+        (4000, 55),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (10000, 5),
+        (10000, 15),
+        (500, 45),
+        (500, 20),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 20),
+        (5000, 5),
+        (2500, 55),
+        (2500, 55),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 55),
+        (5000, 55),
+        (2500, 75),
+        (2500, 75),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (10000, 2),
+        (9500, 3),
+        (2000, 35),
+        (5000, 8),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (1000, 25),
+        (1000, 25),
+        (500, 55),
+        (500, 55),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (10000, 1),
+        (7000, 10),
+        (3000, 35),
+        (2000, 35),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (8000, 5),
+        (8000, 20),
+        (3000, 55),
+        (3000, 55),
+        (0, 100),
+        (0, 100),
+    ),
+    (
+        (5000, 20),
+        (5000, 20),
+        (2000, 55),
+        (2000, 55),
+        (0, 100),
+        (0, 100),
+    ),
 )
 
 NATURE_NAMES: tuple[str, ...] = (
@@ -1212,6 +1447,8 @@ def set_identity_section(
     eeprom: bytearray,
     *,
     trainer_name: str | None = None,
+    trainer_tid: int | None = None,
+    trainer_sid: int | None = None,
     protocol_version: int | None = None,
     protocol_sub_version: int | None = None,
     last_sync_epoch_seconds: int | None = None,
@@ -1220,6 +1457,10 @@ def set_identity_section(
     _check_size(eeprom)
     if trainer_name is not None:
         set_trainer_name(eeprom, trainer_name)
+    if trainer_tid is not None:
+        write_u16_be(eeprom, IDENTITY_TRAINER_TID_OFFSET, _validate_u16("trainerTid", trainer_tid))
+    if trainer_sid is not None:
+        write_u16_be(eeprom, IDENTITY_TRAINER_SID_OFFSET, _validate_u16("trainerSid", trainer_sid))
     if protocol_version is not None:
         eeprom[IDENTITY_PROTOCOL_VERSION_OFFSET] = _validate_u8("protocolVersion", protocol_version)
     if protocol_sub_version is not None:
@@ -1230,6 +1471,28 @@ def set_identity_section(
         set_last_sync_seconds(eeprom, last_sync_epoch_seconds)
     if step_count is not None:
         set_steps(eeprom, step_count)
+
+    _sync_team_identity_from_identity_section(eeprom)
+
+
+def _sync_team_identity_from_identity_section(eeprom: bytearray) -> None:
+    _check_size(eeprom)
+
+    # Identity TID/SID are stored big-endian, while TeamData stores them little-endian.
+    identity_tid = read_u16_be(eeprom, IDENTITY_TRAINER_TID_OFFSET)
+    identity_sid = read_u16_be(eeprom, IDENTITY_TRAINER_SID_OFFSET)
+    if identity_tid != 0:
+        write_u16_le(eeprom, TEAM_TRAINER_TID_OFFSET, identity_tid)
+    if identity_sid != 0:
+        write_u16_le(eeprom, TEAM_TRAINER_SID_OFFSET, identity_sid)
+
+    trainer_name = read_trainer_name(eeprom).strip()
+    if trainer_name and trainer_name != "UNKNOWN":
+        _write_device_text_fixed(eeprom, TEAM_TRAINER_NAME_OFFSET, TEAM_TRAINER_NAME_CHARS, trainer_name)
+
+    identity_uniq = eeprom[IDENTITY_OFFSET + 16 : IDENTITY_OFFSET + 56]
+    if any(identity_uniq):
+        eeprom[TEAM_UNIQ_OFFSET : TEAM_UNIQ_OFFSET + TEAM_UNIQ_SIZE] = identity_uniq
 
 
 def read_stats_section(eeprom: bytearray) -> Dict[str, Any]:
@@ -1384,7 +1647,16 @@ def _configure_route_from_course(
     for group in range(ROUTE_POKE_SLOTS):
         left = entries[group * 2]
         right = entries[group * 2 + 1]
-        pick = left if rng.randint(0, 1) == 0 else right
+        pick_index = rng.randint(0, 1)
+        pick = left if pick_index == 0 else right
+
+        profile_slot = group * 2 + pick_index
+        if 0 <= course_id < len(COURSE_SLOT_PROFILES):
+            min_steps, chance = COURSE_SLOT_PROFILES[course_id][profile_slot]
+        else:
+            min_steps = DEFAULT_ROUTE_SLOT_MIN_STEPS[group]
+            chance = DEFAULT_ROUTE_SLOT_CHANCE[group]
+
         summary = _pokemon_summary_from_values(
             int(pick["speciesId"]),
             level=int(pick.get("level", 10)),
@@ -1394,8 +1666,8 @@ def _configure_route_from_course(
             eeprom,
             group,
             summary,
-            min_steps=DEFAULT_ROUTE_SLOT_MIN_STEPS[group],
-            chance=DEFAULT_ROUTE_SLOT_CHANCE[group],
+            min_steps=min_steps,
+            chance=chance,
         )
         configured.append(
             {
@@ -1403,8 +1675,8 @@ def _configure_route_from_course(
                 "speciesId": summary["speciesId"],
                 "speciesName": _species_name(summary["speciesId"]),
                 "level": summary["level"],
-                "chance": DEFAULT_ROUTE_SLOT_CHANCE[group],
-                "minSteps": DEFAULT_ROUTE_SLOT_MIN_STEPS[group],
+                "chance": chance,
+                "minSteps": min_steps,
             }
         )
 
@@ -1883,8 +2155,20 @@ def send_pokemon_to_stroll(
     _write_device_text_fixed(eeprom, ROUTE_NICKNAME_OFFSET, ROUTE_NICKNAME_CHARS, display_name)
     eeprom[ROUTE_FRIENDSHIP_OFFSET] = friendship_u8
 
+    _sync_team_identity_from_identity_section(eeprom)
+
+    team_tid = read_u16_le(eeprom, TEAM_TRAINER_TID_OFFSET)
+    team_sid = read_u16_le(eeprom, TEAM_TRAINER_SID_OFFSET)
+
     team_base = TEAM_POKES_OFFSET
     write_u16_le(eeprom, team_base + TEAM_POKE_SPECIES_OFFSET, sid)
+    write_u16_le(eeprom, team_base + TEAM_POKE_HELD_ITEM_OFFSET, int(summary["heldItem"]))
+    for move_index, move_id in enumerate(summary["moves"]):
+        write_u16_le(eeprom, team_base + TEAM_POKE_MOVES_OFFSET + move_index * 2, int(move_id))
+    write_u16_le(eeprom, team_base + TEAM_POKE_OT_TID_OFFSET, team_tid)
+    write_u16_le(eeprom, team_base + TEAM_POKE_OT_SID_OFFSET, team_sid)
+    eeprom[team_base + TEAM_POKE_VARIANT_OFFSET] = _validate_u8("variantFlags", variant_flags)
+    eeprom[team_base + TEAM_POKE_HAPPINESS_OFFSET] = friendship_u8
     eeprom[team_base + TEAM_POKE_LEVEL_OFFSET] = lvl
     _write_device_text_fixed(eeprom, team_base + TEAM_POKE_NICKNAME_OFFSET, TEAM_POKE_NICKNAME_CHARS, display_name)
 
@@ -2130,14 +2414,7 @@ def return_pokemon_from_stroll(
     for team_slot in range(TEAM_POKE_COUNT):
         team_base = TEAM_POKES_OFFSET + team_slot * TEAM_POKE_ENTRY_SIZE
         if read_u16_le(eeprom, team_base + TEAM_POKE_SPECIES_OFFSET) == walking_species:
-            write_u16_le(eeprom, team_base + TEAM_POKE_SPECIES_OFFSET, 0)
-            eeprom[team_base + TEAM_POKE_LEVEL_OFFSET] = 0
-            _write_device_text_fixed(
-                eeprom,
-                team_base + TEAM_POKE_NICKNAME_OFFSET,
-                TEAM_POKE_NICKNAME_CHARS,
-                "",
-            )
+            eeprom[team_base : team_base + TEAM_POKE_ENTRY_SIZE] = b"\x00" * TEAM_POKE_ENTRY_SIZE
             break
 
     if clear_caught_after_return:

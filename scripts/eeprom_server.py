@@ -147,6 +147,8 @@ class WearWalkerMockState:
         self,
         *,
         trainer_name: str | None = None,
+        trainer_tid: int | None = None,
+        trainer_sid: int | None = None,
         protocol_version: int | None = None,
         protocol_sub_version: int | None = None,
         last_sync_epoch_seconds: int | None = None,
@@ -156,6 +158,8 @@ class WearWalkerMockState:
             set_identity_section(
                 self._eeprom,
                 trainer_name=trainer_name,
+                trainer_tid=trainer_tid,
+                trainer_sid=trainer_sid,
                 protocol_version=protocol_version,
                 protocol_sub_version=protocol_sub_version,
                 last_sync_epoch_seconds=last_sync_epoch_seconds,
@@ -412,6 +416,8 @@ class SyncRequest(BaseModel):
 
 class IdentityPatchRequest(BaseModel):
     trainerName: str | None = Field(default=None, min_length=1, max_length=64)
+    trainerTid: int | None = Field(default=None, ge=0, le=0xFFFF)
+    trainerSid: int | None = Field(default=None, ge=0, le=0xFFFF)
     protocolVersion: int | None = Field(default=None, ge=0, le=0xFF)
     protocolSubVersion: int | None = Field(default=None, ge=0, le=0xFF)
     lastSyncEpochSeconds: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
@@ -547,6 +553,8 @@ def create_app(eeprom_path: Path) -> FastAPI:
             ensure_patch_has_values(body)
             identity = app.state.ww_state.mutate_identity(
                 trainer_name=body.trainerName,
+                trainer_tid=body.trainerTid,
+                trainer_sid=body.trainerSid,
                 protocol_version=body.protocolVersion,
                 protocol_sub_version=body.protocolSubVersion,
                 last_sync_epoch_seconds=body.lastSyncEpochSeconds,

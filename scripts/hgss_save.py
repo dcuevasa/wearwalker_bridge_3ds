@@ -56,10 +56,13 @@ PK4_OFFSET_PID = 0x00
 PK4_OFFSET_SANITY = 0x04
 PK4_OFFSET_CHECKSUM = 0x06
 PK4_OFFSET_SPECIES = 0x08
+PK4_OFFSET_HELD_ITEM = 0x0A
 PK4_OFFSET_ID32 = 0x0C
 PK4_OFFSET_EXP = 0x10
+PK4_OFFSET_FRIENDSHIP = 0x14
 PK4_OFFSET_ABILITY = 0x15
 PK4_OFFSET_LANGUAGE = 0x17
+PK4_OFFSET_MOVE1 = 0x28
 PK4_OFFSET_IV32 = 0x38
 PK4_OFFSET_FLAGS = 0x40
 PK4_OFFSET_EGG_LOCATION_EXT = 0x44
@@ -618,6 +621,42 @@ def _encode_g4_string(value: str, max_chars: int) -> bytes:
     return bytes(out)
 
 
+def _g4_value_to_char(value: int) -> str:
+    if 0x0121 <= value <= 0x012A:
+        return chr(ord("0") + (value - 0x0121))
+    if 0x012B <= value <= 0x0144:
+        return chr(ord("A") + (value - 0x012B))
+    if 0x0145 <= value <= 0x015E:
+        return chr(ord("a") + (value - 0x0145))
+    if value == 0x01CE:
+        return " "
+
+    punctuation = {
+        0x00E1: "!",
+        0x00E2: "?",
+        0x00F9: ",",
+        0x00F8: ".",
+        0x00F1: "-",
+        0x01B3: "'",
+        0x01AC: "?",
+    }
+    return punctuation.get(value, "?")
+
+
+def _decode_g4_string(raw: bytes | bytearray, max_chars: int) -> str:
+    data = bytearray(raw)
+    length = min(max_chars, len(data) // 2)
+    out_chars: list[str] = []
+
+    for index in range(length):
+        value = _read_u16_le(data, index * 2)
+        if value in (0x0000, 0xFFFF):
+            break
+        out_chars.append(_g4_value_to_char(value))
+
+    return "".join(out_chars).strip()
+
+
 def _pk4_today_triplet() -> tuple[int, int, int]:
     today = date.today()
     if today.year < 2000 or today.year > 2099:
@@ -792,6 +831,82 @@ class HGSSSave:
             ),
             "ot_gender": self._data[trainer_offset + HGSS_TRAINER_GENDER_REL],
             "language": self._data[trainer_offset + HGSS_TRAINER_LANGUAGE_REL],
+        }
+
+    def extract_stroll_send_context(
+        self,
+        *,
+        box_number: int,
+        source_slot_number: int,
+    ) -> dict[str, Any]:
+        box_index = int(box_number) - 1
+        source_slot_index = int(source_slot_number) - 1
+        _, _, source_dec = self._read_box_slot_decrypted(box_index, source_slot_index)
+
+        species_id = _read_u16_le(source_dec, PK4_OFFSET_SPECIES)
+        if species_id == 0:
+            raise ValueError(
+                f"Source slot box {box_number} slot {source_slot_number} is empty"
+            )
+
+        exp = _read_u32_le(source_dec, PK4_OFFSET_EXP)
+        growth = _species_growth_rate(species_id)
+        level = _level_from_exp(exp, growth)
+        friendship = int(source_dec[PK4_OFFSET_FRIENDSHIP])
+        held_item = _read_u16_le(source_dec, PK4_OFFSET_HELD_ITEM)
+        moves = [_read_u16_le(source_dec, PK4_OFFSET_MOVE1 + index * 2) for index in range(4)]
+
+        pid = _read_u32_le(source_dec, PK4_OFFSET_PID)
+        source_id32 = _read_u32_le(source_dec, PK4_OFFSET_ID32)
+        source_tid = source_id32 & 0xFFFF
+        source_sid = (source_id32 >> 16) & 0xFFFF
+        is_shiny = (((pid & 0xFFFF) ^ ((pid >> 16) & 0xFFFF) ^ source_tid ^ source_sid) < 8)
+
+        gender_bits = (int(source_dec[PK4_OFFSET_FLAGS]) >> 1) & 0x03
+        variant_flags = 0x20 if gender_bits == 1 else 0
+        special_flags = 0x02 if is_shiny else 0
+
+        nickname = _decode_g4_string(
+            source_dec[PK4_OFFSET_NICKNAME : PK4_OFFSET_NICKNAME + 22],
+            11,
+        )
+
+        trainer_ctx = self._get_trainer_context()
+        trainer_id32 = int(trainer_ctx["id32"])
+        trainer_tid = trainer_id32 & 0xFFFF
+        trainer_sid = (trainer_id32 >> 16) & 0xFFFF
+        trainer_name = _decode_g4_string(trainer_ctx["ot_name_raw"], 8)
+        if not trainer_name:
+            trainer_name = "WWBRIDGE"
+
+        return {
+            "trainer": {
+                "name": trainer_name,
+                "id32": trainer_id32,
+                "tid": trainer_tid,
+                "sid": trainer_sid,
+                "gender": int(trainer_ctx["ot_gender"]),
+                "language": int(trainer_ctx["language"]),
+            },
+            "sourcePokemon": {
+                "boxNumber": int(box_number),
+                "slotNumber": int(source_slot_number),
+                "speciesId": int(species_id),
+                "level": int(level),
+                "exp": int(exp),
+                "friendship": int(friendship),
+                "heldItem": int(held_item),
+                "moves": [int(move) for move in moves],
+                "variantFlags": int(variant_flags),
+                "specialFlags": int(special_flags),
+                "nickname": nickname,
+                "version": int(source_dec[PK4_OFFSET_VERSION]),
+            },
+            "pokewalker": {
+                "steps": int(self._read_general_u32(HGSS_WALKER_STEPS_OFFSET)),
+                "watts": int(self._read_general_u32(HGSS_WALKER_WATTS_OFFSET)),
+                "courseFlags": int(self._read_general_u32(HGSS_WALKER_COURSE_FLAGS_OFFSET)),
+            },
         }
 
     def _build_pokewalker_capture_pk4(
@@ -1229,6 +1344,19 @@ def patch_hgss_save(
     result = save.patch_pokewalker(steps=steps, watts=watts, course_flags=course_flags)
     save.resign_active_blocks(include_storage=resign_storage)
     return result, save.to_bytes()
+
+
+def extract_hgss_stroll_send_context(
+    path: str | Path,
+    *,
+    box_number: int,
+    source_slot_number: int,
+) -> dict[str, Any]:
+    save = HGSSSave.from_file(path)
+    return save.extract_stroll_send_context(
+        box_number=box_number,
+        source_slot_number=source_slot_number,
+    )
 
 
 def apply_hgss_stroll_box_return(

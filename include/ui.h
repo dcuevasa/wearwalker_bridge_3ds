@@ -23,6 +23,7 @@ enum operation ui_update();
 enum state {
 	IN_MENU,
 	IN_SELECTION,
+	IN_FILE_BROWSER,
 };
 
 enum operation {

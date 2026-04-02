@@ -453,7 +453,7 @@ static void ww_snapshot_from_json(const char *json, wearwalker_snapshot *out_sna
 		out_snapshot->watts = 0;
 }
 
-static bool ww_api_command_request_json(const char *path, const char *body_json,
+static bool ww_api_command_request_json(const char *method, const char *path, const char *body_json,
 		wearwalker_snapshot *out_snapshot, char *out_json, u32 out_size)
 {
 	u8 *response = NULL;
@@ -466,7 +466,7 @@ static bool ww_api_command_request_json(const char *path, const char *body_json,
 	if (!response || !json_buf)
 		goto cleanup;
 
-	if (!ww_http_request_json("POST", path, body_json, response, WW_API_RESPONSE_MAX, &response_size))
+	if (!ww_http_request_json(method, path, body_json, response, WW_API_RESPONSE_MAX, &response_size))
 		goto cleanup;
 
 	if (!ww_http_extract_text_body(response, response_size, json_buf, WW_API_RESPONSE_MAX))
@@ -584,12 +584,36 @@ cleanup:
 	return ok;
 }
 
+bool ww_api_get_sync_package(char *out_json, u32 out_size)
+{
+	u8 *response;
+	u32 response_size;
+	bool ok = false;
+
+	if (!out_json || out_size == 0)
+		return false;
+
+	response = (u8 *)malloc(WW_API_RESPONSE_MAX);
+	if (!response)
+		return false;
+
+	if (!ww_http_request_raw("GET", "/api/v1/sync/package", NULL, 0,
+				response, WW_API_RESPONSE_MAX, &response_size))
+		goto cleanup;
+
+	ok = ww_http_extract_text_body(response, response_size, out_json, out_size);
+
+cleanup:
+	free(response);
+	return ok;
+}
+
 bool ww_api_command_set_steps(u32 steps, wearwalker_snapshot *out_snapshot, char *out_json, u32 out_size)
 {
 	char body[64];
 
 	snprintf(body, sizeof(body), "{\"steps\":%lu}", (unsigned long)steps);
-	return ww_api_command_request_json("/api/v1/device/commands/set-steps", body, out_snapshot, out_json, out_size);
+	return ww_api_command_request_json("POST", "/api/v1/device/commands/set-steps", body, out_snapshot, out_json, out_size);
 }
 
 bool ww_api_command_set_watts(u32 watts, wearwalker_snapshot *out_snapshot, char *out_json, u32 out_size)
@@ -600,7 +624,7 @@ bool ww_api_command_set_watts(u32 watts, wearwalker_snapshot *out_snapshot, char
 		return false;
 
 	snprintf(body, sizeof(body), "{\"watts\":%lu}", (unsigned long)watts);
-	return ww_api_command_request_json("/api/v1/device/commands/set-watts", body, out_snapshot, out_json, out_size);
+	return ww_api_command_request_json("POST", "/api/v1/device/commands/set-watts", body, out_snapshot, out_json, out_size);
 }
 
 bool ww_api_command_set_trainer(const char *trainer_name, wearwalker_snapshot *out_snapshot, char *out_json, u32 out_size)
@@ -617,7 +641,7 @@ bool ww_api_command_set_trainer(const char *trainer_name, wearwalker_snapshot *o
 	if (written < 0 || (u32)written >= sizeof(body))
 		return false;
 
-	return ww_api_command_request_json("/api/v1/device/commands/set-trainer", body, out_snapshot, out_json, out_size);
+	return ww_api_command_request_json("POST", "/api/v1/device/commands/set-trainer", body, out_snapshot, out_json, out_size);
 }
 
 bool ww_api_command_set_sync(u32 epoch_seconds, wearwalker_snapshot *out_snapshot, char *out_json, u32 out_size)
@@ -625,7 +649,137 @@ bool ww_api_command_set_sync(u32 epoch_seconds, wearwalker_snapshot *out_snapsho
 	char body[64];
 
 	snprintf(body, sizeof(body), "{\"epoch\":%lu}", (unsigned long)epoch_seconds);
-	return ww_api_command_request_json("/api/v1/device/commands/set-sync", body, out_snapshot, out_json, out_size);
+	return ww_api_command_request_json("POST", "/api/v1/device/commands/set-sync", body, out_snapshot, out_json, out_size);
+}
+
+bool ww_api_patch_identity(const char *trainer_name, u16 trainer_tid, u16 trainer_sid, char *out_json, u32 out_size)
+{
+	char body[192];
+	int written;
+
+	if (!trainer_name || !trainer_name[0])
+		trainer_name = "WWBRIDGE";
+	if (!ww_json_string_is_safe(trainer_name))
+		return false;
+
+	written = snprintf(
+			body,
+			sizeof(body),
+			"{\"trainerName\":\"%s\",\"trainerTid\":%u,\"trainerSid\":%u}",
+			trainer_name,
+			(unsigned)trainer_tid,
+			(unsigned)trainer_sid);
+	if (written < 0 || (u32)written >= sizeof(body))
+		return false;
+
+	return ww_api_command_request_json("PATCH", "/api/v1/device/identity", body, NULL, out_json, out_size);
+}
+
+bool ww_api_stroll_send(
+		u16 species_id,
+		u8 level,
+		u8 course_id,
+		bool clear_buffers,
+		bool allow_locked_course,
+		const char *nickname,
+		u8 friendship,
+		u16 held_item,
+		const u16 moves[4],
+		u8 variant_flags,
+		u8 special_flags,
+		char *out_json,
+		u32 out_size)
+{
+	char body[512];
+	u16 move1 = 0;
+	u16 move2 = 0;
+	u16 move3 = 0;
+	u16 move4 = 0;
+	int written;
+
+	if (species_id == 0)
+		return false;
+	if (level == 0 || level > 100)
+		level = 10;
+	if (moves) {
+		move1 = moves[0];
+		move2 = moves[1];
+		move3 = moves[2];
+		move4 = moves[3];
+	}
+
+	if (nickname && nickname[0]) {
+		if (!ww_json_string_is_safe(nickname))
+			return false;
+
+		written = snprintf(
+				body,
+				sizeof(body),
+				"{\"speciesId\":%u,\"level\":%u,\"courseId\":%u,\"nickname\":\"%s\",\"friendship\":%u,\"heldItem\":%u,\"moves\":[%u,%u,%u,%u],\"variantFlags\":%u,\"specialFlags\":%u,\"clearBuffers\":%s,\"allowLockedCourse\":%s}",
+				(unsigned)species_id,
+				(unsigned)level,
+				(unsigned)course_id,
+				nickname,
+				(unsigned)friendship,
+				(unsigned)held_item,
+				(unsigned)move1,
+				(unsigned)move2,
+				(unsigned)move3,
+				(unsigned)move4,
+				(unsigned)variant_flags,
+				(unsigned)special_flags,
+				clear_buffers ? "true" : "false",
+				allow_locked_course ? "true" : "false");
+	} else {
+		written = snprintf(
+				body,
+				sizeof(body),
+				"{\"speciesId\":%u,\"level\":%u,\"courseId\":%u,\"friendship\":%u,\"heldItem\":%u,\"moves\":[%u,%u,%u,%u],\"variantFlags\":%u,\"specialFlags\":%u,\"clearBuffers\":%s,\"allowLockedCourse\":%s}",
+				(unsigned)species_id,
+				(unsigned)level,
+				(unsigned)course_id,
+				(unsigned)friendship,
+				(unsigned)held_item,
+				(unsigned)move1,
+				(unsigned)move2,
+				(unsigned)move3,
+				(unsigned)move4,
+				(unsigned)variant_flags,
+				(unsigned)special_flags,
+				clear_buffers ? "true" : "false",
+				allow_locked_course ? "true" : "false");
+	}
+	if (written < 0 || (u32)written >= sizeof(body))
+		return false;
+
+	return ww_api_command_request_json("POST", "/api/v1/stroll/send", body, NULL, out_json, out_size);
+}
+
+bool ww_api_stroll_return(
+		u32 walked_steps,
+		u16 bonus_watts,
+		u8 auto_captures,
+		bool replace_when_full,
+		bool clear_caught_after_return,
+		char *out_json,
+		u32 out_size)
+{
+	char body[256];
+	int written;
+
+	written = snprintf(
+			body,
+			sizeof(body),
+			"{\"walkedSteps\":%lu,\"bonusWatts\":%u,\"autoCaptures\":%u,\"replaceWhenFull\":%s,\"clearCaughtAfterReturn\":%s}",
+			(unsigned long)walked_steps,
+			(unsigned)bonus_watts,
+			(unsigned)auto_captures,
+			replace_when_full ? "true" : "false",
+			clear_caught_after_return ? "true" : "false");
+	if (written < 0 || (u32)written >= sizeof(body))
+		return false;
+
+	return ww_api_command_request_json("POST", "/api/v1/stroll/return", body, NULL, out_json, out_size);
 }
 
 bool ww_api_export_eeprom(const char *out_path)

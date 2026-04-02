@@ -54,6 +54,7 @@ from eeprom_common import (
 from hgss_save import (
     apply_hgss_stroll_box_return,
     diff_hgss_save_files,
+    extract_hgss_stroll_send_context,
     inspect_hgss_save,
     patch_hgss_save,
 )
@@ -366,6 +367,10 @@ def cmd_patch_identity(args: argparse.Namespace) -> int:
     payload: dict[str, int | str] = {}
     if args.trainer_name is not None:
         payload["trainerName"] = args.trainer_name
+    if args.trainer_tid is not None:
+        payload["trainerTid"] = args.trainer_tid
+    if args.trainer_sid is not None:
+        payload["trainerSid"] = args.trainer_sid
     if args.protocol_version is not None:
         payload["protocolVersion"] = args.protocol_version
     if args.protocol_sub_version is not None:
@@ -388,6 +393,8 @@ def cmd_patch_identity(args: argparse.Namespace) -> int:
     set_identity_section(
         eeprom,
         trainer_name=args.trainer_name,
+        trainer_tid=args.trainer_tid,
+        trainer_sid=args.trainer_sid,
         protocol_version=args.protocol_version,
         protocol_sub_version=args.protocol_sub_version,
         last_sync_epoch_seconds=args.last_sync,
@@ -943,6 +950,102 @@ def _parse_u32_like(value: Any) -> int:
     return int(value)
 
 
+def cmd_hgss_stroll_box_send(args: argparse.Namespace) -> int:
+    send_context = extract_hgss_stroll_send_context(
+        args.save,
+        box_number=args.box,
+        source_slot_number=args.source_slot,
+    )
+
+    trainer = dict(send_context.get("trainer", {}))
+    source = dict(send_context.get("sourcePokemon", {}))
+    pokewalker = dict(send_context.get("pokewalker", {}))
+
+    eeprom = load_target_eeprom(args)
+
+    set_identity_section(
+        eeprom,
+        trainer_name=str(trainer.get("name", "WWBRIDGE")),
+        trainer_tid=int(trainer.get("tid", 0)),
+        trainer_sid=int(trainer.get("sid", 0)),
+        step_count=int(pokewalker.get("steps", 0)),
+    )
+    set_stats_section(
+        eeprom,
+        steps=int(pokewalker.get("steps", 0)),
+        watts=int(pokewalker.get("watts", 0)),
+    )
+
+    send_result = send_pokemon_to_stroll(
+        eeprom,
+        species_id=int(source.get("speciesId", 0)),
+        level=int(source.get("level", 10)),
+        route_image_index=args.route_image_index,
+        course_id=args.course_id,
+        nickname=str(source.get("nickname", "")) or None,
+        friendship=int(source.get("friendship", 70)),
+        held_item=int(source.get("heldItem", 0)),
+        moves=[int(move) for move in list(source.get("moves", [0, 0, 0, 0]))[:4]],
+        variant_flags=int(source.get("variantFlags", 0)),
+        special_flags=int(source.get("specialFlags", 0)),
+        seed=args.seed,
+        clear_buffers=args.clear_buffers,
+        allow_locked_course=args.allow_locked_course,
+        assume_national_dex=not args.no_national_dex,
+        unlock_special_courses=args.unlock_special_courses,
+        unlock_event_courses=args.unlock_event_courses,
+        existing_course_flags=int(pokewalker.get("courseFlags", 0)),
+    )
+
+    save_target_eeprom(args, eeprom)
+
+    output_eeprom_path: str | None = None
+    if args.output_eeprom:
+        out_path = Path(args.output_eeprom).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(bytes(eeprom))
+        output_eeprom_path = str(out_path)
+    elif not args.server:
+        output_eeprom_path = str(Path(args.eeprom).resolve())
+
+    route_slots = send_result.get("configuredRouteSlots", [])
+    route_preview: list[dict[str, Any]] = []
+    if isinstance(route_slots, list):
+        for entry in route_slots[:3]:
+            if not isinstance(entry, dict):
+                continue
+            route_preview.append(
+                {
+                    "slot": int(entry.get("slot", -1)),
+                    "speciesId": int(entry.get("speciesId", 0)),
+                    "speciesName": str(entry.get("speciesName", "")),
+                    "level": int(entry.get("level", 0)),
+                    "chance": int(entry.get("chance", 0)),
+                    "minSteps": int(entry.get("minSteps", 0)),
+                }
+            )
+
+    print_json(
+        {
+            "status": "ok",
+            "save": str(Path(args.save).resolve()),
+            "outputEeprom": output_eeprom_path,
+            "sourceFromHGSS": source,
+            "trainerFromHGSS": trainer,
+            "pokewalkerFromHGSS": {
+                "steps": int(pokewalker.get("steps", 0)),
+                "watts": int(pokewalker.get("watts", 0)),
+                "courseFlags": f"0x{int(pokewalker.get('courseFlags', 0)):08X}",
+            },
+            "identityAfterWrite": read_identity_section(eeprom),
+            "statsAfterWrite": read_stats_section(eeprom),
+            "strollSend": send_result,
+            "routeSlotsPreview": route_preview,
+        }
+    )
+    return 0
+
+
 def cmd_hgss_stroll_box_return(args: argparse.Namespace) -> int:
     if args.in_place:
         output_path = Path(args.save).resolve()
@@ -1314,6 +1417,67 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hgss_stroll_box.set_defaults(func=cmd_hgss_stroll_box_return)
 
+    p_hgss_stroll_send = sub.add_parser(
+        "hgss-stroll-box-send",
+        help=(
+            "Read one boxed Pokemon + trainer/pokewalker fields from HGSS .sav and "
+            "write a complete stroll-send state into EEPROM"
+        ),
+    )
+    add_target_options(p_hgss_stroll_send, default_eeprom)
+    p_hgss_stroll_send.add_argument("--save", required=True, help="Input HGSS .sav path")
+    p_hgss_stroll_send.add_argument("--box", type=int, default=17, help="1-based source box number")
+    p_hgss_stroll_send.add_argument(
+        "--source-slot",
+        type=int,
+        default=1,
+        help="1-based source slot in the selected box",
+    )
+    p_hgss_stroll_send.add_argument(
+        "--course-id",
+        type=int,
+        default=None,
+        help="Pokewalker course id override (0..26)",
+    )
+    p_hgss_stroll_send.add_argument(
+        "--route-image-index",
+        type=int,
+        default=None,
+        help="Route image index override (u8). If both are set, course-id wins.",
+    )
+    p_hgss_stroll_send.add_argument("--seed", type=int, default=None, help="Deterministic route seed")
+    p_hgss_stroll_send.add_argument(
+        "--clear-buffers",
+        action="store_true",
+        help="Clear caught/dowsed buffers before writing stroll-send payload",
+    )
+    p_hgss_stroll_send.add_argument(
+        "--allow-locked-course",
+        action="store_true",
+        help="Allow writing a locked course without watt/special checks",
+    )
+    p_hgss_stroll_send.add_argument(
+        "--no-national-dex",
+        action="store_true",
+        help="Compute route unlock state assuming National Dex is unavailable",
+    )
+    p_hgss_stroll_send.add_argument(
+        "--unlock-special-courses",
+        action="store_true",
+        help="Treat trade/Jirachi special courses as unlocked",
+    )
+    p_hgss_stroll_send.add_argument(
+        "--unlock-event-courses",
+        action="store_true",
+        help="Treat event-only courses as unlocked",
+    )
+    p_hgss_stroll_send.add_argument(
+        "--output-eeprom",
+        default=None,
+        help="Optional extra output path to write the resulting EEPROM bytes",
+    )
+    p_hgss_stroll_send.set_defaults(func=cmd_hgss_stroll_box_send)
+
     p_sync_package = sub.add_parser("sync-package", help="Build/read sync package for bridge decoupling")
     add_target_options(p_sync_package, default_eeprom)
     p_sync_package.set_defaults(func=cmd_sync_package)
@@ -1524,6 +1688,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_patch_identity = sub.add_parser("patch-identity", help="Patch identity domain")
     add_target_options(p_patch_identity, default_eeprom)
     p_patch_identity.add_argument("--trainer-name", default=None, help="Trainer name")
+    p_patch_identity.add_argument("--trainer-tid", type=int, default=None, help="Trainer TID (u16)")
+    p_patch_identity.add_argument("--trainer-sid", type=int, default=None, help="Trainer SID (u16)")
     p_patch_identity.add_argument("--protocol-version", type=int, default=None, help="Protocol version")
     p_patch_identity.add_argument(
         "--protocol-sub-version", type=int, default=None, help="Protocol sub-version"

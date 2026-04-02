@@ -40,6 +40,15 @@ GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
 APP_DESCRIPTION := Pokewalker hacking tool
 APP_AUTHOR	:=	francesco265
+APP_PRODUCT_CODE := CTR-P-WWBG
+APP_UNIQUE_ID := 0xA2B01
+RSF_PATH := $(TOPDIR)/app.rsf
+BANNER_IMAGE := $(TOPDIR)/banner.png
+BANNER_AUDIO := $(TOPDIR)/audio.wav
+BANNER_BIN := $(TOPDIR)/banner.bin
+ICON_BIN := $(TOPDIR)/icon.bin
+BANNERTOOL ?= bannertool
+MAKEROM ?= makerom
 #ROMFS		:=	romfs
 #GFXBUILD	:=	$(ROMFS)/gfx
 
@@ -164,11 +173,18 @@ ifneq ($(ROMFS),)
 	export _3DSXFLAGS += --romfs=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: all clean
+.PHONY: all cia clean
 
 #---------------------------------------------------------------------------------
 all: $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+
+cia: all
+	@test -f "$(BANNER_IMAGE)" || (echo "Missing $(BANNER_IMAGE)" && false)
+	@test -f "$(BANNER_AUDIO)" || (echo "Missing $(BANNER_AUDIO)" && false)
+	@$(BANNERTOOL) makebanner -i "$(BANNER_IMAGE)" -a "$(BANNER_AUDIO)" -o "$(BANNER_BIN)"
+	@$(BANNERTOOL) makesmdh -s "$(TARGET)" -l "$(APP_DESCRIPTION)" -p "$(APP_AUTHOR)" -i "$(APP_ICON)" -o "$(ICON_BIN)"
+	@$(MAKEROM) -f cia -o "$(OUTPUT).cia" -target t -exefslogo -elf "$(OUTPUT).elf" -icon "$(ICON_BIN)" -banner "$(BANNER_BIN)" -rsf "$(RSF_PATH)" -DAPP_TITLE="$(TARGET)" -DAPP_PRODUCT_CODE="$(APP_PRODUCT_CODE)" -DAPP_UNIQUE_ID="$(APP_UNIQUE_ID)"
 
 $(BUILD):
 	@mkdir -p $@
@@ -186,7 +202,7 @@ endif
 #---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(GFXBUILD)
+	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(TARGET).cia $(BANNER_BIN) $(ICON_BIN) $(GFXBUILD)
 
 #---------------------------------------------------------------------------------
 $(GFXBUILD)/%.t3x	$(BUILD)/%.h	:	%.t3s

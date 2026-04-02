@@ -58,7 +58,7 @@ make cia
 
 This repository now includes a first WiFi protocol draft and two Python tools to test each side independently.
 
-Current 3DS UI mode is test-focused: legacy pwalkerHax gameplay/editing menu actions were removed from UI, leaving backend/API test actions only.
+Current 3DS UI now exposes four practical menus: API test, HGSS sync/patch, HGSS stroll send-from-box, and HGSS stroll return-to-save.
 
 - Protocol spec: docs/protocol/PROTOCOL_V1.md
 - Mock backend (no watch required): scripts/eeprom_server.py
@@ -71,6 +71,12 @@ From the repository root:
 ```sh
 python3 -m pip install -r requirements.txt
 python3 scripts/eeprom_server.py --host 127.0.0.1 --port 8080
+```
+
+For real 3DS LAN testing, bind the server on all interfaces and use your PC LAN IP in the 3DS menu:
+
+```sh
+python3 scripts/eeprom_server.py --host 0.0.0.0 --port 8080
 ```
 
 Open FastAPI interactive docs at:
@@ -243,6 +249,92 @@ The 3DS app now includes a dedicated **HGSS save sync/patch** menu:
 - Optional trip-counter increment (maps to HGSS Pokewalker trip counter at `0xE700` in the active General block).
 
 Current MVP patch scope is the Pokewalker progress area + General block checksum refresh.
+
+### HGSS stroll send/return menus on 3DS
+
+Two additional on-device workflows are now available:
+
+- **HGSS -> Stroll Send**
+	- Configure backend host/port.
+	- Select a real HGSS `.sav` from SD.
+	- Choose source **box** and **slot**.
+	- Inspect selected slot summary (`species`, `exp`, estimated level).
+	- Before send, seed backend EEPROM identity/stats from HGSS save:
+		- trainer name + TID/SID from HGSS trainer block,
+		- Pokewalker steps/watts from HGSS Pokewalker fields.
+	- Choose route/course id and trigger `/api/v1/stroll/send`.
+	- The send payload now uses real source-slot fields from `.sav` (`nickname`, `friendship`, `heldItem`, `moves[4]`, `variantFlags`, `specialFlags`) instead of species/level only.
+	- On success, patch the selected `.sav` locally by writing the sent source PK4 into the active HGSS walker-pair area and clearing the source slot.
+
+- **Stroll -> HGSS Return**
+	- Configure backend host/port.
+	- Select HGSS `.sav`, source box/slot, optional target slot (`0 = auto-empty`).
+	- Configure walked steps / bonus watts / auto captures.
+	- Trigger `/api/v1/stroll/return`, fetch `/api/v1/sync/package`, then patch `.sav` locally:
+		- if source slot is empty, restore source PK4 from the HGSS walker-pair area first,
+		- source slot EXP/friendship update,
+		- optional captured Pokemon insertion into target/auto slot,
+		- Pokewalker steps/watts/course flags sync,
+		- optional trip counter increment,
+		- General + Storage checksum refresh.
+
+### HGSS -> EEPROM data fidelity and legality notes
+
+This project now supports a deterministic HGSS-to-EEPROM send workflow that explicitly documents where each field comes from and why it is considered legal.
+
+#### Validated model (against reverse-engineering notes)
+
+- Full boxed Pokemon data (`PK4`, 136 bytes) remains in HGSS save storage.
+- During send, HGSS keeps the full Pokemon in save state (walker-pair/quarantine semantics) while EEPROM receives a compact stroll payload.
+- During return, EEPROM trip/capture data is merged back into HGSS source/capture slots.
+- This matches the high-level model in `pokemon_storage.md`: EEPROM is a lightweight stroll/session representation, not the authoritative full Pokemon store.
+
+#### Legal data sources used by the implementation
+
+- Pokewalker encounter legality table: `pkhex/PKHeX.Core/Resources/legality/wild/Gen4/encounter_walker4.pkl`
+	- Used to configure route slots (species/level/moves/gender) for each course.
+- HGSS personal table: `pkhex/PKHeX.Core/Resources/byte/personal/personal_hgss`
+	- Used for species-level legality metadata (growth/friendship/ability constraints in related builders).
+- HGSS `.sav` source slot PK4
+	- Used for walking Pokemon species/level/held item/moves/friendship/nickname and save trainer identity context.
+
+#### What is written to EEPROM in HGSS->send flow
+
+- Identity domain
+	- Trainer name from HGSS save trainer block.
+	- Trainer TID/SID from HGSS save trainer block.
+- Stats domain
+	- Steps and watts seeded from HGSS Pokewalker fields.
+- Stroll domain
+	- Walking companion summary (species/level/held item/moves/friendship/flags/nickname).
+	- Selected route/course id and route name.
+- Route encounter slots
+	- Three configured capture slots (one per route group) with min-steps and chance.
+
+Sprites are currently not regenerated in this flow yet; only semantic EEPROM fields are updated.
+
+#### Generate an EEPROM from HGSS save (local, reproducible)
+
+Use the new command:
+
+```sh
+python3 scripts/eeprom_client.py hgss-stroll-box-send \
+	--save scripts/test_HGSS_saves/input_hgss.sav \
+	--eeprom scripts/test_roms/eeprom.bin \
+	--box 17 --source-slot 1 --course-id 0 --clear-buffers \
+	--output-eeprom outputs/eeprom_from_hgss_send.bin
+```
+
+Verify the resulting EEPROM domains:
+
+```sh
+python3 scripts/eeprom_client.py identity --eeprom outputs/eeprom_from_hgss_send.bin
+python3 scripts/eeprom_client.py stats --eeprom outputs/eeprom_from_hgss_send.bin
+python3 scripts/eeprom_client.py stroll --eeprom outputs/eeprom_from_hgss_send.bin
+python3 scripts/eeprom_client.py routes --eeprom outputs/eeprom_from_hgss_send.bin
+```
+
+The command output also includes `routeSlotsPreview` (3 entries) and `strollSend.configuredRouteSlots` for quick auditing.
 
 ## Credits
 
