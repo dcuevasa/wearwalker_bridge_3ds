@@ -1,5 +1,5 @@
 #include "pokewalker.h"
-#include "ir.h"
+#include "transport.h"
 #include "utils.h"
 #include <string.h>
 #include <stdbool.h>
@@ -8,6 +8,8 @@
 #include <3ds.h>
 
 #define clamp(x, min, max) x < min ? min : (x > max ? max : x)
+#define TRANSPORT_ADV_TIMEOUT_MS 4000
+#define TRANSPORT_PACKET_TIMEOUT_MS 4000
 
 static u32 inited_session_id; // Big endian
 
@@ -60,7 +62,7 @@ void send_pokepacket(poke_packet *pkt)
 {
 	pkt->header.checksum = swap16(pkt->header.checksum);
 	xor_data(pkt, sizeof(packet_header) + pkt->payload_size);
-	ir_send_data(pkt, sizeof(packet_header) + pkt->payload_size);
+	transport_send_data(pkt, sizeof(packet_header) + pkt->payload_size);
 }
 
 bool recv_pokepacket(poke_packet *pkt)
@@ -68,7 +70,7 @@ bool recv_pokepacket(poke_packet *pkt)
 	u16 checksum;
 	u32 tc;
 
-	tc = ir_recv_data(pkt, MAX_PACKET_SIZE);
+	tc = transport_recv_data(pkt, MAX_PACKET_SIZE, TRANSPORT_PACKET_TIMEOUT_MS);
 	if (tc < sizeof(packet_header))
 		return false;
 	pkt->payload_size = tc - sizeof(packet_header);
@@ -90,7 +92,7 @@ bool wait_adv()
 {
 	u8 adv = 0;
 
-	ir_recv_data(&adv, 1);
+	transport_recv_data(&adv, 1, TRANSPORT_ADV_TIMEOUT_MS);
 
 	return adv == 0x56;
 }
@@ -212,7 +214,7 @@ void poke_get_data(void)
 {
 	poke_packet pkt_req, pkt_idata;
 
-	ir_enable();
+	transport_enable();
 
 	if (!poke_init_session()) {
 		printf("Error while establishing session\n");
@@ -233,14 +235,14 @@ void poke_get_data(void)
 	print_identity_data((identity_data *) pkt_idata.payload);
 
 finish:
-	ir_disable();
+	transport_disable();
 }
 
 void poke_add_watts(u16 watts, u32 steps, bool max_steps)
 {
 	poke_packet pkt_req, pkt_ack;
 
-	ir_enable();
+	transport_enable();
 
 	if (!poke_init_session()) {
 		printf("Error while establishing session\n");
@@ -308,7 +310,7 @@ set_todaysteps: ;
 	printf("SUCCESS!\n");
 
 finish:
-	ir_disable();
+	transport_disable();
 }
 
 void poke_gift_item(u16 item)
@@ -324,7 +326,7 @@ void poke_gift_item(u16 item)
 	item_data[6] = item;
 	item_data[7] = item >> 8;
 
-	ir_enable();
+	transport_enable();
 
 	if (!poke_init_session()) {
 		printf("Error while establishing session\n");
@@ -352,7 +354,7 @@ void poke_gift_item(u16 item)
 	printf("SUCCESS!\n");
 
 finish:
-	ir_disable();
+	transport_disable();
 }
 
 void poke_gift_pokemon(pokemon_data poke_data, pokemon_extradata poke_extra)
@@ -369,7 +371,7 @@ void poke_gift_pokemon(pokemon_data poke_data, pokemon_extradata poke_extra)
 	string_to_img(poke_name, 80, poke_str, false);
 
 
-	ir_enable();
+	transport_enable();
 
 	if (!poke_init_session()) {
 		printf("Error while establishing session\n");
@@ -425,22 +427,21 @@ void poke_gift_pokemon(pokemon_data poke_data, pokemon_extradata poke_extra)
 	printf("SUCCESS!\n");
 
 finish:
-	ir_disable();
+	transport_disable();
 }
 
 void poke_dump_rom()
 {
 	poke_packet pkt_ack;
-	u8 *rom_dump;
 	u16 i = 0;
+	FILE *f = fopen("PWROM.bin", "wb");
 
-	rom_dump = (u8 *) malloc(ROM_SIZE);
-	if (!rom_dump) {
-		printf("Error while allocating memory\n");
-		goto finish;
+	if (!f) {
+		printf("Error while opening PWROM.bin\n");
+		return;
 	}
 	
-	ir_enable();
+	transport_enable();
 
 	if (!poke_init_session()) {
 		printf("Error while establishing session\n");
@@ -458,30 +459,23 @@ void poke_dump_rom()
 			printf("\nError while receiving data at 0x%04X\n", i);
 			goto finish;
 		}
-		memcpy(rom_dump + i, pkt_ack.payload, pkt_ack.payload_size);
+
+		if (fwrite(pkt_ack.payload, 1, pkt_ack.payload_size, f) != pkt_ack.payload_size) {
+			printf("\nError while writing ROM chunk at 0x%04X\n", i);
+			goto finish;
+		}
 		i += pkt_ack.payload_size;
 
 		progress_bar(i, ROM_SIZE, 25);
 	}
 	printf("Dump finished!\n");
 
-	if (i == ROM_SIZE) {
-		FILE *f = fopen("PWROM.bin", "wb");
-		if (f) {
-			int written = fwrite(rom_dump, 1, ROM_SIZE, f);
-			fclose(f);
-			if (written != ROM_SIZE)
-				printf("Error while writing to file\n");
-			else
-				printf("ROM dumped to PWROM.bin\n");
-		} else {
-			printf("Error while opening file\n");
-		}
-	}
+	if (i == ROM_SIZE)
+		printf("ROM dumped to PWROM.bin\n");
 
 finish:
-	ir_disable();
-	free(rom_dump);
+	transport_disable();
+	fclose(f);
 }
 
 void poke_dump_eeprom()
@@ -490,7 +484,12 @@ void poke_dump_eeprom()
 	u8 buf[0x80];
 
 	FILE *f = fopen("PWEEPROM.bin", "wb");
-	ir_enable();
+	if (!f) {
+		printf("Error while opening PWEEPROM.bin\n");
+		return;
+	}
+
+	transport_enable();
 
 	if (!poke_init_session()) {
 		printf("Error while establishing session\n");
@@ -513,6 +512,6 @@ void poke_dump_eeprom()
 	printf("EEPROM dumped to PWEEPROM.bin\n");
 
 finish:
-	ir_disable();
+	transport_disable();
 	fclose(f);
 }

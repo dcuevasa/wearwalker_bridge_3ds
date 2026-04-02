@@ -1,6 +1,6 @@
 #pragma once
 
-#include "pokewalker.h"
+#include <3ds/types.h>
 #include <citro2d.h>
 
 #define COLOR_BG	C2D_Color32(0xEE, 0x83, 0x29, 0xFF)

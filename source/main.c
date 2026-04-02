@@ -1,4 +1,6 @@
-#include "ir.h"
+#include "transport.h"
+#include "transport_ir.h"
+#include "transport_wifi.h"
 #include "ui.h"
 #include "updates.h"
 #include <stdio.h>
@@ -15,7 +17,21 @@ int main(int argc, char* argv[])
 	gfxInitDefault();
 
 	ui_init();
-	ir_init();
+
+#ifdef USE_WIFI_BACKEND
+	transport_set_backend(transport_wifi_backend_get());
+#else
+	transport_set_backend(transport_ir_backend_get());
+#endif
+
+	if (!transport_init()) {
+		printf("Error while initializing transport backend\n");
+		ui_exit();
+		gfxExit();
+		return 1;
+	}
+
+	printf("Using %s backend\n", transport_get_backend()->name);
 
 	ui_draw();
 	// Disable updates checking and downloading for now, as it seems that httpc
@@ -29,6 +45,7 @@ int main(int argc, char* argv[])
 			ui_draw();
 	}
 
+	transport_cleanup();
 	ui_exit();
 	gfxExit();
 	return 0;

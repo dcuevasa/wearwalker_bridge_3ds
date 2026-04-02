@@ -1,0 +1,20 @@
+*.bin
+*.3dsx
+*.elf
+*.3ds
+*.smdh
+*.cia
+*.log
+*.db
+*.sqlite
+
+# Ignore pycache and virtual environment directories
+__pycache__/
+venv/
+
+build/
+dist/
+*.egg-info/
+
+*.sav
+*.nds

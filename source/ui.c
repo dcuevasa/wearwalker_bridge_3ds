@@ -1,66 +1,327 @@
 #include "ui.h"
-#include "updates.h"
+#include "wearwalker_api.h"
+
+#include <3ds.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-void call_poke_add_watts();
-void call_poke_gift_pokemon();
-void call_poke_gift_item();
+void call_set_wearwalker_host();
+void call_apply_wearwalker_endpoint();
+void call_wearwalker_status();
+void call_wearwalker_snapshot();
+void call_wearwalker_export_eeprom();
+void call_wearwalker_import_eeprom();
+void call_set_wearwalker_trainer();
+void call_wearwalker_command_set_steps();
+void call_wearwalker_command_set_watts();
+void call_wearwalker_command_set_sync();
+void call_wearwalker_command_set_trainer();
 
-// Add watts menu
-menu_entry add_watts_menu_entries[] = {
-	{"Enter watts to add", ENTRY_NUMATTR, .num_attr = {.value = 100, .min = 1, .max = 65535}},
-	{"Set today steps (optional)", ENTRY_NUMATTR, .num_attr = {.value = 0, .min = 0, .max = 99999}},
-	{"Set total steps to max", ENTRY_SELATTR, .sel_menu = {.options = yn_list, .props = {.len = 2, .selected = 0}}},
-	{"Add watts and set steps", ENTRY_ACTION, .callback = call_poke_add_watts},
+static char g_wearwalker_host[64] = WW_API_DEFAULT_HOST;
+static char g_wearwalker_trainer[32] = "WWBRIDGE";
+static u32 g_pending_steps = 1000;
+static u32 g_pending_watts = 100;
+static u32 g_pending_sync = 0;
+static char g_pending_trainer[32] = "WWBRIDGE";
+
+typedef enum {
+	WW_TASK_NONE = 0,
+	WW_TASK_STATUS,
+	WW_TASK_SNAPSHOT,
+	WW_TASK_EXPORT_EEPROM,
+	WW_TASK_IMPORT_EEPROM,
+	WW_TASK_COMMAND_SET_STEPS,
+	WW_TASK_COMMAND_SET_WATTS,
+	WW_TASK_COMMAND_SET_SYNC,
+	WW_TASK_COMMAND_SET_TRAINER,
+} ww_async_task;
+
+typedef struct {
+	Thread thread;
+	LightLock lock;
+	bool running;
+	bool finished;
+	ww_async_task task;
+	bool success;
+	char json[WW_API_RESPONSE_MAX];
+	wearwalker_snapshot snapshot;
+} ww_async_context;
+
+static ww_async_context g_ww_async;
+static s32 g_ui_thread_prio = 0x30;
+
+#define WW_ASYNC_STACK_SIZE (24 * 1024)
+
+static const char *ww_async_task_name(ww_async_task task)
+{
+	switch (task) {
+		case WW_TASK_STATUS:
+			return "bridge status";
+		case WW_TASK_SNAPSHOT:
+			return "snapshot";
+		case WW_TASK_EXPORT_EEPROM:
+			return "EEPROM export";
+		case WW_TASK_IMPORT_EEPROM:
+			return "EEPROM import";
+		case WW_TASK_COMMAND_SET_STEPS:
+			return "command set-steps";
+		case WW_TASK_COMMAND_SET_WATTS:
+			return "command set-watts";
+		case WW_TASK_COMMAND_SET_SYNC:
+			return "command set-sync";
+		case WW_TASK_COMMAND_SET_TRAINER:
+			return "command set-trainer";
+		default:
+			return "request";
+	}
+}
+
+static void ww_async_worker(void *arg)
+{
+	ww_async_task task = (ww_async_task)(uintptr_t)arg;
+	bool success = false;
+	char *json = (char *)malloc(WW_API_RESPONSE_MAX);
+	wearwalker_snapshot snapshot = {0};
+	u32 pending_steps = g_pending_steps;
+	u32 pending_watts = g_pending_watts;
+	u32 pending_sync = g_pending_sync;
+	char pending_trainer[sizeof(g_pending_trainer)];
+
+	snprintf(pending_trainer, sizeof(pending_trainer), "%s", g_pending_trainer);
+
+	if (!json) {
+		LightLock_Lock(&g_ww_async.lock);
+		g_ww_async.success = false;
+		g_ww_async.finished = true;
+		g_ww_async.running = false;
+		g_ww_async.task = task;
+		memset(&g_ww_async.snapshot, 0, sizeof(g_ww_async.snapshot));
+		snprintf(g_ww_async.json, sizeof(g_ww_async.json), "out of memory");
+		LightLock_Unlock(&g_ww_async.lock);
+		return;
+	}
+
+	json[0] = '\0';
+
+	switch (task) {
+		case WW_TASK_STATUS:
+			success = ww_api_get_status(json, WW_API_RESPONSE_MAX);
+			if (!success)
+				snprintf(json, WW_API_RESPONSE_MAX, "status request failed");
+			break;
+		case WW_TASK_SNAPSHOT:
+			success = ww_api_get_snapshot(&snapshot, json, WW_API_RESPONSE_MAX);
+			if (!success)
+				snprintf(json, WW_API_RESPONSE_MAX, "snapshot request failed");
+			break;
+		case WW_TASK_EXPORT_EEPROM:
+			success = ww_api_export_eeprom("WWEEPROM.bin");
+			if (!success)
+				snprintf(json, WW_API_RESPONSE_MAX, "export failed");
+			break;
+		case WW_TASK_IMPORT_EEPROM:
+			success = ww_api_import_eeprom("PWEEPROM_IMPORT.bin");
+			if (!success)
+				snprintf(json, WW_API_RESPONSE_MAX, "import failed");
+			break;
+		case WW_TASK_COMMAND_SET_STEPS:
+			success = ww_api_command_set_steps(pending_steps, &snapshot, json, WW_API_RESPONSE_MAX);
+			if (!success)
+				snprintf(json, WW_API_RESPONSE_MAX, "set-steps command failed");
+			break;
+		case WW_TASK_COMMAND_SET_WATTS:
+			success = ww_api_command_set_watts(pending_watts, &snapshot, json, WW_API_RESPONSE_MAX);
+			if (!success)
+				snprintf(json, WW_API_RESPONSE_MAX, "set-watts command failed");
+			break;
+		case WW_TASK_COMMAND_SET_SYNC:
+			success = ww_api_command_set_sync(pending_sync, &snapshot, json, WW_API_RESPONSE_MAX);
+			if (!success)
+				snprintf(json, WW_API_RESPONSE_MAX, "set-sync command failed");
+			break;
+		case WW_TASK_COMMAND_SET_TRAINER:
+			success = ww_api_command_set_trainer(pending_trainer, &snapshot, json, WW_API_RESPONSE_MAX);
+			if (!success)
+				snprintf(json, WW_API_RESPONSE_MAX, "set-trainer command failed");
+			break;
+		default:
+			snprintf(json, WW_API_RESPONSE_MAX, "unknown task");
+			break;
+	}
+
+	LightLock_Lock(&g_ww_async.lock);
+	g_ww_async.success = success;
+	g_ww_async.finished = true;
+	g_ww_async.running = false;
+	g_ww_async.task = task;
+	g_ww_async.snapshot = snapshot;
+	snprintf(g_ww_async.json, sizeof(g_ww_async.json), "%s", json);
+	LightLock_Unlock(&g_ww_async.lock);
+
+	free(json);
+}
+
+static bool ww_async_start(ww_async_task task)
+{
+	Thread thread;
+	s32 worker_prio;
+
+	LightLock_Lock(&g_ww_async.lock);
+	if (g_ww_async.running) {
+		LightLock_Unlock(&g_ww_async.lock);
+		return false;
+	}
+
+	g_ww_async.running = true;
+	g_ww_async.finished = false;
+	g_ww_async.success = false;
+	g_ww_async.task = task;
+	g_ww_async.json[0] = '\0';
+	memset(&g_ww_async.snapshot, 0, sizeof(g_ww_async.snapshot));
+	LightLock_Unlock(&g_ww_async.lock);
+
+	worker_prio = g_ui_thread_prio > 0 ? g_ui_thread_prio - 1 : g_ui_thread_prio;
+	thread = threadCreate(ww_async_worker, (void *)(uintptr_t)task, WW_ASYNC_STACK_SIZE, worker_prio, -2, false);
+	if (!thread) {
+		LightLock_Lock(&g_ww_async.lock);
+		g_ww_async.running = false;
+		LightLock_Unlock(&g_ww_async.lock);
+		return false;
+	}
+
+	LightLock_Lock(&g_ww_async.lock);
+	g_ww_async.thread = thread;
+	LightLock_Unlock(&g_ww_async.lock);
+
+	return true;
+}
+
+static bool ww_async_poll_completion(void)
+{
+	Thread thread;
+	ww_async_task task;
+	bool success;
+	char json[WW_API_RESPONSE_MAX];
+	wearwalker_snapshot snapshot;
+
+	LightLock_Lock(&g_ww_async.lock);
+	if (!g_ww_async.finished) {
+		LightLock_Unlock(&g_ww_async.lock);
+		return false;
+	}
+
+	thread = g_ww_async.thread;
+	task = g_ww_async.task;
+	success = g_ww_async.success;
+	snapshot = g_ww_async.snapshot;
+	snprintf(json, sizeof(json), "%s", g_ww_async.json);
+
+	g_ww_async.thread = NULL;
+	g_ww_async.finished = false;
+	LightLock_Unlock(&g_ww_async.lock);
+
+	if (thread) {
+		threadJoin(thread, U64_MAX);
+		threadFree(thread);
+	}
+
+	if (!success) {
+		printf("WearWalker %s failed (%s)\n", ww_async_task_name(task), json[0] ? json : "unknown error");
+		return true;
+	}
+
+	switch (task) {
+		case WW_TASK_STATUS:
+			printf("Bridge status: %.220s\n", json);
+			break;
+		case WW_TASK_SNAPSHOT:
+		case WW_TASK_COMMAND_SET_STEPS:
+		case WW_TASK_COMMAND_SET_WATTS:
+		case WW_TASK_COMMAND_SET_SYNC:
+		case WW_TASK_COMMAND_SET_TRAINER:
+			printf("Trainer: %s\n", snapshot.trainer);
+			printf("Steps: %lu\n", (unsigned long)snapshot.steps);
+			printf("Watts: %lu\n", (unsigned long)snapshot.watts);
+			break;
+		case WW_TASK_EXPORT_EEPROM:
+			printf("EEPROM exported to WWEEPROM.bin\n");
+			break;
+		case WW_TASK_IMPORT_EEPROM:
+			printf("EEPROM imported successfully\n");
+			break;
+		default:
+			printf("WearWalker request completed\n");
+			break;
+	}
+
+	return true;
+}
+
+static void ww_async_shutdown(void)
+{
+	Thread thread;
+
+	LightLock_Lock(&g_ww_async.lock);
+	thread = g_ww_async.thread;
+	g_ww_async.thread = NULL;
+	g_ww_async.running = false;
+	g_ww_async.finished = false;
+	LightLock_Unlock(&g_ww_async.lock);
+
+	if (thread) {
+		threadJoin(thread, U64_MAX);
+		threadFree(thread);
+	}
+}
+
+enum {
+	WW_MENU_SET_HOST = 0,
+	WW_MENU_PORT,
+	WW_MENU_APPLY_ENDPOINT,
+	WW_MENU_GET_STATUS,
+	WW_MENU_GET_SNAPSHOT,
+	WW_MENU_EXPORT_EEPROM,
+	WW_MENU_IMPORT_EEPROM,
+	WW_MENU_SET_TRAINER_TEXT,
+	WW_MENU_CMD_STEPS_VALUE,
+	WW_MENU_CMD_STEPS_SEND,
+	WW_MENU_CMD_WATTS_VALUE,
+	WW_MENU_CMD_WATTS_SEND,
+	WW_MENU_CMD_SYNC_VALUE,
+	WW_MENU_CMD_SYNC_SEND,
+	WW_MENU_CMD_TRAINER_SEND,
 };
 
-menu add_watts_menu = {
-	.title = "Add watts and steps",
-	.entries = add_watts_menu_entries,
-	.props = {.len = sizeof(add_watts_menu_entries) / sizeof(add_watts_menu_entries[0]), .selected = 0},
+// WearWalker WiFi menu
+menu_entry wearwalker_wifi_menu_entries[] = {
+	{"Set backend host", ENTRY_ACTION, .callback = call_set_wearwalker_host},
+	{"Backend port", ENTRY_NUMATTR, .num_attr = {.value = WW_API_DEFAULT_PORT, .min = 1, .max = 65535}},
+	{"Apply endpoint", ENTRY_ACTION, .callback = call_apply_wearwalker_endpoint},
+	{"Get bridge status", ENTRY_ACTION, .callback = call_wearwalker_status},
+	{"Get snapshot", ENTRY_ACTION, .callback = call_wearwalker_snapshot},
+	{"Export EEPROM -> WWEEPROM.bin", ENTRY_ACTION, .callback = call_wearwalker_export_eeprom},
+	{"Import EEPROM <- PWEEPROM_IMPORT.bin", ENTRY_ACTION, .callback = call_wearwalker_import_eeprom},
+	{"Trainer command text", ENTRY_ACTION, .callback = call_set_wearwalker_trainer},
+	{"Set-steps value", ENTRY_NUMATTR, .num_attr = {.value = 1000, .min = 0, .max = 9999999}},
+	{"Send command: set-steps", ENTRY_ACTION, .callback = call_wearwalker_command_set_steps},
+	{"Set-watts value", ENTRY_NUMATTR, .num_attr = {.value = 100, .min = 0, .max = 65535}},
+	{"Send command: set-watts", ENTRY_ACTION, .callback = call_wearwalker_command_set_watts},
+	{"Set-sync epoch", ENTRY_NUMATTR, .num_attr = {.value = 0, .min = 0, .max = 4294967295U}},
+	{"Send command: set-sync", ENTRY_ACTION, .callback = call_wearwalker_command_set_sync},
+	{"Send command: set-trainer", ENTRY_ACTION, .callback = call_wearwalker_command_set_trainer},
 };
 
-// Gift item menu
-menu_entry gift_item_menu_entries[] = {
-	{"Select item", ENTRY_SELATTR, .sel_menu = {.options = item_list, .props = {.len = sizeof(item_list) / sizeof(item_list[0]), .selected = 0}}},
-	{"Send item", ENTRY_ACTION, .callback = call_poke_gift_item},
+menu wearwalker_wifi_menu = {
+	.title = "WearWalker API Test",
+	.entries = wearwalker_wifi_menu_entries,
+	.props = {.len = sizeof(wearwalker_wifi_menu_entries) / sizeof(wearwalker_wifi_menu_entries[0]), .selected = 0},
 };
 
-menu gift_item_menu = {
-	.title = "Gift item",
-	.entries = gift_item_menu_entries,
-	.props = {.len = sizeof(gift_item_menu_entries) / sizeof(gift_item_menu_entries[0]), .selected = 0},
-};
-
-// Gift Pokemon menu
-menu_entry gift_pokemon_menu_entries[] = {
-	{"Select Pokemon", ENTRY_SELATTR, .sel_menu = {.options = poke_list, .props = {.len = sizeof(poke_list) / sizeof(poke_list[0]), .selected = 0}}},
-	{"Select held item", ENTRY_SELATTR, .sel_menu = {.options = item_list, .props = {.len = sizeof(item_list) / sizeof(item_list[0]), .selected = 0}}},
-	{"Select move 1", ENTRY_SELATTR, .sel_menu = {.options = move_list, .props = {.len = sizeof(move_list) / sizeof(move_list[0]), .selected = 0}}},
-	{"Select move 2", ENTRY_SELATTR, .sel_menu = {.options = move_list, .props = {.len = sizeof(move_list) / sizeof(move_list[0]), .selected = 0}}},
-	{"Select move 3", ENTRY_SELATTR, .sel_menu = {.options = move_list, .props = {.len = sizeof(move_list) / sizeof(move_list[0]), .selected = 0}}},
-	{"Select move 4", ENTRY_SELATTR, .sel_menu = {.options = move_list, .props = {.len = sizeof(move_list) / sizeof(move_list[0]), .selected = 0}}},
-	{"Select level", ENTRY_NUMATTR, .num_attr = {.value = 50, .min = 1, .max = 100}},
-	{"Gender", ENTRY_SELATTR, .sel_menu = {.options = gender_list, .props = {.len = 2, .selected = 0}}},
-	{"Shiny", ENTRY_SELATTR, .sel_menu = {.options = yn_list, .props = {.len = 2, .selected = 0}}},
-	{"Select ability", ENTRY_SELATTR, .sel_menu = {.options = ability_list, .props = {.len = sizeof(ability_list) / sizeof(ability_list[0]), .selected = 0}}},
-	{"Send Pokemon", ENTRY_ACTION, .callback = call_poke_gift_pokemon},
-};
-
-menu gift_pokemon_menu = {
-	.title = "Gift Pokemon",
-	.entries = gift_pokemon_menu_entries,
-	.props = {.len = sizeof(gift_pokemon_menu_entries) / sizeof(gift_pokemon_menu_entries[0]), .selected = 0},
-};
-//
 // Main menu
 menu_entry main_menu_entries[] = {
-	{"Get Pokewalker info", ENTRY_ACTION, .callback = poke_get_data},
-	{"Add watts and steps", ENTRY_CHANGEMENU, .new_menu = &add_watts_menu},
-	{"Gift Pokemon", ENTRY_CHANGEMENU, .new_menu = &gift_pokemon_menu},
-	{"Gift item", ENTRY_CHANGEMENU, .new_menu = &gift_item_menu},
-	{"Dump ROM", ENTRY_ACTION, .callback = poke_dump_rom},
-	{"Dump EEPROM (user data)", ENTRY_ACTION, .callback = poke_dump_eeprom}
+	{"WearWalker API test menu", ENTRY_CHANGEMENU, .new_menu = &wearwalker_wifi_menu},
 };
 
 menu main_menu = {
@@ -81,6 +342,16 @@ void ui_init()
 {
 	PrintConsole header;
 
+	svcGetThreadPriority(&g_ui_thread_prio, CUR_THREAD_HANDLE);
+	LightLock_Init(&g_ww_async.lock);
+	g_ww_async.thread = NULL;
+	g_ww_async.running = false;
+	g_ww_async.finished = false;
+	g_ww_async.task = WW_TASK_NONE;
+	g_ww_async.success = false;
+	g_ww_async.json[0] = '\0';
+	memset(&g_ww_async.snapshot, 0, sizeof(g_ww_async.snapshot));
+
 	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
 	C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
 	C2D_Prepare();
@@ -92,8 +363,16 @@ void ui_init()
 	consoleSetWindow(&logs, 0, 3, logs.consoleWidth, logs.consoleHeight - 3);
 
 	consoleSelect(&header);
-	printf("pwalkerHax v%s\n---", VER);
+	printf("WearWalker Bridge Test v%s\n---", VER);
 	consoleSelect(&logs);
+
+	strncpy(g_wearwalker_host, ww_api_get_host(), sizeof(g_wearwalker_host) - 1);
+	g_wearwalker_host[sizeof(g_wearwalker_host) - 1] = '\0';
+	wearwalker_wifi_menu_entries[WW_MENU_PORT].num_attr.value = ww_api_get_port();
+	g_pending_steps = wearwalker_wifi_menu_entries[WW_MENU_CMD_STEPS_VALUE].num_attr.value;
+	g_pending_watts = wearwalker_wifi_menu_entries[WW_MENU_CMD_WATTS_VALUE].num_attr.value;
+	g_pending_sync = wearwalker_wifi_menu_entries[WW_MENU_CMD_SYNC_VALUE].num_attr.value;
+	snprintf(g_pending_trainer, sizeof(g_pending_trainer), "%s", g_wearwalker_trainer);
 
 	target = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 	textbuf = C2D_TextBufNew(256);
@@ -101,6 +380,8 @@ void ui_init()
 
 void ui_exit()
 {
+	ww_async_shutdown();
+
 	C2D_TextBufDelete(textbuf);
 	C2D_Fini();
 	C3D_Fini();
@@ -178,11 +459,14 @@ void draw_menu(u16 font_size, u16 padding, menu_properties props)
 			draw_string(15, draw_start + padding, font_size, g_active_menu->entries[cur].text, false, 0);
 
 			switch (g_active_menu->entries[cur].type) {
+					case ENTRY_ACTION:
+					case ENTRY_CHANGEMENU:
+						break;
 				case ENTRY_SELATTR:
 					draw_string(-21, draw_start + padding, font_size, g_active_menu->entries[cur].sel_menu.options[g_active_menu->entries[cur].sel_menu.props.selected], false, 0);
 					break;
 				case ENTRY_NUMATTR:
-					sprintf(strbuf, "%d", g_active_menu->entries[cur].num_attr.value);
+						sprintf(strbuf, "%lu", (unsigned long)g_active_menu->entries[cur].num_attr.value);
 					draw_string(-21, draw_start + padding, font_size, strbuf, false, 0);
 					break;
 			}
@@ -212,6 +496,30 @@ s32 numpad_input(const char *hint_text, u8 digits)
 	return button == SWKBD_BUTTON_RIGHT ? atoi(buf) : -1;
 }
 
+bool text_input(const char *hint_text, char *out, u32 max_len)
+{
+	char buf[64];
+	SwkbdState swkbd;
+	SwkbdButton button = SWKBD_BUTTON_NONE;
+
+	if (!out || max_len < 2 || max_len > sizeof(buf))
+		return false;
+
+	snprintf(buf, sizeof(buf), "%s", out);
+
+	swkbdInit(&swkbd, SWKBD_TYPE_QWERTY, 1, max_len - 1);
+	swkbdSetHintText(&swkbd, hint_text);
+	swkbdSetValidation(&swkbd, SWKBD_NOTBLANK_NOTEMPTY, 0, 0);
+	swkbdSetFeatures(&swkbd, SWKBD_FIXED_WIDTH);
+	button = swkbdInputText(&swkbd, buf, sizeof(buf));
+
+	if (button != SWKBD_BUTTON_RIGHT)
+		return false;
+
+	snprintf(out, max_len, "%s", buf);
+	return true;
+}
+
 // menu_entry must be of type ENTRY_SELATTR
 void goto_item(menu_entry *entry)
 {
@@ -223,13 +531,29 @@ void goto_item(menu_entry *entry)
 }
 
 // menu_entry must be of type ENTRY_NUMATTR
+static u8 ww_num_digits(u32 value)
+{
+	u8 digits = 1;
+
+	while (value >= 10 && digits < 10) {
+		value /= 10;
+		digits++;
+	}
+
+	return digits;
+}
+
 void set_numattr(menu_entry *entry)
 {
 	char strbuf[64];
 	s32 value;
+	u8 digits;
 
-	sprintf(strbuf, "%s (min %d, max %d)", entry->text, entry->num_attr.min, entry->num_attr.max);
-	value = numpad_input(strbuf, 5);
+	sprintf(strbuf, "%s (min %lu, max %lu)", entry->text,
+			(unsigned long)entry->num_attr.min,
+			(unsigned long)entry->num_attr.max);
+	digits = ww_num_digits(entry->num_attr.max);
+	value = numpad_input(strbuf, digits);
 
 	if (value != -1) {
 		value = value > entry->num_attr.max ? entry->num_attr.max : value;
@@ -238,47 +562,114 @@ void set_numattr(menu_entry *entry)
 	}
 }
 
-void call_poke_add_watts()
+void call_set_wearwalker_host()
 {
-	u16 watts = g_active_menu->entries[0].num_attr.value;
-	u32 today_steps = g_active_menu->entries[1].num_attr.value;
-	bool max_steps = g_active_menu->entries[2].sel_menu.props.selected == 1;
-	printf("Adding %d watts\n", watts);
-	poke_add_watts(watts, today_steps, max_steps);
+	if (text_input("WearWalker IP/host", g_wearwalker_host, sizeof(g_wearwalker_host)))
+		printf("WearWalker host set to %s\n", g_wearwalker_host);
 }
 
-void call_poke_gift_pokemon()
+void call_apply_wearwalker_endpoint()
 {
-	pokemon_data poke_data = { 0 };
-	pokemon_extradata poke_extra = { 0 };
+	u16 port = wearwalker_wifi_menu_entries[WW_MENU_PORT].num_attr.value;
 
-	poke_data.poke = g_active_menu->entries[0].sel_menu.props.selected;
-	poke_data.held_item = g_active_menu->entries[1].sel_menu.props.selected;
-	for (u8 i = 0; i < 4; i++)
-		poke_data.moves[i] = g_active_menu->entries[i + 2].sel_menu.props.selected;
-	poke_data.level = g_active_menu->entries[6].num_attr.value;
-	poke_data.variants = g_active_menu->entries[7].sel_menu.props.selected == 1 ? 0x20 : 0;
-	poke_data.flags = g_active_menu->entries[8].sel_menu.props.selected == 1 ? 0x02 : 0;
-
-	poke_extra.location_met = 2008; // Distant land
-	poke_extra.pokeball_type = 4;	// Pokeball
-	poke_extra.ability = g_active_menu->entries[9].sel_menu.props.selected;
-
-	if (!poke_data.poke || !poke_data.moves[0]) {
-		printf("Please select a Pokemon and at least one move\n");
-		return;
-	}
-	poke_gift_pokemon(poke_data, poke_extra);
+	if (ww_api_set_endpoint(g_wearwalker_host, port))
+		printf("Using WearWalker endpoint %s:%lu\n", g_wearwalker_host, (unsigned long)port);
+	else
+		printf("Invalid WearWalker endpoint\n");
 }
 
-void call_poke_gift_item() {
-	u16 item = g_active_menu->entries[0].sel_menu.props.selected;
+void call_set_wearwalker_trainer()
+{
+	if (text_input("Trainer for set-trainer", g_wearwalker_trainer, sizeof(g_wearwalker_trainer)))
+		printf("Trainer command set to %s\n", g_wearwalker_trainer);
+}
 
-	if (!item) {
-		printf("Please select an item\n");
+void call_wearwalker_status()
+{
+	if (!ww_async_start(WW_TASK_STATUS)) {
+		printf("WearWalker request already running\n");
 		return;
 	}
-	poke_gift_item(item);
+
+	printf("Requesting bridge status in background...\n");
+}
+
+void call_wearwalker_snapshot()
+{
+	if (!ww_async_start(WW_TASK_SNAPSHOT)) {
+		printf("WearWalker request already running\n");
+		return;
+	}
+
+	printf("Requesting snapshot in background...\n");
+}
+
+void call_wearwalker_export_eeprom()
+{
+	if (!ww_async_start(WW_TASK_EXPORT_EEPROM)) {
+		printf("WearWalker request already running\n");
+		return;
+	}
+
+	printf("Exporting WearWalker EEPROM in background...\n");
+}
+
+void call_wearwalker_import_eeprom()
+{
+	if (!ww_async_start(WW_TASK_IMPORT_EEPROM)) {
+		printf("WearWalker request already running\n");
+		return;
+	}
+
+	printf("Importing EEPROM from PWEEPROM_IMPORT.bin in background...\n");
+}
+
+void call_wearwalker_command_set_steps()
+{
+	g_pending_steps = wearwalker_wifi_menu_entries[WW_MENU_CMD_STEPS_VALUE].num_attr.value;
+
+	if (!ww_async_start(WW_TASK_COMMAND_SET_STEPS)) {
+		printf("WearWalker request already running\n");
+		return;
+	}
+
+	printf("Sending set-steps command...\n");
+}
+
+void call_wearwalker_command_set_watts()
+{
+	g_pending_watts = wearwalker_wifi_menu_entries[WW_MENU_CMD_WATTS_VALUE].num_attr.value;
+
+	if (!ww_async_start(WW_TASK_COMMAND_SET_WATTS)) {
+		printf("WearWalker request already running\n");
+		return;
+	}
+
+	printf("Sending set-watts command...\n");
+}
+
+void call_wearwalker_command_set_sync()
+{
+	g_pending_sync = wearwalker_wifi_menu_entries[WW_MENU_CMD_SYNC_VALUE].num_attr.value;
+
+	if (!ww_async_start(WW_TASK_COMMAND_SET_SYNC)) {
+		printf("WearWalker request already running\n");
+		return;
+	}
+
+	printf("Sending set-sync command...\n");
+}
+
+void call_wearwalker_command_set_trainer()
+{
+	snprintf(g_pending_trainer, sizeof(g_pending_trainer), "%s", g_wearwalker_trainer);
+
+	if (!ww_async_start(WW_TASK_COMMAND_SET_TRAINER)) {
+		printf("WearWalker request already running\n");
+		return;
+	}
+
+	printf("Sending set-trainer command...\n");
 }
 
 void move_selection(const s16 offset)
@@ -316,10 +707,12 @@ enum operation ui_update()
 {
 	menu_entry *selected_entry = &g_active_menu->entries[g_active_menu->props.selected];
 	static u16 old_selected = 0;
+	bool async_completed;
 
 	gspWaitForVBlank();
 	hidScanInput();
 	u32 kDown = hidKeysDown() | (hidKeysDownRepeat() & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT));
+	async_completed = ww_async_poll_completion();
 
 	if (kDown) {
 		if (kDown & KEY_START) {
@@ -332,12 +725,6 @@ enum operation ui_update()
 			move_selection(-10);
 		} else if (kDown & KEY_RIGHT) {
 			move_selection(10);
-		} else if (kDown & KEY_SELECT && updates_available()) {
-			printf("Downloading new version...\n");
-			if (updates_download())
-				printf("New version of pwalkerHax downloaded!\nDelete this version and open the new one!\n");
-			else
-				printf("Download failed!\n");
 		} else if (kDown & KEY_Y && g_state == IN_SELECTION) {
 			goto_item(selected_entry);
 		} else if (kDown & KEY_A) {
@@ -376,6 +763,7 @@ enum operation ui_update()
 		} 
 		return OP_UPDATE;
 	}
-	return OP_NONE;
+
+	return async_completed ? OP_UPDATE : OP_NONE;
 }
 

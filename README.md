@@ -40,6 +40,166 @@ Just download the latest [release](https://github.com/francesco265/pwalkerHax/re
 
 The only requirement to build this project is to have the [libctru](https://github.com/devkitPro/libctru) library installed on your system, then just run the `make` command in the root directory of the project.
 
+## WiFi protocol and offline testing
+
+This repository now includes a first WiFi protocol draft and two Python tools to test each side independently.
+
+Current 3DS UI mode is test-focused: legacy pwalkerHax gameplay/editing menu actions were removed from UI, leaving backend/API test actions only.
+
+- Protocol spec: docs/protocol/PROTOCOL_V1.md
+- Mock backend (no watch required): scripts/eeprom_server.py
+- EEPROM manipulator (no 3DS required): scripts/eeprom_client.py
+
+### Start mock backend
+
+From the repository root:
+
+```sh
+python3 -m pip install -r requirements.txt
+python3 scripts/eeprom_server.py --host 127.0.0.1 --port 8080
+```
+
+Open FastAPI interactive docs at:
+
+- http://127.0.0.1:8080/docs
+
+This exposes:
+
+- GET /api/v1/bridge/status
+- GET /api/v1/device/snapshot
+- GET /api/v1/eeprom/export
+- PUT /api/v1/eeprom/import
+- GET /api/v1/device/domains
+- GET /api/v1/device/identity
+- GET /api/v1/device/stats
+- GET /api/v1/device/stroll
+- GET /api/v1/device/inventory
+- GET /api/v1/device/journal
+- GET /api/v1/device/routes
+- PATCH /api/v1/device/identity
+- PATCH /api/v1/device/stats
+- PATCH /api/v1/device/stroll
+- POST /api/v1/device/inventory/dowsed/{slot}
+- POST /api/v1/device/inventory/gifted/{slot}
+- POST /api/v1/device/inventory/caught/{slot}
+- POST /api/v1/device/journal/clear
+- POST /api/v1/stroll/send
+- POST /api/v1/stroll/return
+- GET /api/v1/stroll/report
+
+### Manipulate EEPROM locally
+
+```sh
+python3 scripts/eeprom_client.py snapshot
+python3 scripts/eeprom_client.py set-steps 12345
+python3 scripts/eeprom_client.py set-watts 500
+python3 scripts/eeprom_client.py set-trainer ASH
+```
+
+By default, scripts use scripts/test_roms/eeprom.bin.
+You can override it with --eeprom /path/to/your/eeprom.bin.
+
+### Manipulate EEPROM via API
+
+```sh
+python3 scripts/eeprom_client.py snapshot --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py set-steps 9000 --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py set-watts 777 --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py set-trainer RED --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py export --server http://127.0.0.1:8080 --output WWEEPROM.bin
+python3 scripts/eeprom_client.py import --server http://127.0.0.1:8080 --input WWEEPROM.bin
+```
+
+### Semantic domain API testing with CLI
+
+```sh
+python3 scripts/eeprom_client.py identity --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py stats --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py stroll --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py inventory --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py journal --preview 3 --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py routes --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py domains --server http://127.0.0.1:8080
+
+python3 scripts/eeprom_client.py patch-identity --server http://127.0.0.1:8080 --trainer-name APIA --protocol-version 2 --protocol-sub-version 1
+python3 scripts/eeprom_client.py patch-stats --server http://127.0.0.1:8080 --steps 2222 --lifetime-steps 2222 --today-steps 1200 --watts 321
+python3 scripts/eeprom_client.py patch-stroll --server http://127.0.0.1:8080 --session-watts 322 --route-image-index 7
+python3 scripts/eeprom_client.py set-dowsed-item --server http://127.0.0.1:8080 0 25
+python3 scripts/eeprom_client.py set-gifted-item --server http://127.0.0.1:8080 1 44
+python3 scripts/eeprom_client.py set-caught-species --server http://127.0.0.1:8080 2 150
+python3 scripts/eeprom_client.py clear-journal --server http://127.0.0.1:8080
+```
+
+### HGSS save fidelity tooling (Pokewalker)
+
+These commands operate directly on HGSS `.sav` files (no watch/3DS required) and use PKHeX-aligned block detection/checksum logic.
+
+```sh
+python3 scripts/eeprom_client.py hgss-status --save "scripts/test_HGSS_saves/4832 - Pokemon - Edicion Oro HeartGold (Spain) [b].sav"
+
+python3 scripts/eeprom_client.py hgss-patch \
+	--save "scripts/test_HGSS_saves/4832 - Pokemon - Edicion Oro HeartGold (Spain) [b].sav" \
+	--output scripts/test_HGSS_saves/hgss_patched.sav \
+	--steps 123456 --watts 321 --unlock-all-courses
+
+python3 scripts/eeprom_client.py hgss-diff \
+	--before "scripts/test_HGSS_saves/4832 - Pokemon - Edicion Oro HeartGold (Spain) [b].sav" \
+	--after scripts/test_HGSS_saves/hgss_patched.sav
+```
+
+### Decoupled sync workflow (ready for watch/backend/3DS split)
+
+```sh
+# 1) Read current sync package from backend
+python3 scripts/eeprom_client.py sync-package --server http://127.0.0.1:8080
+
+# 2) Apply a package produced by another actor (watch, test harness, etc.)
+python3 scripts/eeprom_client.py sync-apply --server http://127.0.0.1:8080 --input sync_package.json
+
+# 3) Apply batch operations atomically in order
+python3 scripts/eeprom_client.py apply-operations --server http://127.0.0.1:8080 --input ops.json
+```
+
+Example operations file (`ops.json`):
+
+```json
+{
+	"operations": [
+		{ "op": "stroll-tick", "steps": 200 },
+		{ "op": "add-caught-species", "speciesId": 150 },
+		{ "op": "add-dowsed-item", "itemId": 25 }
+	]
+}
+```
+
+### Stroll lifecycle helper commands
+
+```sh
+python3 scripts/eeprom_client.py stroll-send 25 --course-id 0 --level 14 --clear-buffers --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py stroll-return 2400 --auto-captures 2 --bonus-watts 30 --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py stroll-report --server http://127.0.0.1:8080
+
+python3 scripts/eeprom_client.py stroll-tick 200 --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py stroll-catch 150 --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py stroll-dowsing 25 --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py stroll-peer-gift 44 --server http://127.0.0.1:8080
+python3 scripts/eeprom_client.py stroll-reset-buffers --server http://127.0.0.1:8080
+```
+
+In server mode, set-* commands try command endpoints first and automatically fall back to export/import for older backends.
+
+### 3DS integration test against mock backend
+
+1. Start scripts/eeprom_server.py on your PC.
+2. Build 3DS with WiFi backend:
+
+```sh
+make USE_WIFI=1
+```
+
+3. On 3DS, open the WearWalker API test menu and set host/port to the mock server endpoint.
+4. Test status, snapshot, export and import flows.
+
 ## Credits
 
 This code is just a port of Dmitry's amazing [work](https://dmitry.gr/?r=05.Projects&proj=28.%20pokewalker), for which he originally developed a running demo for PalmOS devices. He reverse-engineered the Pokewalker's protocol and created all the exploits, i just ported his work to the 3DS.

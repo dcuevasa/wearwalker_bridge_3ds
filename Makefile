@@ -52,6 +52,10 @@ CFLAGS	:=	-g -Wall -O2 -mword-relocations \
 			-ffunction-sections \
 			$(ARCH)
 
+ifneq ($(strip $(USE_WIFI)),)
+CFLAGS	+=	-DUSE_WIFI_BACKEND
+endif
+
 CFLAGS	+=	$(INCLUDE) -D__3DS__
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
