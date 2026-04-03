@@ -5003,6 +5003,95 @@ void draw_menu(u16 font_size, u16 padding, menu_properties props)
 		draw_scrollbar(first, cur - 1, props.len);
 }
 
+static bool ww_is_simple_main_menu_active(void)
+{
+	return g_simple_mode && g_state == IN_MENU && g_active_menu == &main_menu_simple;
+}
+
+static bool ww_handle_simple_main_menu_input(u32 kDown)
+{
+	u16 selected;
+	u16 next;
+
+	if (!ww_is_simple_main_menu_active())
+		return false;
+
+	selected = g_active_menu->props.selected;
+	next = selected;
+
+	if (kDown & KEY_LEFT)
+		next = 0;
+	else if (kDown & KEY_RIGHT)
+		next = 1;
+	else if (kDown & KEY_DOWN)
+		next = 2;
+	else if ((kDown & KEY_UP) && selected == 2)
+		next = 0;
+	else
+		return false;
+
+	g_active_menu->props.selected = next;
+	return true;
+}
+
+static void ww_draw_simple_main_menu(void)
+{
+	const float side_pad = 10.0f;
+	const float center_gap = 10.0f;
+	const float card_y = 34.0f;
+	const float card_h = 164.0f;
+	const float card_w = (SCREEN_WIDTH - side_pad * 2.0f - center_gap) * 0.5f;
+	const float left_x = side_pad;
+	const float right_x = side_pad + card_w + center_gap;
+	const float settings_w = 92.0f;
+	const float settings_h = 22.0f;
+	const float settings_x = SCREEN_WIDTH - settings_w - 10.0f;
+	const float settings_y = 6.0f;
+	const bool send_selected = g_active_menu->props.selected == 0;
+	const bool receive_selected = g_active_menu->props.selected == 1;
+	const bool settings_selected = g_active_menu->props.selected == 2;
+	const u32 send_border = send_selected ? C2D_Color32(0xB6, 0xF0, 0xD2, 0xFF) : C2D_Color32(0x2E, 0x78, 0x63, 0xFF);
+	const u32 send_fill = send_selected ? C2D_Color32(0x2E, 0x87, 0x6B, 0xFF) : C2D_Color32(0x1B, 0x4E, 0x42, 0xFF);
+	const u32 receive_border = receive_selected ? C2D_Color32(0xF5, 0xDE, 0x9E, 0xFF) : C2D_Color32(0x7A, 0x5B, 0x22, 0xFF);
+	const u32 receive_fill = receive_selected ? C2D_Color32(0x9A, 0x6E, 0x28, 0xFF) : C2D_Color32(0x5A, 0x42, 0x18, 0xFF);
+	const u32 settings_border = settings_selected ? C2D_Color32(0xB8, 0xE0, 0xF0, 0xFF) : C2D_Color32(0x3A, 0x63, 0x77, 0xFF);
+	const u32 settings_fill = settings_selected ? C2D_Color32(0x3B, 0x79, 0x95, 0xFF) : C2D_Color32(0x24, 0x49, 0x5B, 0xFF);
+
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, C2D_Color32(0x0D, 0x1F, 0x27, 0xFF));
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.0f, SCREEN_WIDTH, 28.0f, C2D_Color32(0x14, 0x37, 0x45, 0xFF));
+	C2D_DrawRectSolid(0.0f, 210.0f, 0.0f, SCREEN_WIDTH, 30.0f, C2D_Color32(0x12, 0x2C, 0x38, 0xFF));
+
+	C2D_DrawRectSolid(settings_x - 1.0f, settings_y - 1.0f, 0.0f, settings_w + 2.0f, settings_h + 2.0f, settings_border);
+	C2D_DrawRectSolid(settings_x, settings_y, 0.0f, settings_w, settings_h, settings_fill);
+	draw_string(settings_x + 15.0f, settings_y + 4.0f, 9.0f, "SETTINGS", false, 0);
+
+	draw_string(10.0f, 7.0f, 11.5f, "Quick Actions", false, 0);
+	draw_string(10.0f, 20.0f, 8.1f, "Left/Right choose card, Down highlights settings", false, 0);
+
+	C2D_DrawRectSolid(left_x - 2.0f, card_y - 2.0f, 0.0f, card_w + 4.0f, card_h + 4.0f, send_border);
+	C2D_DrawRectSolid(left_x, card_y, 0.0f, card_w, card_h, send_fill);
+	C2D_DrawRectSolid(left_x + 8.0f, card_y + 10.0f, 0.0f, card_w - 16.0f, 24.0f, C2D_Color32(0x44, 0xA1, 0x84, 0xFF));
+	draw_string(left_x + 42.0f, card_y + 14.0f, 14.2f, "SEND", false, 0);
+	draw_string(left_x + 12.0f, card_y + 56.0f, 9.2f, "Pick one Pokemon from", false, 0);
+	draw_string(left_x + 12.0f, card_y + 72.0f, 9.2f, "your HGSS box and", false, 0);
+	draw_string(left_x + 12.0f, card_y + 88.0f, 9.2f, "send it to Pokewalker.", false, 0);
+	draw_string(left_x + 12.0f, card_y + 122.0f, 8.5f, "Source slot and route", false, 0);
+	draw_string(left_x + 12.0f, card_y + 136.0f, 8.5f, "selection are guided.", false, 0);
+
+	C2D_DrawRectSolid(right_x - 2.0f, card_y - 2.0f, 0.0f, card_w + 4.0f, card_h + 4.0f, receive_border);
+	C2D_DrawRectSolid(right_x, card_y, 0.0f, card_w, card_h, receive_fill);
+	C2D_DrawRectSolid(right_x + 8.0f, card_y + 10.0f, 0.0f, card_w - 16.0f, 24.0f, C2D_Color32(0xC2, 0x8D, 0x35, 0xFF));
+	draw_string(right_x + 25.0f, card_y + 14.0f, 14.2f, "RECEIVE", false, 0);
+	draw_string(right_x + 12.0f, card_y + 56.0f, 9.2f, "Bring back the walking", false, 0);
+	draw_string(right_x + 12.0f, card_y + 72.0f, 9.2f, "Pokemon and apply", false, 0);
+	draw_string(right_x + 12.0f, card_y + 88.0f, 9.2f, "captured encounters.", false, 0);
+	draw_string(right_x + 12.0f, card_y + 122.0f, 8.5f, "Guided flow with slot", false, 0);
+	draw_string(right_x + 12.0f, card_y + 136.0f, 8.5f, "and capture placement.", false, 0);
+
+	draw_string(10.0f, 218.0f, 8.7f, "A: open selected action", false, 0);
+	draw_string(186.0f, 218.0f, 8.7f, "START: exit", false, 0);
+}
+
 void draw_file_browser(void)
 {
 	const u16 font_size = 12;
@@ -7187,6 +7276,8 @@ void ui_draw()
 		ww_draw_route_selector();
 	else if (g_state == IN_RETURN_SELECTOR)
 		ww_draw_return_selector();
+	else if (ww_is_simple_main_menu_active())
+		ww_draw_simple_main_menu();
 	else if (g_state == IN_FILE_BROWSER)
 		draw_file_browser();
 	else if (g_state == IN_SELECTION)
@@ -7483,6 +7574,9 @@ enum operation ui_update()
 
 			return OP_UPDATE;
 		}
+
+		if (ww_handle_simple_main_menu_input(kDown))
+			return OP_UPDATE;
 
 		if (kDown & KEY_UP) {
 			move_selection(-1);
