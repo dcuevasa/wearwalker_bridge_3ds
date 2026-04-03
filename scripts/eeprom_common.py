@@ -288,392 +288,10 @@ COURSE_UNLOCK_RULES: tuple[dict[str, Any], ...] = (
 )
 COURSE_UNLOCK_MASK = (1 << len(COURSE_NAMES)) - 1
 
-# PKHeX source: PokewalkerRNG.CourseSpecies (6 entries per course, 3 groups of 2).
-COURSE_SPECIES: tuple[int, ...] = (
-    115,
-    84,
-    29,
-    32,
-    16,
-    161,
-    202,
-    69,
-    48,
-    46,
-    43,
-    21,
-    240,
-    95,
-    66,
-    77,
-    163,
-    74,
-    54,
-    120,
-    79,
-    60,
-    191,
-    194,
-    239,
-    81,
-    81,
-    198,
-    163,
-    19,
-    238,
-    92,
-    92,
-    95,
-    41,
-    66,
-    147,
-    60,
-    98,
-    90,
-    118,
-    72,
-    63,
-    100,
-    109,
-    88,
-    19,
-    162,
-    300,
-    264,
-    314,
-    313,
-    263,
-    265,
-    320,
-    298,
-    116,
-    318,
-    118,
-    129,
-    218,
-    307,
-    228,
-    111,
-    77,
-    74,
-    352,
-    351,
-    203,
-    234,
-    44,
-    70,
-    105,
-    128,
-    42,
-    177,
-    66,
-    92,
-    439,
-    415,
-    403,
-    406,
-    399,
-    401,
-    459,
-    361,
-    215,
-    436,
-    220,
-    179,
-    357,
-    438,
-    114,
-    400,
-    179,
-    102,
-    433,
-    200,
-    93,
-    418,
-    223,
-    170,
-    456,
-    422,
-    129,
-    86,
-    54,
-    90,
-    417,
-    25,
-    39,
-    35,
-    183,
-    187,
-    442,
-    446,
-    433,
-    349,
-    164,
-    42,
-    120,
-    224,
-    116,
-    222,
-    223,
-    170,
-    35,
-    39,
-    41,
-    163,
-    74,
-    95,
-    25,
-    25,
-    25,
-    25,
-    25,
-    25,
-    441,
-    302,
-    25,
-    453,
-    427,
-    417,
-    255,
-    133,
-    279,
-    61,
-    52,
-    25,
-    446,
-    374,
-    116,
-    355,
-    129,
-    436,
-    239,
-    240,
-    238,
-    440,
-    174,
-    173,
-)
+# Legacy placeholders intentionally kept empty: no baked encounter/route profile table in backend.
+COURSE_SPECIES: tuple[int, ...] = ()
 
-# Per-course per-slot capture thresholds and probability (from HGSS Pokewalker course data).
-# Ordering matches encounter_walker4 slot ordering used by `_load_walker_encounters()`.
-COURSE_SLOT_PROFILES: tuple[tuple[tuple[int, int], ...], ...] = (
-    (
-        (3000, 50),
-        (2000, 70),
-        (500, 75),
-        (500, 75),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (4000, 30),
-        (3000, 70),
-        (700, 89),
-        (700, 89),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 50),
-        (4000, 80),
-        (1000, 92),
-        (1000, 92),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (4000, 70),
-        (5000, 60),
-        (1000, 87),
-        (1500, 35),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 15),
-        (4000, 40),
-        (1000, 85),
-        (1000, 45),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 50),
-        (5000, 20),
-        (1000, 92),
-        (1000, 92),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 30),
-        (4000, 60),
-        (500, 72),
-        (500, 92),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 40),
-        (3000, 60),
-        (1500, 75),
-        (1500, 92),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (7500, 50),
-        (5000, 75),
-        (2000, 84),
-        (2000, 84),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (7000, 50),
-        (5000, 50),
-        (1500, 84),
-        (1500, 84),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 70),
-        (5000, 60),
-        (2000, 85),
-        (2000, 85),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 30),
-        (5000, 30),
-        (1000, 85),
-        (1000, 85),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 45),
-        (5000, 45),
-        (500, 65),
-        (1000, 55),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (7000, 40),
-        (7000, 45),
-        (3000, 55),
-        (3000, 55),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (10000, 50),
-        (10000, 50),
-        (3000, 55),
-        (3000, 75),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (6000, 50),
-        (5000, 40),
-        (1000, 55),
-        (1000, 55),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 50),
-        (6000, 50),
-        (500, 55),
-        (1000, 65),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (4000, 30),
-        (5000, 55),
-        (500, 65),
-        (1500, 65),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (8000, 45),
-        (8000, 45),
-        (4000, 55),
-        (4000, 55),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (10000, 5),
-        (10000, 15),
-        (500, 45),
-        (500, 20),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 20),
-        (5000, 5),
-        (2500, 55),
-        (2500, 55),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 55),
-        (5000, 55),
-        (2500, 75),
-        (2500, 75),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (10000, 2),
-        (9500, 3),
-        (2000, 35),
-        (5000, 8),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (1000, 25),
-        (1000, 25),
-        (500, 55),
-        (500, 55),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (10000, 1),
-        (7000, 10),
-        (3000, 35),
-        (2000, 35),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (8000, 5),
-        (8000, 20),
-        (3000, 55),
-        (3000, 55),
-        (0, 100),
-        (0, 100),
-    ),
-    (
-        (5000, 20),
-        (5000, 20),
-        (2000, 55),
-        (2000, 55),
-        (0, 100),
-        (0, 100),
-    ),
-)
+COURSE_SLOT_PROFILES: tuple[tuple[tuple[int, int], ...], ...] = ()
 
 NATURE_NAMES: tuple[str, ...] = (
     "Hardy",
@@ -1226,22 +844,8 @@ def _load_walker_encounters() -> dict[int, list[dict[str, Any]]]:
                     )
                 courses[course_id] = entries
 
-    if not courses:
-        slots_per_course = 6
-        total_courses = len(COURSE_SPECIES) // slots_per_course
-        for course_id in range(total_courses):
-            entries: list[dict[str, Any]] = []
-            for slot in range(slots_per_course):
-                species_id = COURSE_SPECIES[course_id * slots_per_course + slot]
-                entries.append(
-                    {
-                        "speciesId": species_id,
-                        "level": 10,
-                        "gender": 0,
-                        "moves": [0, 0, 0, 0],
-                    }
-                )
-            courses[course_id] = entries
+    # Intentionally no baked fallback encounter table here.
+    # If PKHeX encounter data is unavailable, callers should handle empty results.
 
     _WALKER_ENCOUNTERS_CACHE = courses
     return courses
@@ -1929,12 +1533,8 @@ def _configure_route_from_course(
         pick_index = rng.randint(0, 1)
         pick = left if pick_index == 0 else right
 
-        profile_slot = group * 2 + pick_index
-        if 0 <= course_id < len(COURSE_SLOT_PROFILES):
-            min_steps, chance = COURSE_SLOT_PROFILES[course_id][profile_slot]
-        else:
-            min_steps = DEFAULT_ROUTE_SLOT_MIN_STEPS[group]
-            chance = DEFAULT_ROUTE_SLOT_CHANCE[group]
+        min_steps = DEFAULT_ROUTE_SLOT_MIN_STEPS[group]
+        chance = DEFAULT_ROUTE_SLOT_CHANCE[group]
 
         summary = _pokemon_summary_from_values(
             int(pick["speciesId"]),
@@ -2530,6 +2130,11 @@ def send_pokemon_to_stroll(
 ) -> Dict[str, Any]:
     _check_size(eeprom)
 
+    if resolved_route_config is None:
+        raise ValueError(
+            "resolvedRouteConfig is required; route/items/encounters must be resolved by 3DS ROM extraction"
+        )
+
     rng_seed = int(seed) if seed is not None else int(time.time_ns() & 0xFFFFFFFF)
     rng = random.Random(rng_seed)
 
@@ -2599,17 +2204,11 @@ def send_pokemon_to_stroll(
             selected_course = 0
             course_note = "No unlocked courses detected; defaulted to route 0"
 
-    resolved_route_meta: dict[str, Any] | None = None
-    if resolved_route_config is not None:
-        route_cfg, route_items_cfg, selected_route_image_index, resolved_route_meta = _apply_resolved_route_config(
-            eeprom,
-            selected_course,
-            resolved_route_config,
-        )
-    else:
-        route_cfg = _configure_route_from_course(eeprom, selected_course, rng=rng)
-        route_items_cfg = _configure_route_items_from_course(eeprom, selected_course)
-        selected_route_image_index = int(eeprom[ROUTE_IMAGE_INDEX_OFFSET])
+    route_cfg, route_items_cfg, selected_route_image_index, resolved_route_meta = _apply_resolved_route_config(
+        eeprom,
+        selected_course,
+        resolved_route_config,
+    )
 
     if friendship is None:
         friendship = _species_base_friendship(sid)
@@ -2699,7 +2298,7 @@ def send_pokemon_to_stroll(
         },
         "configuredRouteSlots": route_cfg,
         "configuredRouteItems": route_items_cfg,
-        "resolvedRouteSource": "3ds-local" if resolved_route_meta is not None else "server-generated",
+        "resolvedRouteSource": "3ds-local",
         "resolvedRouteMeta": resolved_route_meta,
         "stroll": read_stroll_section(eeprom),
         "routes": read_routes_section(eeprom),

@@ -518,7 +518,7 @@ class StrollSendRequest(BaseModel):
     assumeNationalDex: bool = True
     unlockSpecialCourses: bool = False
     unlockEventCourses: bool = False
-    resolvedRouteConfig: ResolvedRouteConfigRequest | None = None
+    resolvedRouteConfig: ResolvedRouteConfigRequest
 
 
 class SpritePatchEntryRequest(BaseModel):
@@ -747,13 +747,6 @@ def create_app(eeprom_path: Path) -> FastAPI:
     @app.post("/api/v1/stroll/send")
     def stroll_send(body: StrollSendRequest) -> dict:
         try:
-            if body.resolvedRouteConfig is None:
-                return json_error(
-                    400,
-                    "missing_resolved_route_config",
-                    "resolvedRouteConfig is required; route/items/encounters must be resolved by 3DS",
-                )
-
             payload = app.state.ww_state.mutate_stroll_send(
                 species_id=body.speciesId,
                 level=body.level,

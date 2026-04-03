@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "hgss_patcher.h"
 #include "hgss_storage.h"
+#include "pokewalker_lookup.h"
 #include "utils.h"
 #include "wearwalker_api.h"
 
@@ -15,6 +16,11 @@
 #include <strings.h>
 #include <string.h>
 #include <sys/stat.h>
+
+static bool g_console_enabled = false;
+static bool g_debug_console_ready;
+static int ww_ui_log(const char *fmt, ...);
+#define printf ww_ui_log
 
 void call_set_wearwalker_host();
 void call_apply_wearwalker_endpoint();
@@ -35,16 +41,84 @@ void call_patch_hgss_manual();
 void call_patch_hgss_from_sync();
 void call_apply_stroll_send_endpoint();
 void call_show_stroll_send_slot();
+void call_pick_stroll_send_slot();
 void call_stroll_send_from_save();
 void call_apply_stroll_return_endpoint();
 void call_show_stroll_return_slot();
+void call_pick_stroll_return_slot();
 void call_stroll_return_to_save();
+void call_apply_settings_endpoint();
+void call_toggle_simple_mode();
+void call_save_ui_config_now();
+void call_start_guided_send(void);
+
+static bool ww_save_ui_config(void);
+static void ww_sync_port_entries(u16 port);
+static bool ww_apply_endpoint_from_ui(u16 port);
+static menu *ww_get_main_menu(void);
+static bool ww_prepare_selected_save_path(void);
+static bool ww_prepare_selected_nds_path(void);
+static void ww_draw_top_context(void);
+static void ww_path_basename(const char *path, char *out, size_t out_size);
+static void ww_init_debug_console(void);
+static void ww_clear_debug_console(void);
+
+typedef enum {
+	WW_BOX_PICKER_NONE = 0,
+	WW_BOX_PICKER_SEND_SOURCE,
+	WW_BOX_PICKER_RETURN_SOURCE,
+} ww_box_picker_mode;
+
+static bool ww_box_selector_reload(void);
+static bool ww_box_selector_open(ww_box_picker_mode mode);
+static void ww_box_selector_apply_choice(void);
+static void ww_draw_box_selector(void);
+static bool ww_compute_simple_return_walked_steps(u32 *out_walked_steps);
+static bool ww_route_selector_reload(void);
+static bool ww_route_selector_open(void);
+static void ww_draw_route_selector(void);
+static void ww_draw_2bpp_sprite(
+		const u8 *sprite,
+		u32 width,
+		u32 height,
+		float x,
+		float y,
+		float scale,
+		bool transparent_zero);
+static void ww_draw_item_token_sprite(u16 item_id, float x, float y, float scale);
+static void ww_draw_simple_top_panel(void);
+static void ww_async_progress_set(u32 percent, const char *label);
+static void ww_async_progress_get(u32 *out_percent, char *out_label, size_t out_label_size);
+
+typedef struct {
+	u16 species_id;
+	u8 level;
+	u16 min_steps;
+	u8 chance;
+	u16 moves[4];
+	bool sprite_ready;
+	u8 sprite_frame0[0x0C0];
+	char species_name[32];
+} ww_route_slot_preview;
+
+typedef struct {
+	u16 item_id;
+	u16 min_steps;
+	u8 chance;
+	char item_name[32];
+} ww_route_item_preview;
+
+#define WW_ROUTE_PREVIEW_SLOT_COUNT 6u
+#define WW_ROUTE_SELECTED_SLOT_COUNT 3u
 
 #define WW_SAVE_PATH_MAX 512
 #define WW_BROWSER_ENTRY_NAME_MAX 256
 #define WW_BROWSER_MAX_ENTRIES 384
 #define WW_ASYNC_LOG_MAX 1024
 #define WW_STROLL_SEND_BODY_MAX 12288
+#define WW_UI_CONFIG_DIR "sdmc:/3ds/wearwalker_bridge"
+#define WW_UI_CONFIG_PATH "sdmc:/3ds/wearwalker_bridge/config.ini"
+#define TOP_SCREEN_WIDTH 400
 
 typedef struct {
 	char name[WW_BROWSER_ENTRY_NAME_MAX];
@@ -66,6 +140,7 @@ static char g_selected_hgss_save_path[WW_SAVE_PATH_MAX];
 static char g_selected_hgss_nds_path[WW_SAVE_PATH_MAX];
 static char g_pending_save_path[WW_SAVE_PATH_MAX];
 static char g_pending_nds_path[WW_SAVE_PATH_MAX];
+static bool g_simple_mode = true;
 static u32 g_pending_hgss_steps = 2400;
 static u32 g_pending_hgss_watts = 100;
 static u32 g_pending_hgss_course_flags = 0;
@@ -80,7 +155,7 @@ static u32 g_pending_return_source_slot = 1;
 static u32 g_pending_return_target_slot = 0;
 static u32 g_pending_return_walked_steps = 1200;
 static u32 g_pending_return_bonus_watts = 0;
-static u32 g_pending_return_auto_captures = 1;
+static u32 g_pending_return_auto_captures = 0;
 static bool g_pending_return_increment_trip_counter = true;
 static ww_browser_entry g_browser_entries[WW_BROWSER_MAX_ENTRIES];
 static u32 g_browser_entry_count;
@@ -88,6 +163,41 @@ static s32 g_browser_selected;
 static u32 g_browser_first;
 static char g_browser_cwd[WW_SAVE_PATH_MAX] = "sdmc:/";
 static ww_browser_filter g_browser_filter = WW_BROWSER_FILTER_SAV;
+static ww_box_picker_mode g_box_picker_mode = WW_BOX_PICKER_NONE;
+static u32 g_box_picker_box = 1;
+static u32 g_box_picker_slot = 1;
+static hgss_box_slot_summary g_box_picker_slots[HGSS_BOX_SLOTS];
+static hgss_stroll_send_context g_box_picker_context[HGSS_BOX_SLOTS];
+static bool g_box_picker_context_valid[HGSS_BOX_SLOTS];
+static u16 g_box_picker_sprite_species = 0xFFFF;
+static bool g_box_picker_sprite_ready = false;
+static u8 g_box_picker_sprite[0x0C0];
+static bool g_box_picker_reload_ok = false;
+static char g_box_picker_error[128];
+static bool g_route_selector_ready = false;
+static char g_route_selector_error[128];
+static u32 g_route_selector_course = 0;
+static hgss_stroll_send_context g_guided_send_context;
+static bool g_guided_send_context_ready = false;
+static u8 g_route_preview_area_sprite[0x0C0];
+static bool g_route_preview_area_ready = false;
+static u8 g_route_preview_adv_types[3];
+static ww_route_slot_preview g_route_preview_slots[WW_ROUTE_PREVIEW_SLOT_COUNT];
+static ww_route_item_preview g_route_preview_items[10];
+static u8 g_route_preview_selected_slots[WW_ROUTE_SELECTED_SLOT_COUNT];
+static s8 g_route_preview_selected_group[WW_ROUTE_PREVIEW_SLOT_COUNT];
+static bool g_route_selector_locked = false;
+static bool g_route_selector_special_lock = false;
+static s32 g_route_selector_required_watts = 0;
+static u32 g_route_selector_current_watts = 0;
+static bool g_route_send_busy = false;
+static u32 g_ui_anim_tick = 0;
+static u32 g_async_progress_percent = 0;
+static char g_async_progress_label[48] = "Idle";
+static u32 g_route_selector_session_seed = 0;
+static u32 g_route_selector_preview_seed = 0;
+static u32 g_pending_send_route_seed = 0;
+static bool g_pending_send_route_seed_valid = false;
 
 typedef enum {
 	WW_TASK_NONE = 0,
@@ -143,6 +253,87 @@ static s32 g_ui_thread_prio = 0x30;
 #define WW_OV112_MAX_SLOT_CHANCE 100u
 #define WW_OV112_MAX_ITEM_CHANCE 100u
 
+static const char *g_route_course_names[WW_OV112_COURSE_COUNT] = {
+	"Refreshing Field",
+	"Noisy Forest",
+	"Rugged Road",
+	"Beautiful Beach",
+	"Suburban Area",
+	"Dim Cave",
+	"Blue Lake",
+	"Town Outskirts",
+	"Hoenn Field",
+	"Warm Beach",
+	"Volcano Path",
+	"Treehouse",
+	"Scary Cave",
+	"Sinnoh Field",
+	"Icy Mountain Road",
+	"Big Forest",
+	"White Lake",
+	"Stormy Beach",
+	"Resort",
+	"Quiet Cave",
+	"Beyond The Sea",
+	"Night Sky's Edge",
+	"Yellow Forest",
+	"Rally",
+	"Sightseeing",
+	"Winners Path",
+	"Amity Meadow",
+};
+
+static const s32 g_route_course_watts_required[WW_OV112_COURSE_COUNT] = {
+	0,
+	0,
+	50,
+	200,
+	500,
+	1000,
+	2000,
+	3000,
+	5000,
+	7500,
+	10000,
+	15000,
+	20000,
+	25000,
+	30000,
+	40000,
+	50000,
+	65000,
+	80000,
+	100000,
+	-1,
+	-1,
+	-1,
+	-1,
+	-1,
+	-1,
+	-1,
+};
+
+static const char *g_type_names[18] = {
+	"Normal",
+	"Fighting",
+	"Flying",
+	"Poison",
+	"Ground",
+	"Rock",
+	"Bug",
+	"Ghost",
+	"Steel",
+	"Fire",
+	"Water",
+	"Grass",
+	"Electric",
+	"Psychic",
+	"Ice",
+	"Dragon",
+	"Dark",
+	"Unknown",
+};
+
 #define WW_ROM_CACHE_MAGIC 0x48524357u /* WRCH */
 #define WW_ROM_CACHE_VERSION 2u
 #define WW_ROM_CACHE_PATH "sdmc:/3ds/wearwalker_bridge/rom_course_cache.bin"
@@ -156,6 +347,21 @@ typedef struct {
 	u32 table_size;
 	u32 course_count;
 } ww_rom_cache_header;
+
+static int ww_ui_log(const char *fmt, ...)
+{
+	va_list args;
+	int written;
+
+	if (!g_console_enabled || !g_debug_console_ready)
+		return 0;
+
+	va_start(args, fmt);
+	written = vprintf(fmt, args);
+	va_end(args);
+
+	return written;
+}
 
 static const char *ww_async_task_name(ww_async_task task)
 {
@@ -187,6 +393,29 @@ static const char *ww_async_task_name(ww_async_task task)
 		default:
 			return "request";
 	}
+}
+
+static void ww_async_progress_set(u32 percent, const char *label)
+{
+	if (percent > 100)
+		percent = 100;
+
+	LightLock_Lock(&g_ww_async.lock);
+	g_async_progress_percent = percent;
+	snprintf(g_async_progress_label, sizeof(g_async_progress_label), "%s", (label && label[0]) ? label : "Working");
+	LightLock_Unlock(&g_ww_async.lock);
+}
+
+static void ww_async_progress_get(u32 *out_percent, char *out_label, size_t out_label_size)
+{
+	if (!out_percent)
+		return;
+
+	LightLock_Lock(&g_ww_async.lock);
+	*out_percent = g_async_progress_percent;
+	if (out_label && out_label_size > 0)
+		snprintf(out_label, out_label_size, "%s", g_async_progress_label);
+	LightLock_Unlock(&g_ww_async.lock);
 }
 
 static bool ww_json_get_u32_from(const char *json, const char *key, u32 *out_value)
@@ -1545,10 +1774,8 @@ static bool ww_load_narc_from_nds(const char *nds_path, const char *narc_path, u
 	if (!ww_read_file_range(f, fat_offset, fat_data, fat_size))
 		goto cleanup;
 
-	if (!ww_nds_find_file_id_from_fnt(fnt_data, fnt_size, narc_path, &file_id)) {
-		/* fallback for standard HG/SS ROM order */
-		file_id = 258;
-	}
+	if (!ww_nds_find_file_id_from_fnt(fnt_data, fnt_size, narc_path, &file_id))
+		goto cleanup;
 
 	if (!ww_nds_get_file_bounds_from_fat(fat_data, fat_size, file_id, &file_start, &file_end))
 		goto cleanup;
@@ -1839,6 +2066,12 @@ static u32 ww_lcg_next(u32 *state)
 	return *state;
 }
 
+static u32 ww_lcg_pair_pick(u32 *state)
+{
+	/* Do not use LCG LSB: it alternates predictably and creates obvious pair patterns. */
+	return (ww_lcg_next(state) >> 16) & 0x1u;
+}
+
 static void ww_sanitize_json_ascii(const char *src, char *dst, size_t dst_size)
 {
 	size_t pos = 0;
@@ -1886,6 +2119,8 @@ static bool ww_build_resolved_stroll_send_json(
 		const hgss_stroll_send_context *send_context,
 		u8 level,
 		u32 course_id,
+		bool force_route_seed,
+		u32 forced_route_seed,
 		bool clear_buffers,
 		bool allow_locked_course,
 		const u8 course_table[WW_OV112_COURSE_TABLE_SIZE],
@@ -1928,7 +2163,13 @@ static bool ww_build_resolved_stroll_send_json(
 		else
 			route_image_index = course_id % WW_OV112_ROUTE_IMAGE_COUNT;
 	}
-	route_seed = (u32)(svcGetSystemTick() & 0xFFFFFFFFu);
+	if (force_route_seed) {
+		route_seed = forced_route_seed;
+	} else {
+		route_seed = (course_id + 1u) * 2654435761u;
+		route_seed ^= ((u32)send_context->source_slot.species_id << 16);
+		route_seed ^= send_context->source_slot.exp;
+	}
 	adv_type0 = record[WW_OV112_ADV_TYPES_OFFSET + 0u];
 	adv_type1 = record[WW_OV112_ADV_TYPES_OFFSET + 1u];
 	adv_type2 = record[WW_OV112_ADV_TYPES_OFFSET + 2u];
@@ -1974,7 +2215,7 @@ static bool ww_build_resolved_stroll_send_json(
 
 	for (group = 0; group < 3; group++) {
 		u32 pair_base = group * 2u;
-		u32 pair_pick = ww_lcg_next(&route_seed) & 0x1u;
+		u32 pair_pick = ww_lcg_pair_pick(&route_seed);
 		u32 source_pair_index = pair_base + pair_pick;
 		u32 base = WW_OV112_SLOT_OFFSET + source_pair_index * WW_OV112_SLOT_SIZE;
 		u16 species_id = ww_read_u16_le(record + base + 0x00);
@@ -2555,6 +2796,8 @@ static bool ww_browser_activate_selected(void)
 		snprintf(g_selected_hgss_nds_path, sizeof(g_selected_hgss_nds_path), "%s", path);
 	else
 		snprintf(g_selected_hgss_save_path, sizeof(g_selected_hgss_save_path), "%s", path);
+
+	ww_save_ui_config();
 	return true;
 }
 
@@ -2574,6 +2817,8 @@ static void ww_async_worker(void *arg)
 	u32 pending_send_box = g_pending_send_box;
 	u32 pending_send_slot = g_pending_send_slot;
 	u32 pending_send_course = g_pending_send_course;
+	u32 pending_send_route_seed = g_pending_send_route_seed;
+	bool pending_send_route_seed_valid = g_pending_send_route_seed_valid;
 	bool pending_send_allow_locked = g_pending_send_allow_locked;
 	bool pending_send_clear_buffers = g_pending_send_clear_buffers;
 	u32 pending_return_box = g_pending_return_box;
@@ -2756,6 +3001,8 @@ static void ww_async_worker(void *arg)
 				bool route_cache_hit = false;
 				u8 level;
 
+				ww_async_progress_set(5, "Reading save context");
+
 				if (!pending_nds_path[0]) {
 					snprintf(json, WW_API_RESPONSE_MAX, "missing HGSS .nds path for dynamic sprite workflow");
 					success = false;
@@ -2784,6 +3031,7 @@ static void ww_async_worker(void *arg)
 					snprintf(seed_trainer_name, sizeof(seed_trainer_name), "WWBRIDGE");
 
 				level = ww_estimate_level_from_exp(send_context.source_slot.exp);
+				ww_async_progress_set(12, "Syncing trainer with API");
 
 				if (!ww_api_patch_identity(
 						seed_trainer_name,
@@ -2803,12 +3051,16 @@ static void ww_async_worker(void *arg)
 						break;
 					}
 				}
+				ww_async_progress_set(22, "Trainer synced");
+				ww_async_progress_set(28, "Syncing steps with API");
 
 				success = ww_api_command_set_steps(send_context.pokewalker_steps, NULL, NULL, 0);
 				if (!success) {
 					snprintf(json, WW_API_RESPONSE_MAX, "failed to seed EEPROM steps from HGSS save");
 					break;
 				}
+				ww_async_progress_set(36, "Steps synced");
+				ww_async_progress_set(42, "Syncing watts with API");
 
 				eeprom_watts = send_context.pokewalker_watts;
 				if (eeprom_watts > 0xFFFFu)
@@ -2819,6 +3071,8 @@ static void ww_async_worker(void *arg)
 					snprintf(json, WW_API_RESPONSE_MAX, "failed to seed EEPROM watts from HGSS save");
 					break;
 				}
+				ww_async_progress_set(50, "Watts synced");
+				ww_async_progress_set(56, "Resolving route from ROM");
 
 				if (pending_send_course >= WW_OV112_COURSE_COUNT) {
 					snprintf(json, WW_API_RESPONSE_MAX, "course index out of range for ROM route table");
@@ -2849,6 +3103,8 @@ static void ww_async_worker(void *arg)
 							&send_context,
 							level,
 							pending_send_course,
+							pending_send_route_seed_valid,
+							pending_send_route_seed,
 							pending_send_clear_buffers,
 							pending_send_allow_locked,
 							course_table,
@@ -2864,6 +3120,8 @@ static void ww_async_worker(void *arg)
 					success = false;
 					break;
 				}
+				ww_async_progress_set(68, "Route payload ready");
+				ww_async_progress_set(82, "Request sent to API");
 
 				success = ww_api_stroll_send_resolved_json(send_body, json, WW_API_RESPONSE_MAX);
 				free(send_body);
@@ -2886,6 +3144,8 @@ static void ww_async_worker(void *arg)
 					}
 					break;
 				}
+				ww_async_progress_set(86, "Route accepted by API");
+				ww_async_progress_set(88, "Patching name sprites");
 
 				ww_apply_dynamic_name_sprite_patches(
 						&send_context,
@@ -2893,6 +3153,7 @@ static void ww_async_worker(void *arg)
 						pending_send_course,
 						&sprite_name_patches_applied,
 						&sprite_name_patches_failed);
+				ww_async_progress_set(92, "Patching Pokemon sprites");
 
 				ww_apply_dynamic_pokemon_sprite_patches(
 						pending_nds_path,
@@ -2900,6 +3161,8 @@ static void ww_async_worker(void *arg)
 						json,
 						&sprite_image_patches_applied,
 						&sprite_image_patches_failed);
+				ww_async_progress_set(95, "Sprites patched");
+				ww_async_progress_set(97, "Updating save");
 
 				success = hgss_apply_stroll_send(
 						pending_save_path,
@@ -2914,6 +3177,8 @@ static void ww_async_worker(void *arg)
 					snprintf(json, WW_API_RESPONSE_MAX, "%s", patch_error[0] ? patch_error : "failed to patch save after send");
 					break;
 				}
+				ww_async_progress_set(98, "Save updated");
+				ww_async_progress_set(99, "Verifying save update");
 
 				success = hgss_read_box_slot_summary(
 						pending_save_path,
@@ -2961,6 +3226,7 @@ static void ww_async_worker(void *arg)
 						pending_nds_path,
 						send_report.source_slot_cleared ? "source cleared" : "source kept",
 						send_report.walker_pair_written ? "written" : "missing");
+				ww_async_progress_set(100, "Send completed");
 				break;
 			}
 			case WW_TASK_HGSS_STROLL_RETURN: {
@@ -3189,6 +3455,7 @@ static bool ww_async_start(ww_async_task task)
 	g_ww_async.json[0] = '\0';
 	memset(&g_ww_async.snapshot, 0, sizeof(g_ww_async.snapshot));
 	LightLock_Unlock(&g_ww_async.lock);
+	ww_async_progress_set(0, "Starting");
 
 	worker_prio = g_ui_thread_prio > 0 ? g_ui_thread_prio - 1 : g_ui_thread_prio;
 	thread = threadCreate(ww_async_worker, (void *)(uintptr_t)task, WW_ASYNC_STACK_SIZE, worker_prio, -2, false);
@@ -3234,6 +3501,8 @@ static bool ww_async_poll_completion(void)
 		threadJoin(thread, U64_MAX);
 		threadFree(thread);
 	}
+
+	ww_async_progress_set(100, success ? "Completed" : "Failed");
 
 	if (!success) {
 		printf("WearWalker %s failed (%s)\n", ww_async_task_name(task), json[0] ? json : "unknown error");
@@ -3288,6 +3557,109 @@ static void ww_async_shutdown(void)
 		threadJoin(thread, U64_MAX);
 		threadFree(thread);
 	}
+}
+
+static void ww_trim_ascii(char *text)
+{
+	char *start;
+	char *end;
+
+	if (!text)
+		return;
+
+	start = text;
+	while (*start && isspace((unsigned char)*start))
+		start++;
+
+	if (start != text)
+		memmove(text, start, strlen(start) + 1);
+
+	end = text + strlen(text);
+	while (end > text && isspace((unsigned char)end[-1]))
+		end--;
+	*end = '\0';
+}
+
+static bool ww_save_ui_config(void)
+{
+	FILE *f;
+	u16 port = ww_api_get_port();
+
+	mkdir("sdmc:/3ds", 0777);
+	mkdir(WW_UI_CONFIG_DIR, 0777);
+
+	f = fopen(WW_UI_CONFIG_PATH, "wb");
+	if (!f)
+		return false;
+
+	fprintf(f, "host=%s\n", g_wearwalker_host);
+	fprintf(f, "port=%u\n", (unsigned)port);
+	fprintf(f, "save_path=%s\n", g_selected_hgss_save_path);
+	fprintf(f, "rom_path=%s\n", g_selected_hgss_nds_path);
+	fprintf(f, "simple_mode=%u\n", g_simple_mode ? 1u : 0u);
+
+	fclose(f);
+	return true;
+}
+
+static void ww_load_ui_config(void)
+{
+	FILE *f;
+	char line[WW_SAVE_PATH_MAX + 96];
+	u16 loaded_port = ww_api_get_port();
+
+	f = fopen(WW_UI_CONFIG_PATH, "rb");
+	if (!f)
+		return;
+
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char *eq = strchr(line, '=');
+		char *key;
+		char *value;
+
+		if (!eq)
+			continue;
+
+		*eq = '\0';
+		key = line;
+		value = eq + 1;
+
+		ww_trim_ascii(key);
+		ww_trim_ascii(value);
+
+		if (strcmp(key, "host") == 0) {
+			if (value[0]) {
+				snprintf(g_wearwalker_host, sizeof(g_wearwalker_host), "%s", value);
+			}
+		} else if (strcmp(key, "port") == 0) {
+			char *endptr = NULL;
+			unsigned long parsed = strtoul(value, &endptr, 10);
+			if (endptr != value && parsed >= 1 && parsed <= 65535)
+				loaded_port = (u16)parsed;
+		} else if (strcmp(key, "save_path") == 0) {
+			snprintf(g_selected_hgss_save_path, sizeof(g_selected_hgss_save_path), "%s", value);
+		} else if (strcmp(key, "rom_path") == 0) {
+			snprintf(g_selected_hgss_nds_path, sizeof(g_selected_hgss_nds_path), "%s", value);
+		} else if (strcmp(key, "simple_mode") == 0) {
+			if (strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0)
+				g_simple_mode = false;
+			else
+				g_simple_mode = true;
+		}
+	}
+
+	fclose(f);
+
+	if (!g_wearwalker_host[0])
+		snprintf(g_wearwalker_host, sizeof(g_wearwalker_host), "%s", WW_API_DEFAULT_HOST);
+
+	if (!ww_api_set_endpoint(g_wearwalker_host, loaded_port)) {
+		snprintf(g_wearwalker_host, sizeof(g_wearwalker_host), "%s", WW_API_DEFAULT_HOST);
+		loaded_port = WW_API_DEFAULT_PORT;
+		ww_api_set_endpoint(g_wearwalker_host, loaded_port);
+	}
+
+	ww_sync_port_entries(loaded_port);
 }
 
 enum {
@@ -3351,6 +3723,31 @@ enum {
 	RETURN_MENU_AUTO_CAPTURES,
 	RETURN_MENU_INCREMENT_TRIP,
 	RETURN_MENU_APPLY,
+};
+
+enum {
+	SEND_SIMPLE_MENU_PICK_SLOT = 0,
+	SEND_SIMPLE_MENU_SHOW_SLOT,
+	SEND_SIMPLE_MENU_ROUTE,
+	SEND_SIMPLE_MENU_SEND,
+};
+
+enum {
+	RETURN_SIMPLE_MENU_PICK_SLOT = 0,
+	RETURN_SIMPLE_MENU_SHOW_SLOT,
+	RETURN_SIMPLE_MENU_APPLY,
+};
+
+enum {
+	SETTINGS_MENU_TOGGLE_MODE = 0,
+	SETTINGS_MENU_SET_HOST,
+	SETTINGS_MENU_PORT,
+	SETTINGS_MENU_APPLY_ENDPOINT,
+	SETTINGS_MENU_SELECT_SAVE,
+	SETTINGS_MENU_SHOW_SAVE,
+	SETTINGS_MENU_SELECT_ROM,
+	SETTINGS_MENU_SHOW_ROM,
+	SETTINGS_MENU_SAVE,
 };
 
 // WearWalker WiFi menu
@@ -3430,7 +3827,7 @@ menu_entry hgss_stroll_return_menu_entries[] = {
 	{"Target slot (0=auto,1-30)", ENTRY_NUMATTR, .num_attr = {.value = 0, .min = 0, .max = HGSS_BOX_SLOTS}},
 	{"Walked steps", ENTRY_NUMATTR, .num_attr = {.value = 1200, .min = 0, .max = 4294967295U}},
 	{"Bonus watts", ENTRY_NUMATTR, .num_attr = {.value = 0, .min = 0, .max = 65535}},
-	{"Auto captures", ENTRY_NUMATTR, .num_attr = {.value = 1, .min = 0, .max = 3}},
+	{"Auto captures", ENTRY_NUMATTR, .num_attr = {.value = 0, .min = 0, .max = 3}},
 	{"Increment trip counter (0/1)", ENTRY_NUMATTR, .num_attr = {.value = 1, .min = 0, .max = 1}},
 	{"Apply stroll return and patch save", ENTRY_ACTION, .callback = call_stroll_return_to_save},
 };
@@ -3441,32 +3838,190 @@ menu hgss_stroll_return_menu = {
 	.props = {.len = sizeof(hgss_stroll_return_menu_entries) / sizeof(hgss_stroll_return_menu_entries[0]), .selected = 0},
 };
 
-// Main menu
-menu_entry main_menu_entries[] = {
+menu_entry hgss_stroll_send_simple_menu_entries[] = {
+	{"Choose source slot (visual)", ENTRY_ACTION, .callback = call_pick_stroll_send_slot},
+	{"Inspect selected source slot", ENTRY_ACTION, .callback = call_show_stroll_send_slot},
+	{"Route/course id (0-26)", ENTRY_NUMATTR, .num_attr = {.value = 0, .min = 0, .max = 26}},
+	{"Send to stroll", ENTRY_ACTION, .callback = call_stroll_send_from_save},
+};
+
+menu hgss_stroll_send_simple_menu = {
+	.title = "Simple Send",
+	.entries = hgss_stroll_send_simple_menu_entries,
+	.props = {.len = sizeof(hgss_stroll_send_simple_menu_entries) / sizeof(hgss_stroll_send_simple_menu_entries[0]), .selected = 0},
+};
+
+menu_entry hgss_stroll_return_simple_menu_entries[] = {
+	{"Choose source slot (visual)", ENTRY_ACTION, .callback = call_pick_stroll_return_slot},
+	{"Inspect selected source slot", ENTRY_ACTION, .callback = call_show_stroll_return_slot},
+	{"Apply stroll return", ENTRY_ACTION, .callback = call_stroll_return_to_save},
+};
+
+menu hgss_stroll_return_simple_menu = {
+	.title = "Simple Return",
+	.entries = hgss_stroll_return_simple_menu_entries,
+	.props = {.len = sizeof(hgss_stroll_return_simple_menu_entries) / sizeof(hgss_stroll_return_simple_menu_entries[0]), .selected = 0},
+};
+
+menu_entry settings_menu_entries[] = {
+	{"Toggle UI mode (Simple/Debug)", ENTRY_ACTION, .callback = call_toggle_simple_mode},
+	{"Set backend host", ENTRY_ACTION, .callback = call_set_wearwalker_host},
+	{"Backend port", ENTRY_NUMATTR, .num_attr = {.value = WW_API_DEFAULT_PORT, .min = 1, .max = 65535}},
+	{"Apply endpoint", ENTRY_ACTION, .callback = call_apply_settings_endpoint},
+	{"Select HGSS save (.sav)", ENTRY_ACTION, .callback = call_select_hgss_save},
+	{"Show selected save path", ENTRY_ACTION, .callback = call_show_hgss_save_path},
+	{"Select HGSS ROM (.nds)", ENTRY_ACTION, .callback = call_select_hgss_rom},
+	{"Show selected ROM path", ENTRY_ACTION, .callback = call_show_hgss_rom_path},
+	{"Save settings now", ENTRY_ACTION, .callback = call_save_ui_config_now},
+};
+
+menu settings_menu = {
+	.title = "Settings",
+	.entries = settings_menu_entries,
+	.props = {.len = sizeof(settings_menu_entries) / sizeof(settings_menu_entries[0]), .selected = 0},
+};
+
+menu_entry main_menu_simple_entries[] = {
+	{"HGSS stroll send", ENTRY_ACTION, .callback = call_start_guided_send},
+	{"HGSS stroll return", ENTRY_CHANGEMENU, .new_menu = &hgss_stroll_return_simple_menu},
+	{"Settings", ENTRY_CHANGEMENU, .new_menu = &settings_menu},
+};
+
+menu main_menu_simple = {
+	.title = "Main menu (Simple)",
+	.entries = main_menu_simple_entries,
+	.props = {.len = sizeof(main_menu_simple_entries) / sizeof(main_menu_simple_entries[0]), .selected = 0},
+};
+
+menu_entry main_menu_debug_entries[] = {
 	{"WearWalker API test menu", ENTRY_CHANGEMENU, .new_menu = &wearwalker_wifi_menu},
 	{"HGSS save sync/patch", ENTRY_CHANGEMENU, .new_menu = &hgss_patch_menu},
 	{"HGSS stroll send from box", ENTRY_CHANGEMENU, .new_menu = &hgss_stroll_send_menu},
 	{"HGSS stroll return to save", ENTRY_CHANGEMENU, .new_menu = &hgss_stroll_return_menu},
+	{"Settings", ENTRY_CHANGEMENU, .new_menu = &settings_menu},
 };
 
-menu main_menu = {
-	.title = "Main menu",
-	.entries = main_menu_entries,
-	.props = {.len = sizeof(main_menu_entries) / sizeof(main_menu_entries[0]), .selected = 0},
+menu main_menu_debug = {
+	.title = "Main menu (Debug)",
+	.entries = main_menu_debug_entries,
+	.props = {.len = sizeof(main_menu_debug_entries) / sizeof(main_menu_debug_entries[0]), .selected = 0},
 };
+
+static menu *ww_get_main_menu(void)
+{
+	return g_simple_mode ? &main_menu_simple : &main_menu_debug;
+}
+
+static void ww_sync_port_entries(u16 port)
+{
+	wearwalker_wifi_menu_entries[WW_MENU_PORT].num_attr.value = port;
+	hgss_stroll_send_menu_entries[SEND_MENU_PORT].num_attr.value = port;
+	hgss_stroll_return_menu_entries[RETURN_MENU_PORT].num_attr.value = port;
+	settings_menu_entries[SETTINGS_MENU_PORT].num_attr.value = port;
+}
+
+static bool ww_apply_endpoint_from_ui(u16 port)
+{
+	if (!ww_api_set_endpoint(g_wearwalker_host, port)) {
+		printf("Invalid WearWalker endpoint\n");
+		return false;
+	}
+
+	ww_sync_port_entries(port);
+	printf("Using WearWalker endpoint %s:%lu\n", g_wearwalker_host, (unsigned long)port);
+	ww_save_ui_config();
+	return true;
+}
 
 
 // Currently active menu
-static menu *g_active_menu = &main_menu;
+static menu *g_active_menu = &main_menu_simple;
 static enum state g_state = IN_MENU;
 static C3D_RenderTarget *target;
+static C3D_RenderTarget *target_top;
 static C2D_TextBuf textbuf;
+static PrintConsole g_header_console;
 static PrintConsole logs;
+static bool g_debug_console_ready = false;
+
+static void ww_init_debug_console(void)
+{
+	if (g_debug_console_ready)
+		return;
+
+	consoleInit(GFX_TOP, &g_header_console);
+	consoleInit(GFX_TOP, &logs);
+	consoleSetWindow(&g_header_console, 0, 0, g_header_console.consoleWidth, 6);
+	consoleSetWindow(&logs, 0, 6, logs.consoleWidth, logs.consoleHeight - 6);
+	g_debug_console_ready = true;
+}
+
+static void ww_clear_debug_console(void)
+{
+	if (!g_debug_console_ready)
+		return;
+
+	consoleSelect(&g_header_console);
+	consoleClear();
+	consoleSelect(&logs);
+	consoleClear();
+}
+
+static void ww_path_basename(const char *path, char *out, size_t out_size)
+{
+	const char *base;
+
+	if (!out || out_size == 0)
+		return;
+
+	if (!path || !path[0]) {
+		snprintf(out, out_size, "(none)");
+		return;
+	}
+
+	base = strrchr(path, '/');
+	if (!base || !base[1])
+		snprintf(out, out_size, "%s", path);
+	else
+		snprintf(out, out_size, "%s", base + 1);
+}
+
+static void ww_draw_top_context(void)
+{
+	char save_name[48];
+	char rom_name[48];
+	const char *panel_state;
+
+	if (g_simple_mode || !g_console_enabled || !g_debug_console_ready)
+		return;
+
+	ww_path_basename(g_selected_hgss_save_path, save_name, sizeof(save_name));
+	ww_path_basename(g_selected_hgss_nds_path, rom_name, sizeof(rom_name));
+
+	if (g_state == IN_BOX_SELECTOR)
+		panel_state = "Visual box selector";
+	else if (g_state == IN_FILE_BROWSER)
+		panel_state = "File browser";
+	else
+		panel_state = g_active_menu ? g_active_menu->title : "Menu";
+
+	consoleSelect(&g_header_console);
+	printf("\x1b[2J\x1b[0;0H");
+	printf("WearWalker v%s | %s mode\n", VER, g_simple_mode ? "Simple" : "Debug");
+	printf("%s:%u\n", ww_api_get_host(), (unsigned)ww_api_get_port());
+	printf("SAVE %s\n", save_name);
+	printf("ROM  %s\n", rom_name);
+	printf("%s\n", panel_state);
+	if (g_state == IN_BOX_SELECTOR)
+		printf("Box %lu Slot %lu (L/R change box)\n", (unsigned long)g_box_picker_box, (unsigned long)g_box_picker_slot);
+	else
+		printf("\n");
+
+	consoleSelect(&logs);
+}
 
 void ui_init()
 {
-	PrintConsole header;
-
 	svcGetThreadPriority(&g_ui_thread_prio, CUR_THREAD_HANDLE);
 	LightLock_Init(&g_ww_async.lock);
 	g_ww_async.thread = NULL;
@@ -3481,27 +4036,31 @@ void ui_init()
 	C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
 	C2D_Prepare();
 
-	consoleInit(GFX_TOP, &header);
-	consoleInit(GFX_TOP, &logs);
-
-	consoleSetWindow(&header, 0, 1, header.consoleWidth, 2);
-	consoleSetWindow(&logs, 0, 3, logs.consoleWidth, logs.consoleHeight - 3);
-
-	consoleSelect(&header);
-	printf("WearWalker Bridge Test v%s\n---", VER);
-	consoleSelect(&logs);
+	g_console_enabled = false;
+	g_debug_console_ready = false;
 
 	strncpy(g_wearwalker_host, ww_api_get_host(), sizeof(g_wearwalker_host) - 1);
 	g_wearwalker_host[sizeof(g_wearwalker_host) - 1] = '\0';
-	wearwalker_wifi_menu_entries[WW_MENU_PORT].num_attr.value = ww_api_get_port();
-	hgss_stroll_send_menu_entries[SEND_MENU_PORT].num_attr.value = ww_api_get_port();
-	hgss_stroll_return_menu_entries[RETURN_MENU_PORT].num_attr.value = ww_api_get_port();
+	g_simple_mode = true;
+	g_selected_hgss_save_path[0] = '\0';
+	g_selected_hgss_nds_path[0] = '\0';
+	ww_sync_port_entries(ww_api_get_port());
+	ww_load_ui_config();
+	g_console_enabled = !g_simple_mode;
+	g_active_menu = ww_get_main_menu();
+	g_active_menu->props.selected = 0;
+	if (g_console_enabled) {
+		ww_init_debug_console();
+		ww_clear_debug_console();
+		consoleSelect(&g_header_console);
+		printf("WearWalker Bridge Test v%s\n", VER);
+		consoleSelect(&logs);
+	}
+	printf("UI mode: %s\n", g_simple_mode ? "Simple" : "Debug");
 	g_pending_steps = wearwalker_wifi_menu_entries[WW_MENU_CMD_STEPS_VALUE].num_attr.value;
 	g_pending_watts = wearwalker_wifi_menu_entries[WW_MENU_CMD_WATTS_VALUE].num_attr.value;
 	g_pending_sync = wearwalker_wifi_menu_entries[WW_MENU_CMD_SYNC_VALUE].num_attr.value;
 	snprintf(g_pending_trainer, sizeof(g_pending_trainer), "%s", g_wearwalker_trainer);
-	g_selected_hgss_save_path[0] = '\0';
-	g_selected_hgss_nds_path[0] = '\0';
 	g_pending_save_path[0] = '\0';
 	g_pending_nds_path[0] = '\0';
 	g_pending_hgss_steps = hgss_patch_menu_entries[HGSS_MENU_MANUAL_STEPS].num_attr.value;
@@ -3511,6 +4070,7 @@ void ui_init()
 	g_pending_send_box = hgss_stroll_send_menu_entries[SEND_MENU_BOX].num_attr.value;
 	g_pending_send_slot = hgss_stroll_send_menu_entries[SEND_MENU_SLOT].num_attr.value;
 	g_pending_send_course = hgss_stroll_send_menu_entries[SEND_MENU_ROUTE].num_attr.value;
+	g_route_selector_course = g_pending_send_course;
 	g_pending_send_allow_locked = hgss_stroll_send_menu_entries[SEND_MENU_ALLOW_LOCKED].num_attr.value != 0;
 	g_pending_send_clear_buffers = hgss_stroll_send_menu_entries[SEND_MENU_CLEAR_BUFFERS].num_attr.value != 0;
 	g_pending_return_box = hgss_stroll_return_menu_entries[RETURN_MENU_BOX].num_attr.value;
@@ -3526,12 +4086,14 @@ void ui_init()
 	snprintf(g_browser_cwd, sizeof(g_browser_cwd), "sdmc:/");
 	g_browser_filter = WW_BROWSER_FILTER_SAV;
 
+	target_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
 	target = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 	textbuf = C2D_TextBufNew(256);
 }
 
 void ui_exit()
 {
+	ww_save_ui_config();
 	ww_async_shutdown();
 
 	C2D_TextBufDelete(textbuf);
@@ -3551,6 +4113,28 @@ void draw_string(float x, float y, float size, const char *str, bool centered, i
 	x = x < 0 ? SCREEN_WIDTH - text.width * scale + x : x;
 	C2D_TextOptimize(&text);
 	C2D_DrawText(&text, C2D_WithColor | flags, x, y, 0.0f, scale, scale, COLOR_TEXT);
+}
+
+static void ww_draw_string_width(
+		float x,
+		float y,
+		float size,
+		const char *str,
+		bool centered,
+		int flags,
+		float viewport_width,
+		u32 color)
+{
+	C2D_Text text;
+	float scale;
+
+	C2D_TextBufClear(textbuf);
+	C2D_TextParse(&text, textbuf, str);
+	scale = size / 30;
+	x = centered ? (viewport_width - text.width * scale) / 2 : x;
+	x = x < 0 ? viewport_width - text.width * scale + x : x;
+	C2D_TextOptimize(&text);
+	C2D_DrawText(&text, C2D_WithColor | flags, x, y, 0.0f, scale, scale, color);
 }
 
 void draw_top(const char *str)
@@ -3698,6 +4282,783 @@ void draw_file_browser(void)
 	draw_string(0, 210, 9, "A: open/select  B: up/back  START: exit", true, 0);
 }
 
+static bool ww_box_selector_reload(void)
+{
+	u32 slot_index;
+	char slot_error[96];
+	hgss_stroll_send_context context;
+
+	if (!g_pending_save_path[0]) {
+		g_box_picker_reload_ok = false;
+		snprintf(g_box_picker_error, sizeof(g_box_picker_error), "Select a HGSS save first");
+		for (slot_index = 0; slot_index < HGSS_BOX_SLOTS; slot_index++) {
+			memset(&g_box_picker_slots[slot_index], 0, sizeof(g_box_picker_slots[slot_index]));
+			g_box_picker_context_valid[slot_index] = false;
+		}
+		return false;
+	}
+
+	g_box_picker_reload_ok = true;
+	g_box_picker_error[0] = '\0';
+	g_box_picker_sprite_species = 0xFFFF;
+	g_box_picker_sprite_ready = false;
+
+	for (slot_index = 0; slot_index < HGSS_BOX_SLOTS; slot_index++) {
+		if (hgss_read_stroll_send_context(
+					g_pending_save_path,
+					(u8)g_box_picker_box,
+					(u8)(slot_index + 1),
+					&context,
+					slot_error,
+					sizeof(slot_error))) {
+			g_box_picker_slots[slot_index] = context.source_slot;
+			g_box_picker_context[slot_index] = context;
+			g_box_picker_context_valid[slot_index] = true;
+			continue;
+		}
+
+		g_box_picker_context_valid[slot_index] = false;
+		if (!hgss_read_box_slot_summary(
+						g_pending_save_path,
+						(u8)g_box_picker_box,
+						(u8)(slot_index + 1),
+						&g_box_picker_slots[slot_index],
+						slot_error,
+						sizeof(slot_error))) {
+			g_box_picker_reload_ok = false;
+			memset(&g_box_picker_slots[slot_index], 0, sizeof(g_box_picker_slots[slot_index]));
+		}
+	}
+
+	if (!g_box_picker_reload_ok)
+		snprintf(g_box_picker_error, sizeof(g_box_picker_error), "Unable to inspect one or more slots");
+
+	return g_box_picker_reload_ok;
+}
+
+static bool ww_box_selector_open(ww_box_picker_mode mode)
+{
+	if (!ww_prepare_selected_save_path())
+		return false;
+
+	g_box_picker_mode = mode;
+
+	if (mode == WW_BOX_PICKER_SEND_SOURCE) {
+		g_box_picker_box = hgss_stroll_send_menu_entries[SEND_MENU_BOX].num_attr.value;
+		g_box_picker_slot = hgss_stroll_send_menu_entries[SEND_MENU_SLOT].num_attr.value;
+	} else if (mode == WW_BOX_PICKER_RETURN_SOURCE) {
+		g_box_picker_box = hgss_stroll_return_menu_entries[RETURN_MENU_BOX].num_attr.value;
+		g_box_picker_slot = hgss_stroll_return_menu_entries[RETURN_MENU_SOURCE_SLOT].num_attr.value;
+	}
+
+	if (g_box_picker_box < 1 || g_box_picker_box > HGSS_BOX_COUNT)
+		g_box_picker_box = 1;
+	if (g_box_picker_slot < 1 || g_box_picker_slot > HGSS_BOX_SLOTS)
+		g_box_picker_slot = 1;
+
+	ww_box_selector_reload();
+	g_state = IN_BOX_SELECTOR;
+	return true;
+}
+
+static void ww_box_selector_apply_choice(void)
+{
+	if (g_box_picker_mode == WW_BOX_PICKER_SEND_SOURCE) {
+		hgss_stroll_send_menu_entries[SEND_MENU_BOX].num_attr.value = g_box_picker_box;
+		hgss_stroll_send_menu_entries[SEND_MENU_SLOT].num_attr.value = g_box_picker_slot;
+		g_pending_send_box = g_box_picker_box;
+		g_pending_send_slot = g_box_picker_slot;
+	} else if (g_box_picker_mode == WW_BOX_PICKER_RETURN_SOURCE) {
+		hgss_stroll_return_menu_entries[RETURN_MENU_BOX].num_attr.value = g_box_picker_box;
+		hgss_stroll_return_menu_entries[RETURN_MENU_SOURCE_SLOT].num_attr.value = g_box_picker_slot;
+		g_pending_return_box = g_box_picker_box;
+		g_pending_return_source_slot = g_box_picker_slot;
+	}
+}
+
+static void ww_draw_box_selector(void)
+{
+	const char *title = g_box_picker_mode == WW_BOX_PICKER_SEND_SOURCE ? "Select source slot (Send)" : "Select source slot (Return)";
+	const float origin_x = 10.0f;
+	const float origin_y = 56.0f;
+	const float cell_w = 49.0f;
+	const float cell_h = 30.0f;
+	u32 row;
+	u32 col;
+	char info[96];
+
+	draw_top(title);
+	snprintf(info, sizeof(info), "Box %lu / %u", (unsigned long)g_box_picker_box, (unsigned)HGSS_BOX_COUNT);
+	draw_string(8, 34, 11, info, false, 0);
+
+	for (row = 0; row < 5; row++) {
+		for (col = 0; col < 6; col++) {
+			u32 index = row * 6 + col;
+			u32 slot = index + 1;
+			bool selected = slot == g_box_picker_slot;
+			bool occupied = g_box_picker_slots[index].occupied && g_box_picker_slots[index].species_id != 0;
+			u32 bg = selected
+					? COLOR_SEL
+					: (occupied ? C2D_Color32(0x2A, 0x74, 0x3C, 0xFF) : C2D_Color32(0x43, 0x43, 0x43, 0xFF));
+			char slot_label[8];
+
+			C2D_DrawRectSolid(origin_x + cell_w * col, origin_y + cell_h * row, 0.0f, cell_w - 3.0f, cell_h - 3.0f, bg);
+			snprintf(slot_label, sizeof(slot_label), "%02lu", (unsigned long)slot);
+			draw_string(origin_x + cell_w * col + 4.0f, origin_y + cell_h * row + 2.0f, 9, slot_label, false, 0);
+
+			if (occupied) {
+				snprintf(info, sizeof(info), "#%u", (unsigned)g_box_picker_slots[index].species_id);
+				draw_string(origin_x + cell_w * col + 21.0f, origin_y + cell_h * row + 14.0f, 8, info, false, 0);
+			}
+		}
+	}
+
+	if (g_box_picker_reload_ok) {
+		hgss_box_slot_summary *slot = &g_box_picker_slots[g_box_picker_slot - 1];
+		if (slot->occupied && slot->species_id != 0) {
+			const char *species_name = ww_lookup_species_name(slot->species_id);
+			const char *nickname = g_box_picker_context_valid[g_box_picker_slot - 1]
+					? g_box_picker_context[g_box_picker_slot - 1].nickname
+					: "";
+
+			if (nickname && nickname[0]) {
+				snprintf(
+						info,
+						sizeof(info),
+						"Slot %lu: %s (%s) lv~%u",
+						(unsigned long)g_box_picker_slot,
+						nickname,
+						species_name,
+						(unsigned)ww_estimate_level_from_exp(slot->exp));
+			} else {
+				snprintf(
+						info,
+						sizeof(info),
+						"Slot %lu: %s lv~%u",
+						(unsigned long)g_box_picker_slot,
+						species_name,
+						(unsigned)ww_estimate_level_from_exp(slot->exp));
+			}
+		} else {
+			snprintf(info, sizeof(info), "Slot %lu: empty", (unsigned long)g_box_picker_slot);
+		}
+		draw_string(0, 212, 9, info, true, 0);
+	} else {
+		draw_string(0, 212, 9, g_box_picker_error[0] ? g_box_picker_error : "Could not read slots", true, 0);
+	}
+
+	draw_string(0, 226, 8, "A: choose  B: cancel  L/R: change box", true, 0);
+}
+
+static void ww_draw_2bpp_sprite(
+		const u8 *sprite,
+		u32 width,
+		u32 height,
+		float x,
+		float y,
+		float scale,
+		bool transparent_zero)
+{
+	u32 shade_colors[4];
+	u32 py;
+	u32 blocks_y;
+	u32 expected_bytes;
+
+	shade_colors[0] = C2D_Color32(0xEC, 0xF4, 0xF5, 0xFF);
+	shade_colors[1] = C2D_Color32(0xBE, 0xCF, 0xD2, 0xFF);
+	shade_colors[2] = C2D_Color32(0x67, 0x7E, 0x83, 0xFF);
+	shade_colors[3] = C2D_Color32(0x20, 0x2D, 0x31, 0xFF);
+
+	if (!sprite || width == 0 || height == 0)
+		return;
+
+	blocks_y = (height + 7u) / 8u;
+	expected_bytes = width * blocks_y * 2u;
+
+	for (py = 0; py < height; py++) {
+		u32 px = 0;
+		u32 block_y = py >> 3;
+		u32 bit_y = py & 0x7u;
+
+		while (px < width) {
+			u8 shade;
+			u32 run_start = px;
+			u32 entry_index = block_y * width + px;
+			u32 byte_index = entry_index * 2u;
+			u16 column_word;
+
+			if (byte_index + 1u >= expected_bytes)
+				return;
+
+			column_word = (u16)sprite[byte_index] | ((u16)sprite[byte_index + 1u] << 8);
+			shade = (u8)(((column_word >> bit_y) & 0x1u) | (((column_word >> (bit_y + 8u)) & 0x1u) << 1u));
+
+			if (transparent_zero && shade == 0) {
+				px++;
+				continue;
+			}
+
+			px++;
+			while (px < width) {
+				u8 next_shade;
+				u32 next_entry = block_y * width + px;
+				u32 next_byte_index = next_entry * 2u;
+				u16 next_word;
+
+				if (next_byte_index + 1u >= expected_bytes)
+					return;
+
+				next_word = (u16)sprite[next_byte_index] | ((u16)sprite[next_byte_index + 1u] << 8);
+				next_shade = (u8)(((next_word >> bit_y) & 0x1u) | (((next_word >> (bit_y + 8u)) & 0x1u) << 1u));
+
+				if (transparent_zero && next_shade == 0)
+					break;
+				if (next_shade != shade)
+					break;
+
+				px++;
+			}
+
+			C2D_DrawRectSolid(
+					x + (float)run_start * scale,
+					y + (float)py * scale,
+					0.0f,
+					(float)(px - run_start) * scale,
+					scale,
+					shade_colors[shade]);
+		}
+	}
+}
+
+static void ww_draw_item_token_sprite(u16 item_id, float x, float y, float scale)
+{
+	u8 token[16];
+	u32 px;
+
+	memset(token, 0, sizeof(token));
+
+	for (px = 0; px < 8; px++) {
+		u16 column_word = 0;
+		u32 py;
+
+		for (py = 0; py < 8; py++) {
+			u8 shade;
+
+			if (px == 0 || px == 7 || py == 0 || py == 7) {
+				shade = 3;
+			} else {
+				u32 bit = ((u32)item_id >> ((px + py * 3u) & 0x0Fu)) & 0x1u;
+				shade = bit ? 2 : 1;
+			}
+
+			if (shade & 0x1u)
+				column_word |= (u16)(1u << py);
+			if (shade & 0x2u)
+				column_word |= (u16)(1u << (py + 8u));
+		}
+
+		token[px * 2u] = (u8)(column_word & 0xFFu);
+		token[px * 2u + 1u] = (u8)(column_word >> 8);
+	}
+
+	ww_draw_2bpp_sprite(token, 8, 8, x, y, scale, false);
+}
+
+static bool ww_route_selector_reload(void)
+{
+	u8 course_table[WW_OV112_COURSE_TABLE_SIZE];
+	const u8 *record;
+	u8 *small_narc_data = NULL;
+	u32 small_narc_size = 0;
+	u32 route_plus_one;
+	u32 route_image_index;
+	u32 slot_index;
+	u32 group;
+	u32 item_index;
+	u32 preview_seed;
+	s32 watts_required;
+
+	g_route_selector_ready = false;
+	g_route_selector_error[0] = '\0';
+	g_route_preview_area_ready = false;
+	g_route_selector_locked = false;
+	g_route_selector_special_lock = false;
+	g_route_selector_required_watts = 0;
+	g_route_selector_current_watts = g_guided_send_context.pokewalker_watts;
+	g_route_send_busy = false;
+	g_route_selector_preview_seed = 0;
+
+	for (slot_index = 0; slot_index < WW_ROUTE_PREVIEW_SLOT_COUNT; slot_index++)
+		g_route_preview_selected_group[slot_index] = -1;
+	for (group = 0; group < WW_ROUTE_SELECTED_SLOT_COUNT; group++)
+		g_route_preview_selected_slots[group] = (u8)(group * 2u);
+
+	if (!g_guided_send_context_ready) {
+		snprintf(g_route_selector_error, sizeof(g_route_selector_error), "Select a Pokemon first");
+		return false;
+	}
+
+	if (!ww_prepare_selected_nds_path()) {
+		snprintf(g_route_selector_error, sizeof(g_route_selector_error), "Set HGSS ROM in Settings");
+		return false;
+	}
+
+	if (g_route_selector_course >= WW_OV112_COURSE_COUNT)
+		g_route_selector_course = 0;
+
+	watts_required = g_route_course_watts_required[g_route_selector_course];
+	g_route_selector_special_lock = watts_required < 0;
+	if (!g_route_selector_special_lock)
+		g_route_selector_required_watts = watts_required;
+	g_route_selector_locked = g_route_selector_special_lock
+			|| (!g_route_selector_special_lock && (u32)g_route_selector_required_watts > g_route_selector_current_watts);
+
+	if (!ww_get_course_table_cached(g_pending_nds_path, course_table, NULL)) {
+		snprintf(g_route_selector_error, sizeof(g_route_selector_error), "Unable to read route table from ROM");
+		return false;
+	}
+
+	record = course_table + g_route_selector_course * WW_OV112_COURSE_RECORD_SIZE;
+	route_plus_one = ww_read_u32_le(record + 0x04);
+	if (route_plus_one > 0 && route_plus_one <= WW_OV112_ROUTE_IMAGE_COUNT) {
+		route_image_index = route_plus_one - 1u;
+	} else {
+		u32 route_plus_one_low = route_plus_one & 0xFFu;
+
+		if (route_plus_one_low > 0 && route_plus_one_low <= WW_OV112_ROUTE_IMAGE_COUNT)
+			route_image_index = route_plus_one_low - 1u;
+		else if (g_route_selector_course < WW_OV112_ROUTE_IMAGE_COUNT)
+			route_image_index = g_route_selector_course;
+		else
+			route_image_index = g_route_selector_course % WW_OV112_ROUTE_IMAGE_COUNT;
+	}
+
+	g_route_preview_area_ready = ww_extract_route_area_sprite_from_nds(
+			g_pending_nds_path,
+			route_image_index,
+			g_route_preview_area_sprite);
+
+	g_route_preview_adv_types[0] = record[WW_OV112_ADV_TYPES_OFFSET + 0u];
+	g_route_preview_adv_types[1] = record[WW_OV112_ADV_TYPES_OFFSET + 1u];
+	g_route_preview_adv_types[2] = record[WW_OV112_ADV_TYPES_OFFSET + 2u];
+
+	ww_load_narc_from_nds(g_pending_nds_path, "a/2/4/8", &small_narc_data, &small_narc_size);
+
+	for (slot_index = 0; slot_index < WW_ROUTE_PREVIEW_SLOT_COUNT; slot_index++) {
+		u32 base = WW_OV112_SLOT_OFFSET + slot_index * WW_OV112_SLOT_SIZE;
+		u16 species_id = ww_read_u16_le(record + base + 0x00);
+		u8 level = record[base + 0x02];
+		u16 move0 = ww_read_u16_le(record + base + 0x08);
+		u16 move1 = ww_read_u16_le(record + base + 0x0A);
+		u16 move2 = ww_read_u16_le(record + base + 0x0C);
+		u16 move3 = ww_read_u16_le(record + base + 0x0E);
+		u16 min_steps = ww_read_u16_le(record + base + 0x10);
+		u16 chance_raw = ww_read_u16_le(record + base + 0x12);
+		u8 chance = chance_raw > 100 ? 100 : (u8)chance_raw;
+
+		g_route_preview_slots[slot_index].species_id = species_id;
+		g_route_preview_slots[slot_index].level = level == 0 ? 1 : (level > 100 ? 100 : level);
+		g_route_preview_slots[slot_index].min_steps = min_steps;
+		g_route_preview_slots[slot_index].chance = chance;
+		g_route_preview_slots[slot_index].moves[0] = move0;
+		g_route_preview_slots[slot_index].moves[1] = move1;
+		g_route_preview_slots[slot_index].moves[2] = move2;
+		g_route_preview_slots[slot_index].moves[3] = move3;
+		snprintf(
+				g_route_preview_slots[slot_index].species_name,
+				sizeof(g_route_preview_slots[slot_index].species_name),
+				"%s",
+				ww_lookup_species_name(species_id));
+		g_route_preview_slots[slot_index].sprite_ready = false;
+		memset(
+				g_route_preview_slots[slot_index].sprite_frame0,
+				0,
+				sizeof(g_route_preview_slots[slot_index].sprite_frame0));
+
+		if (small_narc_data && species_id > 0) {
+			u8 small1[WW_OV112_ROUTE_IMAGE_SIZE];
+
+			if (ww_extract_species_small_frames(
+						small_narc_data,
+						small_narc_size,
+						species_id,
+						g_route_preview_slots[slot_index].sprite_frame0,
+						small1)) {
+				ww_remap_sprite_2bpp_contrast(
+						g_route_preview_slots[slot_index].sprite_frame0,
+						sizeof(g_route_preview_slots[slot_index].sprite_frame0));
+				g_route_preview_slots[slot_index].sprite_ready = true;
+			}
+		}
+	}
+
+	preview_seed = g_route_selector_session_seed;
+	preview_seed ^= (g_route_selector_course + 1u) * 2654435761u;
+	preview_seed ^= ((u32)g_guided_send_context.source_slot.species_id << 16);
+	preview_seed ^= g_guided_send_context.source_slot.exp;
+	if (preview_seed == 0)
+		preview_seed = 0xA5A55A5Au;
+	g_route_selector_preview_seed = preview_seed;
+
+	for (group = 0; group < WW_ROUTE_SELECTED_SLOT_COUNT; group++) {
+		u32 pair_base = group * 2u;
+		u32 pick = ww_lcg_pair_pick(&preview_seed);
+		u32 selected_slot = pair_base + pick;
+		u32 alt_slot = pair_base + (pick ^ 0x1u);
+
+		if (g_route_preview_slots[selected_slot].species_id == 0
+				&& g_route_preview_slots[alt_slot].species_id != 0)
+			selected_slot = alt_slot;
+
+		g_route_preview_selected_slots[group] = (u8)selected_slot;
+		g_route_preview_selected_group[selected_slot] = (s8)group;
+	}
+
+	for (item_index = 0; item_index < WW_OV112_ITEM_COUNT; item_index++) {
+		u32 base = WW_OV112_ITEMS_OFFSET + item_index * WW_OV112_ITEM_SIZE;
+		u16 item_id = ww_read_u16_le(record + base + 0x00);
+		u16 min_steps = ww_read_u16_le(record + base + 0x02);
+		u16 chance_raw = ww_read_u16_le(record + base + 0x04);
+		u8 chance = chance_raw > 100 ? 100 : (u8)chance_raw;
+
+		g_route_preview_items[item_index].item_id = item_id;
+		g_route_preview_items[item_index].min_steps = min_steps;
+		g_route_preview_items[item_index].chance = chance;
+		snprintf(
+				g_route_preview_items[item_index].item_name,
+				sizeof(g_route_preview_items[item_index].item_name),
+				"%s",
+				ww_lookup_item_name(item_id));
+	}
+
+	if (small_narc_data)
+		free(small_narc_data);
+
+	g_route_selector_ready = true;
+	return true;
+}
+
+static bool ww_route_selector_open(void)
+{
+	char context_error[128];
+
+	if (!ww_prepare_selected_save_path())
+		return false;
+	if (!ww_prepare_selected_nds_path())
+		return false;
+
+	if (!hgss_read_stroll_send_context(
+					g_pending_save_path,
+					(u8)g_pending_send_box,
+					(u8)g_pending_send_slot,
+					&g_guided_send_context,
+					context_error,
+					sizeof(context_error))) {
+		printf("%s\n", context_error[0] ? context_error : "failed reading source slot context");
+		return false;
+	}
+
+	if (!g_guided_send_context.source_slot.occupied || g_guided_send_context.source_slot.species_id == 0) {
+		printf("Selected source slot is empty\n");
+		return false;
+	}
+
+	g_guided_send_context_ready = true;
+	g_route_send_busy = false;
+	g_pending_send_route_seed_valid = false;
+	g_route_selector_session_seed = (u32)(svcGetSystemTick() & 0xFFFFFFFFu);
+	g_route_selector_session_seed ^= (u32)osGetTime();
+	g_route_selector_session_seed ^= g_ui_anim_tick * 3266489917u;
+	if (g_route_selector_session_seed == 0)
+		g_route_selector_session_seed = 0x6D2B79F5u;
+	if (!ww_route_selector_reload()) {
+		printf("Route preview unavailable: %s\n", g_route_selector_error[0] ? g_route_selector_error : "unknown error");
+	}
+
+	g_state = IN_ROUTE_SELECTOR;
+	return true;
+}
+
+static void ww_draw_route_selector(void)
+{
+	char title[80];
+	char line[192];
+	char progress_label[48];
+	const char *course_name;
+	const char *type0_name;
+	const char *type1_name;
+	const char *type2_name;
+	const char *selected_species_name;
+	u8 selected_level;
+	u8 type0 = g_route_preview_adv_types[0] < 18 ? g_route_preview_adv_types[0] : 17;
+	u8 type1 = g_route_preview_adv_types[1] < 18 ? g_route_preview_adv_types[1] : 17;
+	u8 type2 = g_route_preview_adv_types[2] < 18 ? g_route_preview_adv_types[2] : 17;
+	u32 progress_pct = 0;
+	u32 exp_bar_pct;
+
+	snprintf(
+			title,
+			sizeof(title),
+			"Route %lu details",
+			(unsigned long)(g_route_selector_course + 1));
+	draw_top(title);
+
+	if (!g_route_selector_ready) {
+		draw_string(0, 108, 12, g_route_selector_error[0] ? g_route_selector_error : "Route preview unavailable", true, 0);
+		draw_string(0, 224, 8, "DPad left/right route  A send  B back", true, 0);
+		return;
+	}
+
+	course_name = g_route_course_names[g_route_selector_course];
+	type0_name = g_type_names[type0];
+	type1_name = g_type_names[type1];
+	type2_name = g_type_names[type2];
+	selected_species_name = ww_lookup_species_name(g_guided_send_context.source_slot.species_id);
+	selected_level = ww_estimate_level_from_exp(g_guided_send_context.source_slot.exp);
+	{
+		u64 level_floor = (u64)selected_level * (u64)selected_level * (u64)selected_level;
+		u64 level_next = selected_level >= 100
+				? level_floor
+				: (u64)(selected_level + 1) * (u64)(selected_level + 1) * (u64)(selected_level + 1);
+		u32 level_span = level_next > level_floor ? (u32)(level_next - level_floor) : 1u;
+		u32 level_prog = (u32)(g_guided_send_context.source_slot.exp > level_floor
+				? ((u64)g_guided_send_context.source_slot.exp - level_floor)
+				: 0u);
+
+		exp_bar_pct = selected_level >= 100 ? 100u : (level_prog >= level_span ? 100u : (level_prog * 100u) / level_span);
+	}
+
+	C2D_DrawRectSolid(8.0f, 36.0f, 0.0f, 304.0f, 174.0f, C2D_Color32(0x14, 0x34, 0x3E, 0xFF));
+	C2D_DrawRectSolid(16.0f, 52.0f, 0.0f, 96.0f, 84.0f, C2D_Color32(0x1D, 0x45, 0x52, 0xFF));
+
+	if (g_route_preview_area_ready)
+		ww_draw_2bpp_sprite(g_route_preview_area_sprite, 32, 24, 22.0f, 58.0f, 2.25f, true);
+	else
+		draw_string(22.0f, 88.0f, 8.5f, "No area", false, 0);
+
+	snprintf(line, sizeof(line), "Route %lu: %.24s", (unsigned long)(g_route_selector_course + 1), course_name);
+	draw_string(118.0f, 54.0f, 10.5f, line, false, 0);
+	snprintf(line, sizeof(line), "Watts: %lu", (unsigned long)g_route_selector_current_watts);
+	draw_string(118.0f, 74.0f, 10.0f, line, false, 0);
+
+	if (g_route_selector_special_lock) {
+		draw_string(118.0f, 94.0f, 8.8f, "Status: LOCKED (special/event)", false, 0);
+	} else if (g_route_selector_locked) {
+		snprintf(line, sizeof(line), "Status: LOCKED (need %ldW)", (long)g_route_selector_required_watts);
+		draw_string(118.0f, 94.0f, 8.8f, line, false, 0);
+	} else {
+		snprintf(line, sizeof(line), "Status: UNLOCKED (%ldW)", (long)g_route_selector_required_watts);
+		draw_string(118.0f, 94.0f, 8.8f, line, false, 0);
+	}
+
+	draw_string(118.0f, 112.0f, 8.8f, "Types with advantage:", false, 0);
+	snprintf(line, sizeof(line), "%.10s / %.10s / %.10s", type0_name, type1_name, type2_name);
+	draw_string(118.0f, 126.0f, 8.8f, line, false, 0);
+
+	snprintf(
+			line,
+			sizeof(line),
+			"Selected: %.14s Lv~%u  Friendship %u",
+			selected_species_name,
+			(unsigned)selected_level,
+			(unsigned)g_guided_send_context.source_slot.friendship);
+	draw_string(118.0f, 142.0f, 8.1f, line, false, 0);
+	snprintf(line, sizeof(line), "EXP %lu", (unsigned long)g_guided_send_context.source_slot.exp);
+	draw_string(118.0f, 156.0f, 8.1f, line, false, 0);
+	C2D_DrawRectSolid(118.0f, 170.0f, 0.0f, 180.0f, 8.0f, C2D_Color32(0x2B, 0x46, 0x4C, 0xFF));
+	C2D_DrawRectSolid(118.0f, 170.0f, 0.0f, (180.0f * (float)exp_bar_pct) / 100.0f, 8.0f, C2D_Color32(0x6D, 0xC1, 0x8D, 0xFF));
+	snprintf(line, sizeof(line), "%u%% to next level", (unsigned)exp_bar_pct);
+	draw_string(118.0f, 182.0f, 7.6f, line, false, 0);
+
+	if (g_route_send_busy) {
+		ww_async_progress_get(&progress_pct, progress_label, sizeof(progress_label));
+
+		C2D_DrawRectSolid(14.0f, 150.0f, 0.0f, 292.0f, 52.0f, C2D_Color32(0x20, 0x4B, 0x59, 0xEE));
+		draw_string(0.0f, 154.0f, 9.5f, "Sending to Pokewalker", true, 0);
+		snprintf(line, sizeof(line), "%s (%lu%%)", progress_label, (unsigned long)progress_pct);
+		draw_string(0.0f, 168.0f, 8.6f, line, true, 0);
+		draw_string(0.0f, 184.0f, 8.4f, "Please wait...", true, 0);
+	} else {
+		draw_string(0, 224, 8, "DPad left/right route  A send  B back", true, 0);
+	}
+
+	return;
+}
+
+static void ww_draw_simple_top_panel(void)
+{
+	char line[128];
+	u32 i;
+
+	C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, 240, C2D_Color32(0x10, 0x25, 0x2C, 0xFF));
+	if (g_state == IN_ROUTE_SELECTOR) {
+		C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, 8, C2D_Color32(0x17, 0x4A, 0x57, 0xFF));
+	} else {
+		C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, 18, C2D_Color32(0x17, 0x4A, 0x57, 0xFF));
+		ww_draw_string_width(8, 3, 8, "Simple", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+	}
+
+	if (g_state == IN_BOX_SELECTOR) {
+		hgss_box_slot_summary *slot = &g_box_picker_slots[g_box_picker_slot - 1];
+		const char *species_name = ww_lookup_species_name(slot->species_id);
+		const char *nickname = g_box_picker_context_valid[g_box_picker_slot - 1]
+				? g_box_picker_context[g_box_picker_slot - 1].nickname
+				: "";
+
+		if (slot->occupied && slot->species_id != 0 && g_box_picker_sprite_species != slot->species_id) {
+			u8 *small_narc_data = NULL;
+			u32 small_narc_size = 0;
+			u8 frame1[WW_OV112_ROUTE_IMAGE_SIZE];
+
+			g_box_picker_sprite_ready = false;
+			g_box_picker_sprite_species = slot->species_id;
+
+			if (g_selected_hgss_nds_path[0]
+					&& ww_load_narc_from_nds(g_selected_hgss_nds_path, "a/2/4/8", &small_narc_data, &small_narc_size)
+					&& ww_extract_species_small_frames(
+							small_narc_data,
+							small_narc_size,
+							slot->species_id,
+							g_box_picker_sprite,
+							frame1)) {
+				ww_remap_sprite_2bpp_contrast(g_box_picker_sprite, sizeof(g_box_picker_sprite));
+				g_box_picker_sprite_ready = true;
+			}
+
+			if (small_narc_data)
+				free(small_narc_data);
+		}
+
+		C2D_DrawRectSolid(12, 40, 0, 140, 188, C2D_Color32(0x13, 0x34, 0x3F, 0xFF));
+		if (g_box_picker_sprite_ready)
+			ww_draw_2bpp_sprite(g_box_picker_sprite, 32, 24, 24.0f, 60.0f, 3.4f, true);
+
+		snprintf(line, sizeof(line), "Box %lu Slot %lu", (unsigned long)g_box_picker_box, (unsigned long)g_box_picker_slot);
+		ww_draw_string_width(170, 50, 12, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+
+		if (slot->occupied && slot->species_id != 0) {
+			u8 level_est = ww_estimate_level_from_exp(slot->exp);
+			u64 level_floor = (u64)level_est * (u64)level_est * (u64)level_est;
+			u64 level_next = level_est >= 100
+					? level_floor
+					: (u64)(level_est + 1) * (u64)(level_est + 1) * (u64)(level_est + 1);
+			u32 level_span = level_next > level_floor ? (u32)(level_next - level_floor) : 1u;
+			u32 level_prog = (u32)(slot->exp > level_floor ? ((u64)slot->exp - level_floor) : 0u);
+			u32 exp_bar_pct = level_est >= 100 ? 100u : (level_prog >= level_span ? 100u : (level_prog * 100u) / level_span);
+
+			snprintf(line, sizeof(line), "%s", species_name);
+			ww_draw_string_width(170, 76, 12, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+
+			snprintf(line, sizeof(line), "Nickname: %s", (nickname && nickname[0]) ? nickname : "(none)");
+			ww_draw_string_width(170, 98, 10, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+
+			snprintf(line, sizeof(line), "Lv~%u  Friendship %u", (unsigned)level_est, (unsigned)slot->friendship);
+			ww_draw_string_width(170, 116, 10, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+
+			snprintf(line, sizeof(line), "EXP %lu", (unsigned long)slot->exp);
+			ww_draw_string_width(170, 134, 9, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			C2D_DrawRectSolid(170.0f, 148.0f, 0.0f, 170.0f, 8.0f, C2D_Color32(0x2B, 0x46, 0x4C, 0xFF));
+			C2D_DrawRectSolid(170.0f, 148.0f, 0.0f, (170.0f * (float)exp_bar_pct) / 100.0f, 8.0f, C2D_Color32(0x6D, 0xC1, 0x8D, 0xFF));
+			snprintf(line, sizeof(line), "%u%% to next level", (unsigned)exp_bar_pct);
+			ww_draw_string_width(170, 160, 8, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		} else {
+			ww_draw_string_width(170, 90, 12, "Empty slot", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		}
+
+		ww_draw_string_width(170, 186, 9, "A select  B back  L/R box", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		return;
+	}
+
+	if (g_state == IN_ROUTE_SELECTOR) {
+		u32 slot_index;
+		u32 progress_pct = 0;
+		char progress_label[48];
+
+		if (g_route_send_busy) {
+			u32 dot_count = (g_ui_anim_tick / 16u) % 4u;
+			char dots[5];
+
+			ww_async_progress_get(&progress_pct, progress_label, sizeof(progress_label));
+
+			for (i = 0; i < sizeof(dots) - 1; i++)
+				dots[i] = (i < dot_count) ? '.' : '\0';
+			dots[sizeof(dots) - 1] = '\0';
+
+			C2D_DrawRectSolid(12, 40, 0, 376, 188, C2D_Color32(0x13, 0x34, 0x3F, 0xFF));
+			snprintf(line, sizeof(line), "Sending Pokemon%s", dots);
+			ww_draw_string_width(0, 84, 21, line, true, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			snprintf(line, sizeof(line), "%s (%lu%%)", progress_label, (unsigned long)progress_pct);
+			ww_draw_string_width(0, 116, 13, line, true, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			C2D_DrawRectSolid(44.0f, 142.0f, 0.0f, 312.0f, 18.0f, C2D_Color32(0x2B, 0x46, 0x4C, 0xFF));
+			C2D_DrawRectSolid(44.0f, 142.0f, 0.0f, (312.0f * (float)progress_pct) / 100.0f, 18.0f, C2D_Color32(0x6D, 0xC1, 0x8D, 0xFF));
+			ww_draw_string_width(0, 172, 10.5f, "Returning to menu after completion", true, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			return;
+		}
+
+		C2D_DrawRectSolid(6, 6, 0, 388, 228, C2D_Color32(0x13, 0x34, 0x3F, 0xFF));
+		ww_draw_string_width(12, 8, 10.4f, "Encounter Pokemon (6)", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+
+		for (slot_index = 0; slot_index < WW_ROUTE_PREVIEW_SLOT_COUNT; slot_index++) {
+			u32 row = slot_index / 3u;
+			u32 col = slot_index % 3u;
+			float x = 8.0f + (float)col * 130.0f;
+			float y = 20.0f + (float)row * 64.0f;
+			u32 row_color = g_route_preview_selected_group[slot_index] >= 0
+					? C2D_Color32(0x2A, 0x64, 0x52, 0xFF)
+					: C2D_Color32(0x1A, 0x44, 0x50, 0xFF);
+
+			C2D_DrawRectSolid(x, y, 0.0f, 126.0f, 58.0f, row_color);
+			if (g_route_preview_slots[slot_index].sprite_ready)
+				ww_draw_2bpp_sprite(g_route_preview_slots[slot_index].sprite_frame0, 32, 24, x + 3.0f, y + 5.0f, 1.32f, true);
+
+			snprintf(
+					line,
+					sizeof(line),
+					"%lu. %.11s",
+					(unsigned long)(slot_index + 1),
+					g_route_preview_slots[slot_index].species_name);
+			ww_draw_string_width(x + 50.0f, y + 7.0f, 8.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+
+			snprintf(
+					line,
+					sizeof(line),
+					"%u%% | %u steps",
+					(unsigned)g_route_preview_slots[slot_index].chance,
+					(unsigned)g_route_preview_slots[slot_index].min_steps);
+			ww_draw_string_width(x + 50.0f, y + 25.0f, 7.9f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		}
+
+		ww_draw_string_width(12, 149, 10.6f, "Route Items (10)", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		for (i = 0; i < WW_OV112_ITEM_COUNT; i++) {
+			u32 row = i / 5u;
+			u32 col = i % 5u;
+			float x = 8.0f + (float)col * 77.0f;
+			float y = 162.0f + (float)row * 36.0f;
+
+			C2D_DrawRectSolid(x, y, 0.0f, 74.0f, 34.0f, C2D_Color32(0x1A, 0x44, 0x50, 0xFF));
+			ww_draw_item_token_sprite(g_route_preview_items[i].item_id, x + 2.0f, y + 4.0f, 1.45f);
+			snprintf(
+					line,
+					sizeof(line),
+					"%.9s",
+					g_route_preview_items[i].item_name);
+			ww_draw_string_width(x + 19.0f, y + 3.0f, 8.1f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			snprintf(
+					line,
+					sizeof(line),
+					"%u%% | %u st",
+					(unsigned)g_route_preview_items[i].chance,
+					(unsigned)g_route_preview_items[i].min_steps);
+			ww_draw_string_width(x + 19.0f, y + 16.0f, 7.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		}
+
+		return;
+	}
+
+	ww_draw_string_width(12, 52, 11, "Use Send or Return from the main menu.", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+	ww_draw_string_width(12, 74, 10, "Set HGSS save/ROM only in Settings.", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+}
+
 s32 numpad_input(const char *hint_text, u8 digits)
 {
 	char buf[32];
@@ -3781,18 +5142,53 @@ void set_numattr(menu_entry *entry)
 
 void call_set_wearwalker_host()
 {
-	if (text_input("WearWalker IP/host", g_wearwalker_host, sizeof(g_wearwalker_host)))
+	if (text_input("WearWalker IP/host", g_wearwalker_host, sizeof(g_wearwalker_host))) {
 		printf("WearWalker host set to %s\n", g_wearwalker_host);
+		ww_save_ui_config();
+	}
 }
 
 void call_apply_wearwalker_endpoint()
 {
 	u16 port = wearwalker_wifi_menu_entries[WW_MENU_PORT].num_attr.value;
 
-	if (ww_api_set_endpoint(g_wearwalker_host, port))
-		printf("Using WearWalker endpoint %s:%lu\n", g_wearwalker_host, (unsigned long)port);
+	ww_apply_endpoint_from_ui(port);
+}
+
+void call_apply_settings_endpoint()
+{
+	u16 port = settings_menu_entries[SETTINGS_MENU_PORT].num_attr.value;
+
+	ww_apply_endpoint_from_ui(port);
+}
+
+void call_toggle_simple_mode()
+{
+	bool was_console_enabled = g_console_enabled;
+
+	g_simple_mode = !g_simple_mode;
+	g_console_enabled = !g_simple_mode;
+	ww_save_ui_config();
+	if (g_console_enabled)
+		ww_init_debug_console();
+	if (was_console_enabled || g_console_enabled)
+		ww_clear_debug_console();
+	g_active_menu = ww_get_main_menu();
+	g_active_menu->props.selected = 0;
+	if (g_console_enabled && g_debug_console_ready) {
+		consoleSelect(&g_header_console);
+		printf("WearWalker Bridge Test v%s\n", VER);
+		consoleSelect(&logs);
+	}
+	printf("UI mode changed to %s\n", g_simple_mode ? "Simple" : "Debug");
+}
+
+void call_save_ui_config_now()
+{
+	if (ww_save_ui_config())
+		printf("Saved settings to %s\n", WW_UI_CONFIG_PATH);
 	else
-		printf("Invalid WearWalker endpoint\n");
+		printf("Failed to save settings\n");
 }
 
 void call_set_wearwalker_trainer()
@@ -3923,6 +5319,30 @@ void call_show_hgss_rom_path()
 	printf("Selected HGSS ROM: %s\n", g_selected_hgss_nds_path);
 }
 
+void call_start_guided_send(void)
+{
+	if (!ww_box_selector_open(WW_BOX_PICKER_SEND_SOURCE))
+		return;
+
+	printf("Guided send: select a Pokemon from your boxes\n");
+}
+
+void call_pick_stroll_send_slot()
+{
+	if (!ww_box_selector_open(WW_BOX_PICKER_SEND_SOURCE))
+		return;
+
+	printf("Visual picker: select source slot for send\n");
+}
+
+void call_pick_stroll_return_slot()
+{
+	if (!ww_box_selector_open(WW_BOX_PICKER_RETURN_SOURCE))
+		return;
+
+	printf("Visual picker: select source slot for return\n");
+}
+
 static bool ww_prepare_selected_save_path(void)
 {
 	struct stat info;
@@ -3983,6 +5403,51 @@ static bool ww_prepare_hgss_patch_request(void)
 	return true;
 }
 
+static bool ww_compute_simple_return_walked_steps(u32 *out_walked_steps)
+{
+	char *sync_json;
+	hgss_stroll_send_context source_context;
+	char slot_error[128];
+	u32 sync_steps;
+
+	if (!out_walked_steps)
+		return false;
+
+	if (!hgss_read_stroll_send_context(
+					g_pending_save_path,
+					(u8)g_pending_return_box,
+					(u8)g_pending_return_source_slot,
+					&source_context,
+					slot_error,
+					sizeof(slot_error))) {
+		printf("Simple mode: %s\n", slot_error[0] ? slot_error : "failed reading save context");
+		return false;
+	}
+
+	sync_json = (char *)malloc(WW_API_RESPONSE_MAX);
+	if (!sync_json)
+		return false;
+
+	if (!ww_api_get_sync_package(sync_json, WW_API_RESPONSE_MAX)) {
+		free(sync_json);
+		return false;
+	}
+
+	if (!ww_json_get_u32_after_token(sync_json, "\"stats\"", "steps", &sync_steps)) {
+		free(sync_json);
+		return false;
+	}
+
+	free(sync_json);
+
+	if (sync_steps > source_context.pokewalker_steps)
+		*out_walked_steps = sync_steps - source_context.pokewalker_steps;
+	else
+		*out_walked_steps = 0;
+
+	return true;
+}
+
 void call_patch_hgss_manual()
 {
 	if (!ww_prepare_hgss_patch_request())
@@ -4021,15 +5486,12 @@ void call_apply_stroll_send_endpoint()
 {
 	u16 port = hgss_stroll_send_menu_entries[SEND_MENU_PORT].num_attr.value;
 
-	if (ww_api_set_endpoint(g_wearwalker_host, port))
-		printf("Using WearWalker endpoint %s:%lu\n", g_wearwalker_host, (unsigned long)port);
-	else
-		printf("Invalid WearWalker endpoint\n");
+	ww_apply_endpoint_from_ui(port);
 }
 
 void call_show_stroll_send_slot()
 {
-	hgss_box_slot_summary slot;
+	hgss_stroll_send_context context;
 	char error[128];
 	u32 box = hgss_stroll_send_menu_entries[SEND_MENU_BOX].num_attr.value;
 	u32 source_slot = hgss_stroll_send_menu_entries[SEND_MENU_SLOT].num_attr.value;
@@ -4037,12 +5499,12 @@ void call_show_stroll_send_slot()
 	if (!ww_prepare_selected_save_path())
 		return;
 
-	if (!hgss_read_box_slot_summary(g_pending_save_path, (u8)box, (u8)source_slot, &slot, error, sizeof(error))) {
+	if (!hgss_read_stroll_send_context(g_pending_save_path, (u8)box, (u8)source_slot, &context, error, sizeof(error))) {
 		printf("%s\n", error[0] ? error : "failed to read source slot");
 		return;
 	}
 
-	if (!slot.occupied || slot.species_id == 0) {
+	if (!context.source_slot.occupied || context.source_slot.species_id == 0) {
 		printf(
 				"Source box %lu slot %lu is empty (return will try walker-pair restore)\n",
 				(unsigned long)box,
@@ -4051,12 +5513,24 @@ void call_show_stroll_send_slot()
 	}
 
 	printf(
-			"Source box %lu slot %lu | species %u | exp %lu | lv~%u\n",
+			"Source box %lu slot %lu | species %u (%s) | exp %lu | lv~%u\n",
 			(unsigned long)box,
 			(unsigned long)source_slot,
-			(unsigned)slot.species_id,
-			(unsigned long)slot.exp,
-			(unsigned)ww_estimate_level_from_exp(slot.exp));
+			(unsigned)context.source_slot.species_id,
+			ww_lookup_species_name(context.source_slot.species_id),
+			(unsigned long)context.source_slot.exp,
+			(unsigned)ww_estimate_level_from_exp(context.source_slot.exp));
+	printf(
+			"Nickname: %s | Held item id: %u | Friendship: %u\n",
+			context.nickname[0] ? context.nickname : "(none)",
+			(unsigned)context.held_item,
+			(unsigned)context.source_slot.friendship);
+	printf(
+			"Moves: %u, %u, %u, %u\n",
+			(unsigned)context.moves[0],
+			(unsigned)context.moves[1],
+			(unsigned)context.moves[2],
+			(unsigned)context.moves[3]);
 }
 
 void call_stroll_send_from_save()
@@ -4071,14 +5545,32 @@ void call_stroll_send_from_save()
 
 	g_pending_send_box = hgss_stroll_send_menu_entries[SEND_MENU_BOX].num_attr.value;
 	g_pending_send_slot = hgss_stroll_send_menu_entries[SEND_MENU_SLOT].num_attr.value;
-	g_pending_send_course = hgss_stroll_send_menu_entries[SEND_MENU_ROUTE].num_attr.value;
+	if (g_simple_mode)
+		g_pending_send_course = g_route_selector_course;
+	else
+		g_pending_send_course = hgss_stroll_send_menu_entries[SEND_MENU_ROUTE].num_attr.value;
+	if (g_simple_mode && g_state == IN_ROUTE_SELECTOR) {
+		g_pending_send_route_seed = g_route_selector_preview_seed;
+		g_pending_send_route_seed_valid = g_route_selector_preview_seed != 0;
+	} else {
+		g_pending_send_route_seed = 0;
+		g_pending_send_route_seed_valid = false;
+	}
 	g_pending_send_allow_locked = hgss_stroll_send_menu_entries[SEND_MENU_ALLOW_LOCKED].num_attr.value != 0;
 	g_pending_send_clear_buffers = hgss_stroll_send_menu_entries[SEND_MENU_CLEAR_BUFFERS].num_attr.value != 0;
+	if (g_simple_mode) {
+		g_pending_send_allow_locked = false;
+		g_pending_send_clear_buffers = true;
+		hgss_stroll_send_menu_entries[SEND_MENU_ROUTE].num_attr.value = g_pending_send_course;
+	}
 
 	if (!ww_async_start(WW_TASK_HGSS_STROLL_SEND)) {
 		printf("WearWalker request already running\n");
 		return;
 	}
+
+	if (g_simple_mode && g_state == IN_ROUTE_SELECTOR)
+		g_route_send_busy = true;
 
 	printf("Sending selected box Pokemon to stroll...\n");
 }
@@ -4087,15 +5579,12 @@ void call_apply_stroll_return_endpoint()
 {
 	u16 port = hgss_stroll_return_menu_entries[RETURN_MENU_PORT].num_attr.value;
 
-	if (ww_api_set_endpoint(g_wearwalker_host, port))
-		printf("Using WearWalker endpoint %s:%lu\n", g_wearwalker_host, (unsigned long)port);
-	else
-		printf("Invalid WearWalker endpoint\n");
+	ww_apply_endpoint_from_ui(port);
 }
 
 void call_show_stroll_return_slot()
 {
-	hgss_box_slot_summary slot;
+	hgss_stroll_send_context context;
 	char error[128];
 	u32 box = hgss_stroll_return_menu_entries[RETURN_MENU_BOX].num_attr.value;
 	u32 source_slot = hgss_stroll_return_menu_entries[RETURN_MENU_SOURCE_SLOT].num_attr.value;
@@ -4103,27 +5592,39 @@ void call_show_stroll_return_slot()
 	if (!ww_prepare_selected_save_path())
 		return;
 
-	if (!hgss_read_box_slot_summary(g_pending_save_path, (u8)box, (u8)source_slot, &slot, error, sizeof(error))) {
+	if (!hgss_read_stroll_send_context(g_pending_save_path, (u8)box, (u8)source_slot, &context, error, sizeof(error))) {
 		printf("%s\n", error[0] ? error : "failed to read source slot");
 		return;
 	}
 
-	if (!slot.occupied || slot.species_id == 0) {
+	if (!context.source_slot.occupied || context.source_slot.species_id == 0) {
 		printf("Source box %lu slot %lu is empty\n", (unsigned long)box, (unsigned long)source_slot);
 		return;
 	}
 
 	printf(
-			"Return source box %lu slot %lu | species %u | exp %lu | friendship %u\n",
+			"Return source box %lu slot %lu | species %u (%s) | exp %lu | friendship %u\n",
 			(unsigned long)box,
 			(unsigned long)source_slot,
-			(unsigned)slot.species_id,
-			(unsigned long)slot.exp,
-			(unsigned)slot.friendship);
+			(unsigned)context.source_slot.species_id,
+			ww_lookup_species_name(context.source_slot.species_id),
+			(unsigned long)context.source_slot.exp,
+			(unsigned)context.source_slot.friendship);
+	printf(
+			"Nickname: %s | Held item id: %u | Moves: %u, %u, %u, %u\n",
+			context.nickname[0] ? context.nickname : "(none)",
+			(unsigned)context.held_item,
+			(unsigned)context.moves[0],
+			(unsigned)context.moves[1],
+			(unsigned)context.moves[2],
+			(unsigned)context.moves[3]);
 }
 
 void call_stroll_return_to_save()
 {
+	u32 simple_walked_steps = 0;
+	bool have_simple_walked_steps = false;
+
 	if (!ww_prepare_selected_save_path())
 		return;
 
@@ -4136,6 +5637,18 @@ void call_stroll_return_to_save()
 	g_pending_return_bonus_watts = hgss_stroll_return_menu_entries[RETURN_MENU_BONUS_WATTS].num_attr.value;
 	g_pending_return_auto_captures = hgss_stroll_return_menu_entries[RETURN_MENU_AUTO_CAPTURES].num_attr.value;
 	g_pending_return_increment_trip_counter = hgss_stroll_return_menu_entries[RETURN_MENU_INCREMENT_TRIP].num_attr.value != 0;
+	if (g_simple_mode) {
+		have_simple_walked_steps = ww_compute_simple_return_walked_steps(&simple_walked_steps);
+		g_pending_return_walked_steps = have_simple_walked_steps ? simple_walked_steps : 0;
+		g_pending_return_bonus_watts = 0;
+		g_pending_return_auto_captures = 0;
+		g_pending_return_increment_trip_counter = true;
+		g_pending_return_target_slot = 0;
+		printf(
+				"Simple mode return: walked steps=%lu (%s), bonus=0, auto-captures=0\n",
+				(unsigned long)g_pending_return_walked_steps,
+				have_simple_walked_steps ? "sync delta" : "fallback");
+	}
 
 	if (!ww_async_start(WW_TASK_HGSS_STROLL_RETURN)) {
 		printf("WearWalker request already running\n");
@@ -4163,12 +5676,25 @@ void move_selection(const s16 offset)
 
 void ui_draw()
 {
+	g_ui_anim_tick++;
+	ww_draw_top_context();
+
 	C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+
+	if (g_simple_mode) {
+		C2D_TargetClear(target_top, C2D_Color32(0x10, 0x25, 0x2C, 0xFF));
+		C2D_SceneBegin(target_top);
+		ww_draw_simple_top_panel();
+	}
 
 	C2D_TargetClear(target, COLOR_BG);
 	C2D_SceneBegin(target);
 
-	if (g_state == IN_FILE_BROWSER)
+	if (g_state == IN_BOX_SELECTOR)
+		ww_draw_box_selector();
+	else if (g_state == IN_ROUTE_SELECTOR)
+		ww_draw_route_selector();
+	else if (g_state == IN_FILE_BROWSER)
 		draw_file_browser();
 	else if (g_state == IN_SELECTION)
 		draw_menu(12, 3, g_active_menu->entries[g_active_menu->props.selected].sel_menu.props);
@@ -4186,13 +5712,103 @@ enum operation ui_update()
 
 	gspWaitForVBlank();
 	hidScanInput();
-	u32 kDown = hidKeysDown() | (hidKeysDownRepeat() & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT));
+	u32 kDown = hidKeysDown() | (hidKeysDownRepeat() & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT | KEY_L | KEY_R));
 	async_completed = ww_async_poll_completion();
+
+	if (async_completed && g_route_send_busy) {
+		g_route_send_busy = false;
+		g_state = IN_MENU;
+		g_active_menu = ww_get_main_menu();
+		return OP_UPDATE;
+	}
+
+	if (g_route_send_busy && g_state == IN_ROUTE_SELECTOR)
+		return OP_UPDATE;
 
 	if (kDown & KEY_START)
 		return OP_EXIT;
 
 	if (kDown) {
+		if (g_state == IN_ROUTE_SELECTOR) {
+			if (kDown & KEY_LEFT) {
+				if (g_route_selector_course > 0)
+					g_route_selector_course--;
+				else
+					g_route_selector_course = WW_OV112_COURSE_COUNT - 1;
+				ww_route_selector_reload();
+			} else if (kDown & KEY_RIGHT) {
+				g_route_selector_course = (g_route_selector_course + 1) % WW_OV112_COURSE_COUNT;
+				ww_route_selector_reload();
+			} else if (kDown & KEY_A) {
+				if (g_route_selector_locked) {
+					if (g_route_selector_special_lock) {
+						printf("Selected route is event/special locked\n");
+					} else {
+						printf(
+								"Route locked: need %ld watts (you have %lu)\n",
+								(long)g_route_selector_required_watts,
+								(unsigned long)g_route_selector_current_watts);
+					}
+				} else {
+					g_pending_send_course = g_route_selector_course;
+					hgss_stroll_send_menu_entries[SEND_MENU_ROUTE].num_attr.value = g_pending_send_course;
+					call_stroll_send_from_save();
+				}
+			} else if (kDown & KEY_B) {
+				g_state = IN_BOX_SELECTOR;
+			}
+
+			return OP_UPDATE;
+		}
+
+		if (g_state == IN_BOX_SELECTOR) {
+			if (kDown & KEY_UP) {
+				if (g_box_picker_slot > 6)
+					g_box_picker_slot -= 6;
+			} else if (kDown & KEY_DOWN) {
+				if (g_box_picker_slot <= 24)
+					g_box_picker_slot += 6;
+			} else if (kDown & KEY_LEFT) {
+				if ((g_box_picker_slot - 1) % 6 != 0)
+					g_box_picker_slot--;
+			} else if (kDown & KEY_RIGHT) {
+				if (g_box_picker_slot % 6 != 0)
+					g_box_picker_slot++;
+			} else if (kDown & KEY_L) {
+				if (g_box_picker_box > 1)
+					g_box_picker_box--;
+				else
+					g_box_picker_box = HGSS_BOX_COUNT;
+				ww_box_selector_reload();
+			} else if (kDown & KEY_R) {
+				if (g_box_picker_box < HGSS_BOX_COUNT)
+					g_box_picker_box++;
+				else
+					g_box_picker_box = 1;
+				ww_box_selector_reload();
+			} else if (kDown & KEY_A) {
+				ww_box_selector_apply_choice();
+				printf(
+						"Selected box %lu slot %lu\n",
+						(unsigned long)g_box_picker_box,
+						(unsigned long)g_box_picker_slot);
+
+				if (g_simple_mode && g_box_picker_mode == WW_BOX_PICKER_SEND_SOURCE) {
+					if (!ww_route_selector_open()) {
+						g_state = IN_MENU;
+						g_active_menu = ww_get_main_menu();
+					}
+				} else {
+					g_state = IN_MENU;
+				}
+			} else if (kDown & KEY_B) {
+				g_state = IN_MENU;
+				printf("Cancelled visual box selector\n");
+			}
+
+			return OP_UPDATE;
+		}
+
 		if (g_state == IN_FILE_BROWSER) {
 			if (kDown & KEY_UP) {
 				ww_browser_move_selection(-1);
@@ -4252,7 +5868,7 @@ enum operation ui_update()
 					case ENTRY_CHANGEMENU:
 						g_active_menu = selected_entry->new_menu;
 						g_active_menu->props.selected = 0;
-						consoleClear();
+							ww_clear_debug_console();
 						break;
 					case ENTRY_SELATTR:
 						old_selected = selected_entry->sel_menu.props.selected;
@@ -4269,8 +5885,8 @@ enum operation ui_update()
 				g_state = IN_MENU;
 				old_selected = 0;
 			} else {
-				g_active_menu = &main_menu;
-				consoleClear();
+				g_active_menu = ww_get_main_menu();
+				ww_clear_debug_console();
 			}
 		} 
 		return OP_UPDATE;

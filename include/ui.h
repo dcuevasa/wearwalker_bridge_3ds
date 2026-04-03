@@ -24,6 +24,8 @@ enum state {
 	IN_MENU,
 	IN_SELECTION,
 	IN_FILE_BROWSER,
+	IN_BOX_SELECTOR,
+	IN_ROUTE_SELECTOR,
 };
 
 enum operation {

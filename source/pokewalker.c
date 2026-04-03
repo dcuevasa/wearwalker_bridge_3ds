@@ -515,3 +515,23 @@ finish:
 	transport_disable();
 	fclose(f);
 }
+
+const char *ww_lookup_species_name(u16 species_id)
+{
+	const size_t count = sizeof(poke_list) / sizeof(poke_list[0]);
+
+	if (species_id < count && poke_list[species_id])
+		return poke_list[species_id];
+
+	return "Unknown";
+}
+
+const char *ww_lookup_item_name(u16 item_id)
+{
+	const size_t count = sizeof(item_list) / sizeof(item_list[0]);
+
+	if (item_id < count && item_list[item_id])
+		return item_list[item_id];
+
+	return "Unknown";
+}
