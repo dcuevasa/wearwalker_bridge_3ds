@@ -1,4 +1,6 @@
 #include "ui.h"
+#include "hgss_item_icon_map.h"
+#include "hgss_mon_icon_palette_map.h"
 #include "hgss_patcher.h"
 #include "hgss_storage.h"
 #include "pokewalker_lookup.h"
@@ -84,11 +86,23 @@ static void ww_draw_2bpp_sprite(
 		float x,
 		float y,
 		float scale,
-		bool transparent_zero);
+		bool transparent_zero,
+		u32 color_seed,
+		bool colorize);
 static void ww_draw_item_token_sprite(u16 item_id, float x, float y, float scale);
+static void ww_draw_indexed_icon(
+		const u8 *indices,
+		u32 width,
+		u32 height,
+		const u32 *palette,
+		float x,
+		float y,
+		float scale,
+		bool transparent_zero);
 static void ww_draw_simple_top_panel(void);
 static void ww_async_progress_set(u32 percent, const char *label);
 static void ww_async_progress_get(u32 *out_percent, char *out_label, size_t out_label_size);
+static void ww_build_sprite_palette(u32 color_seed, bool colorize, u32 out_colors[4]);
 
 typedef struct {
 	u16 species_id;
@@ -98,6 +112,11 @@ typedef struct {
 	u16 moves[4];
 	bool sprite_ready;
 	u8 sprite_frame0[0x0C0];
+	bool color_icon_ready;
+	u8 color_icon_width;
+	u8 color_icon_height;
+	u8 color_icon_indices[32 * 32];
+	u32 color_icon_palette[16];
 	char species_name[32];
 } ww_route_slot_preview;
 
@@ -105,6 +124,11 @@ typedef struct {
 	u16 item_id;
 	u16 min_steps;
 	u8 chance;
+	bool icon_ready;
+	u8 icon_width;
+	u8 icon_height;
+	u8 icon_indices[32 * 32];
+	u32 icon_palette[16];
 	char item_name[32];
 } ww_route_item_preview;
 
@@ -171,7 +195,12 @@ static hgss_stroll_send_context g_box_picker_context[HGSS_BOX_SLOTS];
 static bool g_box_picker_context_valid[HGSS_BOX_SLOTS];
 static u16 g_box_picker_sprite_species = 0xFFFF;
 static bool g_box_picker_sprite_ready = false;
-static u8 g_box_picker_sprite[0x0C0];
+static u8 g_box_picker_sprite[0x300];
+static bool g_box_picker_color_icon_ready = false;
+static u8 g_box_picker_color_icon_width = 0;
+static u8 g_box_picker_color_icon_height = 0;
+static u8 g_box_picker_color_icon_indices[32 * 32];
+static u32 g_box_picker_color_icon_palette[16];
 static bool g_box_picker_reload_ok = false;
 static char g_box_picker_error[128];
 static bool g_route_selector_ready = false;
@@ -323,6 +352,7 @@ static const char *g_type_names[18] = {
 	"Bug",
 	"Ghost",
 	"Steel",
+	"???",
 	"Fire",
 	"Water",
 	"Grass",
@@ -331,7 +361,6 @@ static const char *g_type_names[18] = {
 	"Ice",
 	"Dragon",
 	"Dark",
-	"Unknown",
 };
 
 #define WW_ROM_CACHE_MAGIC 0x48524357u /* WRCH */
@@ -2000,6 +2029,346 @@ static bool ww_extract_species_small_frames(
 cleanup:
 	if (decompressed)
 		free(decompressed);
+	return ok;
+}
+
+static bool ww_nitro_find_chunk(const u8 *data, u32 data_size, const char chunk_id[4], u32 *out_offset, u32 *out_size)
+{
+	u32 offset = 16;
+	u16 chunk_count;
+	u32 chunk_index;
+
+	if (!data || !chunk_id || !out_offset || !out_size || data_size < 16)
+		return false;
+
+	chunk_count = ww_read_u16_le(data + 0x0E);
+	for (chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
+		u32 chunk_size;
+
+		if (offset + 8 > data_size)
+			return false;
+
+		chunk_size = ww_read_u32_le(data + offset + 4);
+		if (chunk_size < 8 || offset + chunk_size > data_size)
+			return false;
+
+		if (memcmp(data + offset, chunk_id, 4) == 0) {
+			*out_offset = offset;
+			*out_size = chunk_size;
+			return true;
+		}
+
+		offset += chunk_size;
+	}
+
+	return false;
+}
+
+static bool ww_unpack_narc_member_lz10(
+		const u8 *member_data,
+		u32 member_size,
+		const u8 **out_data,
+		u32 *out_size,
+		u8 **out_allocated)
+{
+	u8 *decompressed = NULL;
+	u32 decompressed_size = 0;
+
+	if (!member_data || !out_data || !out_size || !out_allocated || member_size == 0)
+		return false;
+
+	*out_data = NULL;
+	*out_size = 0;
+	*out_allocated = NULL;
+
+	if (member_data[0] == 0x10) {
+		if (!ww_decompress_lz10(member_data, member_size, &decompressed, &decompressed_size))
+			return false;
+
+		*out_data = decompressed;
+		*out_size = decompressed_size;
+		*out_allocated = decompressed;
+		return true;
+	}
+
+	*out_data = member_data;
+	*out_size = member_size;
+	return true;
+}
+
+static u32 ww_bgr555_to_c2d_color(u16 bgr555, bool transparent)
+{
+	u8 r5 = (u8)(bgr555 & 0x1Fu);
+	u8 g5 = (u8)((bgr555 >> 5) & 0x1Fu);
+	u8 b5 = (u8)((bgr555 >> 10) & 0x1Fu);
+	u8 r8 = (u8)((r5 << 3) | (r5 >> 2));
+	u8 g8 = (u8)((g5 << 3) | (g5 >> 2));
+	u8 b8 = (u8)((b5 << 3) | (b5 >> 2));
+
+	return C2D_Color32(r8, g8, b8, transparent ? 0x00 : 0xFF);
+}
+
+static bool ww_decode_ncgr_32x32_4bpp(const u8 *ncgr_data, u32 ncgr_size, u8 out_indices[32 * 32], u8 *out_width, u8 *out_height)
+{
+	u32 rahc_offset;
+	u32 rahc_size;
+	u32 pixel_data_size;
+	const u8 *pixel_data;
+	u32 tile_index;
+	u32 nonzero = 0;
+
+	if (!ncgr_data || !out_indices || !out_width || !out_height)
+		return false;
+	if (ncgr_size < 16 || memcmp(ncgr_data, "RGCN", 4) != 0)
+		return false;
+	if (!ww_nitro_find_chunk(ncgr_data, ncgr_size, "RAHC", &rahc_offset, &rahc_size))
+		return false;
+	if (rahc_size < 0x20 || rahc_offset + 0x20 > ncgr_size)
+		return false;
+
+	pixel_data_size = ww_read_u32_le(ncgr_data + rahc_offset + 0x18);
+	if (pixel_data_size < 0x200)
+		return false;
+	if (rahc_offset + 0x20 + pixel_data_size > ncgr_size)
+		return false;
+
+	pixel_data = ncgr_data + rahc_offset + 0x20;
+	memset(out_indices, 0, 32 * 32);
+
+	for (tile_index = 0; tile_index < 16; tile_index++) {
+		const u8 *tile = pixel_data + tile_index * 32u;
+		u32 tile_x = tile_index % 4u;
+		u32 tile_y = tile_index / 4u;
+		u32 py;
+
+		for (py = 0; py < 8u; py++) {
+			u32 px;
+
+			for (px = 0; px < 8u; px++) {
+				u8 packed = tile[py * 4u + (px >> 1u)];
+				u8 color_index = (px & 1u) ? (packed >> 4) : (packed & 0x0Fu);
+				u32 out_x = tile_x * 8u + px;
+				u32 out_y = tile_y * 8u + py;
+
+				if (color_index != 0)
+					nonzero++;
+				out_indices[out_y * 32u + out_x] = color_index;
+			}
+		}
+	}
+
+	if (nonzero < 8u)
+		return false;
+
+	*out_width = 32;
+	*out_height = 32;
+	return true;
+}
+
+static bool ww_decode_nclr_colors(const u8 *nclr_data, u32 nclr_size, u32 *out_colors, u32 out_cap, u32 *out_color_count)
+{
+	u32 ttlp_offset;
+	u32 ttlp_size;
+	u32 palette_size;
+	u32 color_count;
+	const u8 *palette_data;
+	u32 i;
+
+	if (!nclr_data || !out_colors || out_cap == 0 || !out_color_count)
+		return false;
+	if (nclr_size < 16 || memcmp(nclr_data, "RLCN", 4) != 0)
+		return false;
+	if (!ww_nitro_find_chunk(nclr_data, nclr_size, "TTLP", &ttlp_offset, &ttlp_size))
+		return false;
+	if (ttlp_size < 0x18 || ttlp_offset + 0x18 > nclr_size)
+		return false;
+
+	palette_size = ww_read_u32_le(nclr_data + ttlp_offset + 0x10);
+	if (palette_size < 32)
+		return false;
+	if (ttlp_offset + 0x18 + palette_size > nclr_size)
+		return false;
+
+	palette_data = nclr_data + ttlp_offset + 0x18;
+	color_count = palette_size / 2u;
+	if (color_count > out_cap)
+		color_count = out_cap;
+
+	for (i = 0; i < color_count; i++) {
+		u16 color555 = ww_read_u16_le(palette_data + i * 2u);
+		out_colors[i] = ww_bgr555_to_c2d_color(color555, false);
+	}
+
+	*out_color_count = color_count;
+
+	return color_count >= 16u;
+}
+
+static bool ww_copy_palette16(const u32 *src_colors, u32 src_count, u32 palette_index, u32 out_palette[16])
+{
+	u32 base;
+	u32 i;
+
+	if (!src_colors || !out_palette)
+		return false;
+
+	base = palette_index * 16u;
+	if (base + 16u > src_count)
+		return false;
+
+	for (i = 0; i < 16u; i++) {
+		u32 color = src_colors[base + i];
+		if (i == 0u)
+			color &= 0x00FFFFFFu;
+		else
+			color = (color & 0x00FFFFFFu) | 0xFF000000u;
+		out_palette[i] = color;
+	}
+
+	return true;
+}
+
+static u32 ww_species_to_icon_member_index(u16 species_id)
+{
+	if (species_id >= 1u && species_id <= 493u)
+		return (u32)species_id + 7u;
+	return 7u;
+}
+
+static u32 ww_species_to_icon_palette_index(u16 species_id)
+{
+	if (species_id < WW_HGSS_MON_ICON_PALETTE_COUNT)
+		return (u32)g_hgss_mon_icon_palette_idx[species_id];
+	return 0u;
+}
+
+static bool ww_extract_species_color_icon_from_narc(
+		const u8 *poke_icon_narc,
+		u32 poke_icon_narc_size,
+		u16 species_id,
+		u8 out_indices[32 * 32],
+		u32 out_palette[16],
+		u8 *out_width,
+		u8 *out_height)
+{
+	u32 icon_member_index;
+	u32 palette_index;
+	const u8 *icon_member;
+	u32 icon_member_size;
+	const u8 *palette_member;
+	u32 palette_member_size;
+	const u8 *icon_data;
+	u32 icon_size;
+	const u8 *palette_data;
+	u32 palette_size;
+	u8 *owned_icon = NULL;
+	u8 *owned_palette = NULL;
+	u32 colors[256];
+	u32 color_count = 0;
+	bool ok = false;
+
+	if (!poke_icon_narc || poke_icon_narc_size == 0 || !out_indices || !out_palette || !out_width || !out_height)
+		return false;
+
+	icon_member_index = ww_species_to_icon_member_index(species_id);
+	palette_index = ww_species_to_icon_palette_index(species_id);
+
+	if (!ww_narc_get_file_by_index(poke_icon_narc, poke_icon_narc_size, icon_member_index, &icon_member, &icon_member_size))
+		return false;
+	if (!ww_narc_get_file_by_index(poke_icon_narc, poke_icon_narc_size, 0u, &palette_member, &palette_member_size))
+		return false;
+	if (!ww_unpack_narc_member_lz10(icon_member, icon_member_size, &icon_data, &icon_size, &owned_icon))
+		goto cleanup;
+	if (!ww_unpack_narc_member_lz10(palette_member, palette_member_size, &palette_data, &palette_size, &owned_palette))
+		goto cleanup;
+	if (!ww_decode_ncgr_32x32_4bpp(icon_data, icon_size, out_indices, out_width, out_height))
+		goto cleanup;
+	if (!ww_decode_nclr_colors(palette_data, palette_size, colors, sizeof(colors) / sizeof(colors[0]), &color_count))
+		goto cleanup;
+	if (!ww_copy_palette16(colors, color_count, palette_index, out_palette))
+		goto cleanup;
+
+	ok = true;
+
+cleanup:
+	if (owned_icon)
+		free(owned_icon);
+	if (owned_palette)
+		free(owned_palette);
+	return ok;
+}
+
+static bool ww_decode_item_icon_nclr(const u8 *nclr_data, u32 nclr_size, u32 out_palette[16])
+{
+	u32 colors[256];
+	u32 color_count = 0;
+
+	if (!out_palette)
+		return false;
+	if (!ww_decode_nclr_colors(nclr_data, nclr_size, colors, sizeof(colors) / sizeof(colors[0]), &color_count))
+		return false;
+	return ww_copy_palette16(colors, color_count, 0u, out_palette);
+}
+
+static bool ww_lookup_item_icon_indices(u16 item_id, u16 *out_ncgr_index, u16 *out_nclr_index)
+{
+	if (!out_ncgr_index || !out_nclr_index)
+		return false;
+	if (item_id >= WW_HGSS_ITEM_ICON_COUNT)
+		return false;
+
+	*out_ncgr_index = g_hgss_item_icon_ncgr[item_id];
+	*out_nclr_index = g_hgss_item_icon_nclr[item_id];
+	return true;
+}
+
+static bool ww_extract_item_icon_from_narc(
+		const u8 *item_icon_narc,
+		u32 item_icon_narc_size,
+		u16 item_id,
+		u8 out_indices[32 * 32],
+		u32 out_palette[16],
+		u8 *out_width,
+		u8 *out_height)
+{
+	u16 ncgr_index;
+	u16 nclr_index;
+	const u8 *ncgr_member;
+	u32 ncgr_member_size;
+	const u8 *nclr_member;
+	u32 nclr_member_size;
+	const u8 *ncgr_data;
+	u32 ncgr_size;
+	const u8 *nclr_data;
+	u32 nclr_size;
+	u8 *owned_ncgr = NULL;
+	u8 *owned_nclr = NULL;
+	bool ok = false;
+
+	if (!item_icon_narc || item_icon_narc_size == 0 || !out_indices || !out_palette || !out_width || !out_height)
+		return false;
+	if (!ww_lookup_item_icon_indices(item_id, &ncgr_index, &nclr_index))
+		return false;
+	if (!ww_narc_get_file_by_index(item_icon_narc, item_icon_narc_size, ncgr_index, &ncgr_member, &ncgr_member_size))
+		return false;
+	if (!ww_narc_get_file_by_index(item_icon_narc, item_icon_narc_size, nclr_index, &nclr_member, &nclr_member_size))
+		return false;
+	if (!ww_unpack_narc_member_lz10(ncgr_member, ncgr_member_size, &ncgr_data, &ncgr_size, &owned_ncgr))
+		goto cleanup;
+	if (!ww_unpack_narc_member_lz10(nclr_member, nclr_member_size, &nclr_data, &nclr_size, &owned_nclr))
+		goto cleanup;
+	if (!ww_decode_ncgr_32x32_4bpp(ncgr_data, ncgr_size, out_indices, out_width, out_height))
+		goto cleanup;
+	if (!ww_decode_item_icon_nclr(nclr_data, nclr_size, out_palette))
+		goto cleanup;
+
+	ok = true;
+
+cleanup:
+	if (owned_ncgr)
+		free(owned_ncgr);
+	if (owned_nclr)
+		free(owned_nclr);
 	return ok;
 }
 
@@ -4450,6 +4819,67 @@ static void ww_draw_box_selector(void)
 	draw_string(0, 226, 8, "A: choose  B: cancel  L/R: change box", true, 0);
 }
 
+static void ww_build_sprite_palette(u32 color_seed, bool colorize, u32 out_colors[4])
+{
+	static const u8 accents[][3] = {
+		{0xD6, 0x4E, 0x5A},
+		{0x5A, 0xA6, 0xE0},
+		{0x68, 0xB7, 0x5D},
+		{0xE3, 0xB1, 0x4F},
+		{0xA8, 0x76, 0xE3},
+		{0xE2, 0x84, 0x59},
+		{0x59, 0xC3, 0xB1},
+		{0xD0, 0x63, 0xA6},
+		{0x6E, 0x8D, 0xE8},
+		{0xC5, 0x6E, 0x58},
+		{0x65, 0xB6, 0x7A},
+		{0xB5, 0x8B, 0x58},
+	};
+	const u8 *accent;
+	u32 idx;
+	u32 r;
+	u32 g;
+	u32 b;
+
+	if (!out_colors)
+		return;
+
+	if (!colorize) {
+		out_colors[0] = C2D_Color32(0xEC, 0xF4, 0xF5, 0xFF);
+		out_colors[1] = C2D_Color32(0xBE, 0xCF, 0xD2, 0xFF);
+		out_colors[2] = C2D_Color32(0x67, 0x7E, 0x83, 0xFF);
+		out_colors[3] = C2D_Color32(0x20, 0x2D, 0x31, 0xFF);
+		return;
+	}
+
+	idx = color_seed % (sizeof(accents) / sizeof(accents[0]));
+	accent = accents[idx];
+	r = accent[0];
+	g = accent[1];
+	b = accent[2];
+
+	out_colors[0] = C2D_Color32(
+			(u8)((r * 18u + 255u * 82u) / 100u),
+			(u8)((g * 18u + 255u * 82u) / 100u),
+			(u8)((b * 18u + 255u * 82u) / 100u),
+			0xFF);
+	out_colors[1] = C2D_Color32(
+			(u8)((r * 45u + 255u * 55u) / 100u),
+			(u8)((g * 45u + 255u * 55u) / 100u),
+			(u8)((b * 45u + 255u * 55u) / 100u),
+			0xFF);
+	out_colors[2] = C2D_Color32(
+			(u8)((r * 80u + 255u * 20u) / 100u),
+			(u8)((g * 80u + 255u * 20u) / 100u),
+			(u8)((b * 80u + 255u * 20u) / 100u),
+			0xFF);
+	out_colors[3] = C2D_Color32(
+			(u8)((r * 52u) / 100u),
+			(u8)((g * 52u) / 100u),
+			(u8)((b * 52u) / 100u),
+			0xFF);
+}
+
 static void ww_draw_2bpp_sprite(
 		const u8 *sprite,
 		u32 width,
@@ -4457,17 +4887,16 @@ static void ww_draw_2bpp_sprite(
 		float x,
 		float y,
 		float scale,
-		bool transparent_zero)
+		bool transparent_zero,
+		u32 color_seed,
+		bool colorize)
 {
 	u32 shade_colors[4];
 	u32 py;
 	u32 blocks_y;
 	u32 expected_bytes;
 
-	shade_colors[0] = C2D_Color32(0xEC, 0xF4, 0xF5, 0xFF);
-	shade_colors[1] = C2D_Color32(0xBE, 0xCF, 0xD2, 0xFF);
-	shade_colors[2] = C2D_Color32(0x67, 0x7E, 0x83, 0xFF);
-	shade_colors[3] = C2D_Color32(0x20, 0x2D, 0x31, 0xFF);
+	ww_build_sprite_palette(color_seed, colorize, shade_colors);
 
 	if (!sprite || width == 0 || height == 0)
 		return;
@@ -4530,6 +4959,56 @@ static void ww_draw_2bpp_sprite(
 	}
 }
 
+static void ww_draw_indexed_icon(
+		const u8 *indices,
+		u32 width,
+		u32 height,
+		const u32 *palette,
+		float x,
+		float y,
+		float scale,
+		bool transparent_zero)
+{
+	u32 py;
+
+	if (!indices || !palette || width == 0 || height == 0)
+		return;
+
+	for (py = 0; py < height; py++) {
+		u32 px = 0;
+
+		while (px < width) {
+			u8 color_index = indices[py * width + px] & 0x0Fu;
+			u32 run_start = px;
+
+			if (transparent_zero && color_index == 0) {
+				px++;
+				continue;
+			}
+
+			px++;
+			while (px < width) {
+				u8 next_color = indices[py * width + px] & 0x0Fu;
+
+				if (transparent_zero && next_color == 0)
+					break;
+				if (next_color != color_index)
+					break;
+
+				px++;
+			}
+
+			C2D_DrawRectSolid(
+					x + (float)run_start * scale,
+					y + (float)py * scale,
+					0.0f,
+					(float)(px - run_start) * scale,
+					scale,
+					palette[color_index]);
+		}
+	}
+}
+
 static void ww_draw_item_token_sprite(u16 item_id, float x, float y, float scale)
 {
 	u8 token[16];
@@ -4561,7 +5040,7 @@ static void ww_draw_item_token_sprite(u16 item_id, float x, float y, float scale
 		token[px * 2u + 1u] = (u8)(column_word >> 8);
 	}
 
-	ww_draw_2bpp_sprite(token, 8, 8, x, y, scale, false);
+	ww_draw_2bpp_sprite(token, 8, 8, x, y, scale, false, ((u32)item_id) ^ 0x9E3779B9u, true);
 }
 
 static bool ww_route_selector_reload(void)
@@ -4570,6 +5049,10 @@ static bool ww_route_selector_reload(void)
 	const u8 *record;
 	u8 *small_narc_data = NULL;
 	u32 small_narc_size = 0;
+	u8 *item_icon_narc_data = NULL;
+	u32 item_icon_narc_size = 0;
+	u8 *poke_icon_narc_data = NULL;
+	u32 poke_icon_narc_size = 0;
 	u32 route_plus_one;
 	u32 route_image_index;
 	u32 slot_index;
@@ -4643,6 +5126,24 @@ static bool ww_route_selector_reload(void)
 	g_route_preview_adv_types[2] = record[WW_OV112_ADV_TYPES_OFFSET + 2u];
 
 	ww_load_narc_from_nds(g_pending_nds_path, "a/2/4/8", &small_narc_data, &small_narc_size);
+	ww_load_narc_from_nds(g_pending_nds_path, "a/0/1/8", &item_icon_narc_data, &item_icon_narc_size);
+	if (!item_icon_narc_data
+			&& !ww_load_narc_from_nds(g_pending_nds_path, "itemtool/itemdata/item_icon", &item_icon_narc_data, &item_icon_narc_size))
+		ww_load_narc_from_nds(g_pending_nds_path, "itemtool/itemdata/item_icon.narc", &item_icon_narc_data, &item_icon_narc_size);
+
+	ww_load_narc_from_nds(g_pending_nds_path, "a/0/2/0", &poke_icon_narc_data, &poke_icon_narc_size);
+	if (!poke_icon_narc_data
+			&& !ww_load_narc_from_nds(
+						g_pending_nds_path,
+						"poketool/icongra/poke_icon/poke_icon",
+						&poke_icon_narc_data,
+						&poke_icon_narc_size)) {
+		ww_load_narc_from_nds(
+				g_pending_nds_path,
+				"poketool/icongra/poke_icon/poke_icon.narc",
+				&poke_icon_narc_data,
+				&poke_icon_narc_size);
+	}
 
 	for (slot_index = 0; slot_index < WW_ROUTE_PREVIEW_SLOT_COUNT; slot_index++) {
 		u32 base = WW_OV112_SLOT_OFFSET + slot_index * WW_OV112_SLOT_SIZE;
@@ -4670,10 +5171,34 @@ static bool ww_route_selector_reload(void)
 				"%s",
 				ww_lookup_species_name(species_id));
 		g_route_preview_slots[slot_index].sprite_ready = false;
+		g_route_preview_slots[slot_index].color_icon_ready = false;
+		g_route_preview_slots[slot_index].color_icon_width = 0;
+		g_route_preview_slots[slot_index].color_icon_height = 0;
 		memset(
 				g_route_preview_slots[slot_index].sprite_frame0,
 				0,
 				sizeof(g_route_preview_slots[slot_index].sprite_frame0));
+		memset(
+				g_route_preview_slots[slot_index].color_icon_indices,
+				0,
+				sizeof(g_route_preview_slots[slot_index].color_icon_indices));
+		memset(
+				g_route_preview_slots[slot_index].color_icon_palette,
+				0,
+				sizeof(g_route_preview_slots[slot_index].color_icon_palette));
+
+		if (poke_icon_narc_data && species_id > 0) {
+			if (ww_extract_species_color_icon_from_narc(
+						poke_icon_narc_data,
+						poke_icon_narc_size,
+						species_id,
+						g_route_preview_slots[slot_index].color_icon_indices,
+						g_route_preview_slots[slot_index].color_icon_palette,
+						&g_route_preview_slots[slot_index].color_icon_width,
+						&g_route_preview_slots[slot_index].color_icon_height)) {
+				g_route_preview_slots[slot_index].color_icon_ready = true;
+			}
+		}
 
 		if (small_narc_data && species_id > 0) {
 			u8 small1[WW_OV112_ROUTE_IMAGE_SIZE];
@@ -4724,15 +5249,43 @@ static bool ww_route_selector_reload(void)
 		g_route_preview_items[item_index].item_id = item_id;
 		g_route_preview_items[item_index].min_steps = min_steps;
 		g_route_preview_items[item_index].chance = chance;
+		g_route_preview_items[item_index].icon_ready = false;
+		g_route_preview_items[item_index].icon_width = 0;
+		g_route_preview_items[item_index].icon_height = 0;
+		memset(
+				g_route_preview_items[item_index].icon_indices,
+				0,
+				sizeof(g_route_preview_items[item_index].icon_indices));
+		memset(
+				g_route_preview_items[item_index].icon_palette,
+				0,
+				sizeof(g_route_preview_items[item_index].icon_palette));
 		snprintf(
 				g_route_preview_items[item_index].item_name,
 				sizeof(g_route_preview_items[item_index].item_name),
 				"%s",
 				ww_lookup_item_name(item_id));
+
+		if (item_icon_narc_data && item_id > 0) {
+			if (ww_extract_item_icon_from_narc(
+						item_icon_narc_data,
+						item_icon_narc_size,
+						item_id,
+						g_route_preview_items[item_index].icon_indices,
+						g_route_preview_items[item_index].icon_palette,
+						&g_route_preview_items[item_index].icon_width,
+						&g_route_preview_items[item_index].icon_height)) {
+				g_route_preview_items[item_index].icon_ready = true;
+			}
+		}
 	}
 
 	if (small_narc_data)
 		free(small_narc_data);
+	if (item_icon_narc_data)
+		free(item_icon_narc_data);
+	if (poke_icon_narc_data)
+		free(poke_icon_narc_data);
 
 	g_route_selector_ready = true;
 	return true;
@@ -4790,9 +5343,9 @@ static void ww_draw_route_selector(void)
 	const char *type2_name;
 	const char *selected_species_name;
 	u8 selected_level;
-	u8 type0 = g_route_preview_adv_types[0] < 18 ? g_route_preview_adv_types[0] : 17;
-	u8 type1 = g_route_preview_adv_types[1] < 18 ? g_route_preview_adv_types[1] : 17;
-	u8 type2 = g_route_preview_adv_types[2] < 18 ? g_route_preview_adv_types[2] : 17;
+	u8 type0 = g_route_preview_adv_types[0] < 18 ? g_route_preview_adv_types[0] : 9;
+	u8 type1 = g_route_preview_adv_types[1] < 18 ? g_route_preview_adv_types[1] : 9;
+	u8 type2 = g_route_preview_adv_types[2] < 18 ? g_route_preview_adv_types[2] : 9;
 	u32 progress_pct = 0;
 	u32 exp_bar_pct;
 
@@ -4832,7 +5385,7 @@ static void ww_draw_route_selector(void)
 	C2D_DrawRectSolid(16.0f, 52.0f, 0.0f, 96.0f, 84.0f, C2D_Color32(0x1D, 0x45, 0x52, 0xFF));
 
 	if (g_route_preview_area_ready)
-		ww_draw_2bpp_sprite(g_route_preview_area_sprite, 32, 24, 22.0f, 58.0f, 2.25f, true);
+		ww_draw_2bpp_sprite(g_route_preview_area_sprite, 32, 24, 22.0f, 58.0f, 2.25f, true, 0u, false);
 	else
 		draw_string(22.0f, 88.0f, 8.5f, "No area", false, 0);
 
@@ -4905,33 +5458,95 @@ static void ww_draw_simple_top_panel(void)
 				? g_box_picker_context[g_box_picker_slot - 1].nickname
 				: "";
 
+		if (!slot->occupied || slot->species_id == 0) {
+			g_box_picker_sprite_ready = false;
+			g_box_picker_color_icon_ready = false;
+			g_box_picker_sprite_species = 0xFFFF;
+		}
+
 		if (slot->occupied && slot->species_id != 0 && g_box_picker_sprite_species != slot->species_id) {
-			u8 *small_narc_data = NULL;
-			u32 small_narc_size = 0;
-			u8 frame1[WW_OV112_ROUTE_IMAGE_SIZE];
+			u8 *poke_icon_narc_data = NULL;
+			u32 poke_icon_narc_size = 0;
 
 			g_box_picker_sprite_ready = false;
+			g_box_picker_color_icon_ready = false;
+			g_box_picker_color_icon_width = 0;
+			g_box_picker_color_icon_height = 0;
+			memset(g_box_picker_color_icon_indices, 0, sizeof(g_box_picker_color_icon_indices));
+			memset(g_box_picker_color_icon_palette, 0, sizeof(g_box_picker_color_icon_palette));
 			g_box_picker_sprite_species = slot->species_id;
 
 			if (g_selected_hgss_nds_path[0]
-					&& ww_load_narc_from_nds(g_selected_hgss_nds_path, "a/2/4/8", &small_narc_data, &small_narc_size)
-					&& ww_extract_species_small_frames(
-							small_narc_data,
-							small_narc_size,
+					&& (ww_load_narc_from_nds(g_selected_hgss_nds_path, "a/0/2/0", &poke_icon_narc_data, &poke_icon_narc_size)
+							|| ww_load_narc_from_nds(
+									g_selected_hgss_nds_path,
+									"poketool/icongra/poke_icon/poke_icon",
+									&poke_icon_narc_data,
+									&poke_icon_narc_size)
+							|| ww_load_narc_from_nds(
+									g_selected_hgss_nds_path,
+									"poketool/icongra/poke_icon/poke_icon.narc",
+									&poke_icon_narc_data,
+									&poke_icon_narc_size))
+					&& ww_extract_species_color_icon_from_narc(
+							poke_icon_narc_data,
+							poke_icon_narc_size,
 							slot->species_id,
-							g_box_picker_sprite,
-							frame1)) {
-				ww_remap_sprite_2bpp_contrast(g_box_picker_sprite, sizeof(g_box_picker_sprite));
-				g_box_picker_sprite_ready = true;
+							g_box_picker_color_icon_indices,
+							g_box_picker_color_icon_palette,
+							&g_box_picker_color_icon_width,
+							&g_box_picker_color_icon_height)) {
+				g_box_picker_color_icon_ready = true;
 			}
 
-			if (small_narc_data)
-				free(small_narc_data);
+			if (poke_icon_narc_data)
+				free(poke_icon_narc_data);
+
+			if (!g_box_picker_color_icon_ready) {
+				u8 *large_narc_data = NULL;
+				u32 large_narc_size = 0;
+				u8 frame1[0x300];
+
+				if (g_selected_hgss_nds_path[0]
+						&& ww_load_narc_from_nds(g_selected_hgss_nds_path, "a/2/5/6", &large_narc_data, &large_narc_size)
+						&& ww_extract_species_large_frames(
+								large_narc_data,
+								large_narc_size,
+								slot->species_id,
+								g_box_picker_sprite,
+								frame1)) {
+					ww_remap_sprite_2bpp_contrast(g_box_picker_sprite, sizeof(g_box_picker_sprite));
+					g_box_picker_sprite_ready = true;
+				}
+
+				if (large_narc_data)
+					free(large_narc_data);
+			}
 		}
 
 		C2D_DrawRectSolid(12, 40, 0, 140, 188, C2D_Color32(0x13, 0x34, 0x3F, 0xFF));
-		if (g_box_picker_sprite_ready)
-			ww_draw_2bpp_sprite(g_box_picker_sprite, 32, 24, 24.0f, 60.0f, 3.4f, true);
+		if (g_box_picker_color_icon_ready) {
+			ww_draw_indexed_icon(
+					g_box_picker_color_icon_indices,
+					g_box_picker_color_icon_width,
+					g_box_picker_color_icon_height,
+					g_box_picker_color_icon_palette,
+					22.0f,
+					54.0f,
+					2.95f,
+					true);
+		} else if (g_box_picker_sprite_ready) {
+			ww_draw_2bpp_sprite(
+					g_box_picker_sprite,
+					64,
+					48,
+					18.0f,
+					52.0f,
+					1.8f,
+					true,
+					0u,
+					false);
+		}
 
 		snprintf(line, sizeof(line), "Box %lu Slot %lu", (unsigned long)g_box_picker_box, (unsigned long)g_box_picker_slot);
 		ww_draw_string_width(170, 50, 12, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
@@ -4996,20 +5611,40 @@ static void ww_draw_simple_top_panel(void)
 		}
 
 		C2D_DrawRectSolid(6, 6, 0, 388, 228, C2D_Color32(0x13, 0x34, 0x3F, 0xFF));
-		ww_draw_string_width(12, 8, 10.4f, "Encounter Pokemon (6)", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		ww_draw_string_width(12, 8, 10.2f, "Encounter Pokemon (6)", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 
 		for (slot_index = 0; slot_index < WW_ROUTE_PREVIEW_SLOT_COUNT; slot_index++) {
 			u32 row = slot_index / 3u;
 			u32 col = slot_index % 3u;
 			float x = 8.0f + (float)col * 130.0f;
-			float y = 20.0f + (float)row * 64.0f;
+			float y = 20.0f + (float)row * 56.0f;
 			u32 row_color = g_route_preview_selected_group[slot_index] >= 0
 					? C2D_Color32(0x2A, 0x64, 0x52, 0xFF)
 					: C2D_Color32(0x1A, 0x44, 0x50, 0xFF);
 
-			C2D_DrawRectSolid(x, y, 0.0f, 126.0f, 58.0f, row_color);
-			if (g_route_preview_slots[slot_index].sprite_ready)
-				ww_draw_2bpp_sprite(g_route_preview_slots[slot_index].sprite_frame0, 32, 24, x + 3.0f, y + 5.0f, 1.32f, true);
+			C2D_DrawRectSolid(x, y, 0.0f, 126.0f, 50.0f, row_color);
+			if (g_route_preview_slots[slot_index].color_icon_ready) {
+				ww_draw_indexed_icon(
+						g_route_preview_slots[slot_index].color_icon_indices,
+						g_route_preview_slots[slot_index].color_icon_width,
+						g_route_preview_slots[slot_index].color_icon_height,
+						g_route_preview_slots[slot_index].color_icon_palette,
+						x + 4.0f,
+						y + 3.0f,
+						1.08f,
+						true);
+			} else if (g_route_preview_slots[slot_index].sprite_ready) {
+				ww_draw_2bpp_sprite(
+						g_route_preview_slots[slot_index].sprite_frame0,
+						32,
+						24,
+						x + 5.0f,
+						y + 6.0f,
+						1.20f,
+						true,
+						0u,
+						false);
+			}
 
 			snprintf(
 					line,
@@ -5017,7 +5652,7 @@ static void ww_draw_simple_top_panel(void)
 					"%lu. %.11s",
 					(unsigned long)(slot_index + 1),
 					g_route_preview_slots[slot_index].species_name);
-			ww_draw_string_width(x + 50.0f, y + 7.0f, 8.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(x + 45.0f, y + 6.0f, 8.4f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 
 			snprintf(
 					line,
@@ -5025,31 +5660,45 @@ static void ww_draw_simple_top_panel(void)
 					"%u%% | %u steps",
 					(unsigned)g_route_preview_slots[slot_index].chance,
 					(unsigned)g_route_preview_slots[slot_index].min_steps);
-			ww_draw_string_width(x + 50.0f, y + 25.0f, 7.9f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(x + 45.0f, y + 22.0f, 7.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			snprintf(line, sizeof(line), "Lv %u", (unsigned)g_route_preview_slots[slot_index].level);
+			ww_draw_string_width(x + 45.0f, y + 34.0f, 7.4f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 		}
 
-		ww_draw_string_width(12, 149, 10.6f, "Route Items (10)", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		ww_draw_string_width(12, 132, 10.8f, "Route Items (10)", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 		for (i = 0; i < WW_OV112_ITEM_COUNT; i++) {
 			u32 row = i / 5u;
 			u32 col = i % 5u;
 			float x = 8.0f + (float)col * 77.0f;
-			float y = 162.0f + (float)row * 36.0f;
+			float y = 144.0f + (float)row * 42.0f;
 
-			C2D_DrawRectSolid(x, y, 0.0f, 74.0f, 34.0f, C2D_Color32(0x1A, 0x44, 0x50, 0xFF));
-			ww_draw_item_token_sprite(g_route_preview_items[i].item_id, x + 2.0f, y + 4.0f, 1.45f);
+			C2D_DrawRectSolid(x, y, 0.0f, 74.0f, 40.0f, C2D_Color32(0x1A, 0x44, 0x50, 0xFF));
+			if (g_route_preview_items[i].icon_ready) {
+				ww_draw_indexed_icon(
+						g_route_preview_items[i].icon_indices,
+						g_route_preview_items[i].icon_width,
+						g_route_preview_items[i].icon_height,
+						g_route_preview_items[i].icon_palette,
+						x + 2.0f,
+						y + 2.0f,
+						0.95f,
+						true);
+			} else {
+				ww_draw_item_token_sprite(g_route_preview_items[i].item_id, x + 4.0f, y + 8.0f, 1.55f);
+			}
 			snprintf(
 					line,
 					sizeof(line),
-					"%.9s",
+					"%.8s",
 					g_route_preview_items[i].item_name);
-			ww_draw_string_width(x + 19.0f, y + 3.0f, 8.1f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(x + 34.0f, y + 4.0f, 8.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 			snprintf(
 					line,
 					sizeof(line),
-					"%u%% | %u st",
+					"%u%% %ust",
 					(unsigned)g_route_preview_items[i].chance,
 					(unsigned)g_route_preview_items[i].min_steps);
-			ww_draw_string_width(x + 19.0f, y + 16.0f, 7.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(x + 34.0f, y + 22.0f, 8.3f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 		}
 
 		return;
