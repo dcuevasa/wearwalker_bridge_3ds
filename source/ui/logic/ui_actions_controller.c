@@ -30,12 +30,11 @@ void call_toggle_simple_mode()
 	if (g_console_enabled) {
 		ww_init_debug_console();
 		ww_clear_debug_console();
-		/* Rebind top target when entering debug to keep states consistent. */
-		target_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+		/* Do not reset TOP GPU target here; console must remain the active top renderer in Debug. */
 	} else if (was_console_enabled && g_debug_console_ready) {
 		/* Leave debug mode cleanly so top simple UI does not render over stale console output. */
 		g_debug_console_ready = false;
-		target_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+		ww_reset_top_render_target();
 	}
 	g_active_menu = ww_get_main_menu();
 	g_active_menu->props.selected = 0;

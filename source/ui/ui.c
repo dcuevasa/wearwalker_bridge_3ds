@@ -67,6 +67,7 @@ static void ww_draw_top_context(void);
 static void ww_path_basename(const char *path, char *out, size_t out_size);
 static void ww_init_debug_console(void);
 static void ww_clear_debug_console(void);
+static void ww_reset_top_render_target(void);
 
 typedef enum {
 	WW_BOX_PICKER_NONE = 0,
@@ -908,6 +909,16 @@ static void ww_clear_debug_console(void)
 	consoleClear();
 	consoleSelect(&logs);
 	consoleClear();
+}
+
+static void ww_reset_top_render_target(void)
+{
+	/* Ensure TOP screen returns to C2D-compatible format after console usage. */
+	gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);
+	gfxSetDoubleBuffering(GFX_TOP, true);
+	gfxSwapBuffersGpu();
+	gspWaitForVBlank();
+	target_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
 }
 
 static void ww_path_basename(const char *path, char *out, size_t out_size)
