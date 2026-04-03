@@ -154,6 +154,9 @@ typedef enum {
 #define WW_UI_CONFIG_DIR "sdmc:/3ds/wearwalker_bridge"
 #define WW_UI_CONFIG_PATH "sdmc:/3ds/wearwalker_bridge/config.ini"
 #define TOP_SCREEN_WIDTH 400
+#define WW_ASYNC_TIMEOUT_STROLL_SEND_MS (20ull * 60ull * 1000ull)
+#define WW_ASYNC_TIMEOUT_STROLL_RETURN_MS (20ull * 60ull * 1000ull)
+#define WW_ASYNC_PRESTART_WINDOW_MS 2500ull
 
 typedef struct {
 	char name[WW_BROWSER_ENTRY_NAME_MAX];
@@ -278,6 +281,10 @@ typedef struct {
 	bool finished;
 	ww_async_task task;
 	bool success;
+	bool cancel_requested;
+	bool remote_started;
+	u64 started_ms;
+	u64 timeout_ms;
 	char json[WW_ASYNC_LOG_MAX];
 	wearwalker_snapshot snapshot;
 } ww_async_context;
@@ -843,13 +850,28 @@ static void ww_sync_port_entries(u16 port)
 
 static bool ww_apply_endpoint_from_ui(u16 port)
 {
+	if (!g_wearwalker_host || !g_wearwalker_host[0]) {
+		ww_set_top_status("Invalid host (empty)", 4000);
+		return false;
+	}
+
+	/* warn if loopback or wildcard address is used */
+	if (strcmp(g_wearwalker_host, "127.0.0.1") == 0 || strcmp(g_wearwalker_host, "0.0.0.0") == 0) {
+		ww_set_top_status("Host is loopback; set LAN IP to connect from 3DS", 6000);
+		/* still allow applying if user insists */
+	}
+
 	if (!ww_api_set_endpoint(g_wearwalker_host, port)) {
-		printf("Invalid WearWalker endpoint\n");
+		ww_set_top_status("Invalid WearWalker endpoint", 4000);
 		return false;
 	}
 
 	ww_sync_port_entries(port);
-	printf("Using WearWalker endpoint %s:%lu\n", g_wearwalker_host, (unsigned long)port);
+	{
+		char msg[128];
+		snprintf(msg, sizeof(msg), "Using WearWalker endpoint %s:%u", g_wearwalker_host, (unsigned)port);
+		ww_set_top_status(msg, 4000);
+	}
 	ww_save_ui_config();
 	return true;
 }
@@ -1707,7 +1729,8 @@ static bool ww_route_selector_open(void)
 
 #include "views/ui_route_return_views.c"
 #include "views/ui_simple_top_panel_view.c"
-s32 numpad_input(const char *hint_text, u8 digits)
+/* initial_text may be NULL to leave input empty */
+s32 numpad_input(const char *hint_text, u8 digits, const char *initial_text)
 {
 	char buf[32];
 	SwkbdState swkbd;
@@ -1717,6 +1740,11 @@ s32 numpad_input(const char *hint_text, u8 digits)
 	swkbdSetHintText(&swkbd, hint_text);
 	swkbdSetValidation(&swkbd, SWKBD_NOTBLANK_NOTEMPTY, 0, 0);
 	swkbdSetFeatures(&swkbd, SWKBD_FIXED_WIDTH);
+	/* set initial text if provided */
+	if (initial_text && initial_text[0])
+		snprintf(buf, sizeof(buf), "%s", initial_text);
+	else
+		buf[0] = '\0';
 	button = swkbdInputText(&swkbd, buf, sizeof(buf));
 
 	return button == SWKBD_BUTTON_RIGHT ? atoi(buf) : -1;
@@ -1746,11 +1774,27 @@ bool text_input(const char *hint_text, char *out, u32 max_len)
 	return true;
 }
 
+/* Top-screen transient status message (drawn on simple top panel). */
+char g_top_status_msg[128] = "";
+u32 g_top_status_expire_tick = 0;
+
+void ww_set_top_status(const char *msg, u32 duration_ms)
+{
+	if (!msg) {
+		g_top_status_msg[0] = '\0';
+		g_top_status_expire_tick = 0;
+		return;
+	}
+	snprintf(g_top_status_msg, sizeof(g_top_status_msg), "%s", msg);
+	/* approximate ticks: UI advances once per frame; assume ~16ms/frame */
+	g_top_status_expire_tick = g_ui_anim_tick + (duration_ms / 16u) + 1u;
+}
+
 // menu_entry must be of type ENTRY_SELATTR
 void goto_item(menu_entry *entry)
 {
 	char str[] = "Go to item";
-	s32 value = numpad_input(str, 3);
+	s32 value = numpad_input(str, 3, NULL);
 
 	if (value >= 0 && value < entry->sel_menu.props.len)
 		entry->sel_menu.props.selected = value;
@@ -1779,7 +1823,11 @@ void set_numattr(menu_entry *entry)
 			(unsigned long)entry->num_attr.min,
 			(unsigned long)entry->num_attr.max);
 	digits = ww_num_digits(entry->num_attr.max);
-	value = numpad_input(strbuf, digits);
+	{
+		char initbuf[32];
+		snprintf(initbuf, sizeof(initbuf), "%u", (unsigned)entry->num_attr.value);
+		value = numpad_input(strbuf, digits, initbuf);
+	}
 
 	if (value != -1) {
 		value = value > entry->num_attr.max ? entry->num_attr.max : value;
@@ -1867,10 +1915,35 @@ enum operation ui_update()
 	}
 
 	if (g_return_apply_busy && g_state == IN_RETURN_SELECTOR)
+	{
+		if (kDown & KEY_B) {
+			if (ww_async_request_cancel_before_start()) {
+				g_return_apply_busy = false;
+				ww_return_flow_reset();
+				g_state = IN_MENU;
+				g_active_menu = ww_get_main_menu();
+				printf("Guided return cancelled before remote start\n");
+			} else {
+				printf("Cannot cancel now: guided return already started remotely\n");
+			}
+		}
 		return OP_UPDATE;
+	}
 
 	if (g_route_send_busy && g_state == IN_ROUTE_SELECTOR)
+	{
+		if (kDown & KEY_B) {
+			if (ww_async_request_cancel_before_start()) {
+				g_route_send_busy = false;
+				g_state = IN_MENU;
+				g_active_menu = ww_get_main_menu();
+				printf("Send cancelled before remote start\n");
+			} else {
+				printf("Cannot cancel now: send already started remotely\n");
+			}
+		}
 		return OP_UPDATE;
+	}
 
 	if (kDown & KEY_START) {
 		if (g_return_flow_active || g_return_apply_busy) {

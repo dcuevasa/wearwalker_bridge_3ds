@@ -160,21 +160,21 @@ void call_select_hgss_rom()
 void call_show_hgss_save_path()
 {
 	if (!g_selected_hgss_save_path[0]) {
-		printf("No HGSS save selected\n");
+		ww_set_top_status("No HGSS save selected", 3000);
 		return;
 	}
 
-	printf("Selected HGSS save: %s\n", g_selected_hgss_save_path);
+	ww_set_top_status(g_selected_hgss_save_path, 5000);
 }
 
 void call_show_hgss_rom_path()
 {
 	if (!g_selected_hgss_nds_path[0]) {
-		printf("No HGSS ROM selected\n");
+		ww_set_top_status("No HGSS ROM selected", 3000);
 		return;
 	}
 
-	printf("Selected HGSS ROM: %s\n", g_selected_hgss_nds_path);
+	ww_set_top_status(g_selected_hgss_nds_path, 5000);
 }
 
 static void ww_return_flow_reset(void)

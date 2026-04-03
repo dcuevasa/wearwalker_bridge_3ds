@@ -1,3 +1,125 @@
+static bool ww_async_has_timed_out(ww_async_task task, char *json, u32 json_size);
+static bool ww_async_consume_cancel_before_start(char *json, u32 json_size);
+
+static u64 ww_async_timeout_for_task(ww_async_task task)
+{
+	switch (task) {
+		case WW_TASK_HGSS_STROLL_SEND:
+			return WW_ASYNC_TIMEOUT_STROLL_SEND_MS;
+		case WW_TASK_HGSS_STROLL_RETURN:
+		case WW_TASK_HGSS_STROLL_RETURN_GUIDED_APPLY:
+			return WW_ASYNC_TIMEOUT_STROLL_RETURN_MS;
+		default:
+			return 0;
+	}
+}
+
+static bool ww_async_wait_prestart_window(ww_async_task task, char *json, u32 json_size, const char *label)
+{
+	u64 deadline_ms;
+
+	if (label && label[0])
+		ww_async_progress_set(0, label);
+
+	deadline_ms = osGetTime() + WW_ASYNC_PRESTART_WINDOW_MS;
+	while (osGetTime() < deadline_ms) {
+		if (ww_async_consume_cancel_before_start(json, json_size))
+			return false;
+		if (ww_async_has_timed_out(task, json, json_size))
+			return false;
+		svcSleepThread(100000000LL);
+	}
+
+	return true;
+}
+
+static bool ww_async_has_timed_out(ww_async_task task, char *json, u32 json_size)
+{
+	u64 started_ms;
+	u64 timeout_ms;
+	u64 elapsed_ms;
+
+	LightLock_Lock(&g_ww_async.lock);
+	started_ms = g_ww_async.started_ms;
+	timeout_ms = g_ww_async.timeout_ms;
+	LightLock_Unlock(&g_ww_async.lock);
+
+	if (timeout_ms == 0)
+		return false;
+
+	elapsed_ms = osGetTime() - started_ms;
+	if (elapsed_ms <= timeout_ms)
+		return false;
+
+	if (json && json_size > 0) {
+		snprintf(
+				json,
+				json_size,
+				"%s timed out after %lu seconds",
+				ww_async_task_name(task),
+				(unsigned long)(elapsed_ms / 1000u));
+	}
+
+	return true;
+}
+
+static bool ww_async_can_cancel_before_start(void)
+{
+	bool can_cancel;
+
+	LightLock_Lock(&g_ww_async.lock);
+	can_cancel = g_ww_async.running && !g_ww_async.remote_started;
+	LightLock_Unlock(&g_ww_async.lock);
+
+	return can_cancel;
+}
+
+static bool ww_async_request_cancel_before_start(void)
+{
+	bool requested = false;
+
+	LightLock_Lock(&g_ww_async.lock);
+	if (g_ww_async.running && !g_ww_async.remote_started) {
+		g_ww_async.cancel_requested = true;
+		requested = true;
+	}
+	LightLock_Unlock(&g_ww_async.lock);
+
+	return requested;
+}
+
+static bool ww_async_consume_cancel_before_start(char *json, u32 json_size)
+{
+	bool cancel = false;
+
+	LightLock_Lock(&g_ww_async.lock);
+	if (g_ww_async.cancel_requested && !g_ww_async.remote_started) {
+		g_ww_async.cancel_requested = false;
+		cancel = true;
+	}
+	LightLock_Unlock(&g_ww_async.lock);
+
+	if (cancel && json && json_size > 0)
+		snprintf(json, json_size, "operation cancelled before remote start");
+
+	return cancel;
+}
+
+static void ww_async_mark_remote_started(void)
+{
+	LightLock_Lock(&g_ww_async.lock);
+	g_ww_async.remote_started = true;
+	LightLock_Unlock(&g_ww_async.lock);
+}
+
+static bool ww_async_should_abort_before_remote(ww_async_task task, char *json, u32 json_size)
+{
+	if (ww_async_consume_cancel_before_start(json, json_size))
+		return true;
+
+	return ww_async_has_timed_out(task, json, json_size);
+}
+
 static void ww_async_worker(void *arg)
 {
 	ww_async_task task = (ww_async_task)(uintptr_t)arg;
@@ -46,6 +168,9 @@ static void ww_async_worker(void *arg)
 		g_ww_async.success = false;
 		g_ww_async.finished = true;
 		g_ww_async.running = false;
+		g_ww_async.cancel_requested = false;
+		g_ww_async.remote_started = false;
+		g_ww_async.timeout_ms = 0;
 		g_ww_async.task = task;
 		memset(&g_ww_async.snapshot, 0, sizeof(g_ww_async.snapshot));
 		snprintf(g_ww_async.json, sizeof(g_ww_async.json), "out of memory");
@@ -206,7 +331,12 @@ static void ww_async_worker(void *arg)
 				bool route_cache_hit = false;
 				u8 level;
 
-				ww_async_progress_set(5, "Reading save context");
+				if (ww_async_should_abort_before_remote(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
+					break;
+				}
+
+				ww_async_progress_set(0, "Preparing send request");
 
 				if (!pending_nds_path[0]) {
 					snprintf(json, WW_API_RESPONSE_MAX, "missing HGSS .nds path for dynamic sprite workflow");
@@ -236,7 +366,25 @@ static void ww_async_worker(void *arg)
 					snprintf(seed_trainer_name, sizeof(seed_trainer_name), "WWBRIDGE");
 
 				level = ww_estimate_level_from_exp(send_context.source_slot.exp);
-				ww_async_progress_set(12, "Syncing trainer with API");
+
+				if (ww_async_should_abort_before_remote(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
+					break;
+				}
+
+				if (!ww_async_wait_prestart_window(task, json, WW_API_RESPONSE_MAX, "Ready to send (B to cancel)")) {
+					success = false;
+					break;
+				}
+
+				if (ww_async_should_abort_before_remote(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
+					break;
+				}
+
+				ww_async_progress_set(0, "Syncing trainer with API");
+
+				ww_async_mark_remote_started();
 
 				if (!ww_api_patch_identity(
 						seed_trainer_name,
@@ -256,12 +404,23 @@ static void ww_async_worker(void *arg)
 						break;
 					}
 				}
+
+				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
+					free(send_body);
+					send_body = NULL;
+					success = false;
+					break;
+				}
 				ww_async_progress_set(22, "Trainer synced");
 				ww_async_progress_set(28, "Syncing steps with API");
 
 				success = ww_api_command_set_steps(send_context.pokewalker_steps, NULL, NULL, 0);
 				if (!success) {
 					snprintf(json, WW_API_RESPONSE_MAX, "failed to seed EEPROM steps from HGSS save");
+					break;
+				}
+				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
 					break;
 				}
 				ww_async_progress_set(36, "Steps synced");
@@ -274,6 +433,10 @@ static void ww_async_worker(void *arg)
 				success = ww_api_command_set_watts(eeprom_watts, NULL, NULL, 0);
 				if (!success) {
 					snprintf(json, WW_API_RESPONSE_MAX, "failed to seed EEPROM watts from HGSS save");
+					break;
+				}
+				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
 					break;
 				}
 				ww_async_progress_set(50, "Watts synced");
@@ -327,6 +490,11 @@ static void ww_async_worker(void *arg)
 				}
 				ww_async_progress_set(68, "Route payload ready");
 				ww_async_progress_set(82, "Request sent to API");
+
+				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
+					break;
+				}
 
 				success = ww_api_stroll_send_resolved_json(send_body, json, WW_API_RESPONSE_MAX);
 				free(send_body);
@@ -455,6 +623,11 @@ static void ww_async_worker(void *arg)
 
 				capture_species_name[0] = '\0';
 
+				if (ww_async_should_abort_before_remote(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
+					break;
+				}
+
 				success = hgss_read_box_slot_summary(
 						pending_save_path,
 						(u8)pending_return_box,
@@ -469,6 +642,25 @@ static void ww_async_worker(void *arg)
 				if (source_slot.occupied && source_slot.species_id != 0)
 					expected_source_species = source_slot.species_id;
 
+				if (ww_async_should_abort_before_remote(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
+					break;
+				}
+
+				if (!ww_async_wait_prestart_window(task, json, WW_API_RESPONSE_MAX, "Ready to return (B to cancel)")) {
+					success = false;
+					break;
+				}
+
+				if (ww_async_should_abort_before_remote(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
+					break;
+				}
+
+				ww_async_progress_set(0, "Requesting return from API");
+
+				ww_async_mark_remote_started();
+
 				success = ww_api_stroll_return(
 						pending_return_walked_steps,
 						(u16)pending_return_bonus_watts,
@@ -479,6 +671,12 @@ static void ww_async_worker(void *arg)
 						WW_API_RESPONSE_MAX);
 				if (!success) {
 					snprintf(json, WW_API_RESPONSE_MAX, "stroll return request failed");
+					break;
+				}
+				ww_async_progress_set(45, "Return accepted by API");
+
+				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
 					break;
 				}
 
@@ -492,6 +690,13 @@ static void ww_async_worker(void *arg)
 				success = ww_api_get_sync_package(sync_json, WW_API_RESPONSE_MAX);
 				if (!success) {
 					snprintf(json, WW_API_RESPONSE_MAX, "failed to fetch sync package after return");
+					free(sync_json);
+					break;
+				}
+				ww_async_progress_set(70, "Sync package fetched");
+
+				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
 					free(sync_json);
 					break;
 				}
@@ -646,6 +851,11 @@ static void ww_async_worker(void *arg)
 				api_error[0] = '\0';
 				api_detail[0] = '\0';
 
+				if (ww_async_should_abort_before_remote(task, json, WW_API_RESPONSE_MAX)) {
+					success = false;
+					break;
+				}
+
 				return_json = (char *)malloc(WW_API_RESPONSE_MAX);
 				sync_json = (char *)malloc(WW_API_RESPONSE_MAX);
 				if (!return_json || !sync_json) {
@@ -658,7 +868,22 @@ static void ww_async_worker(void *arg)
 					break;
 				}
 
-				ww_async_progress_set(4, "Requesting return from API");
+				if (!ww_async_wait_prestart_window(task, json, WW_API_RESPONSE_MAX, "Ready to return (B to cancel)")) {
+					free(return_json);
+					free(sync_json);
+					success = false;
+					break;
+				}
+
+				if (ww_async_should_abort_before_remote(task, json, WW_API_RESPONSE_MAX)) {
+					free(return_json);
+					free(sync_json);
+					success = false;
+					break;
+				}
+
+				ww_async_progress_set(0, "Requesting return from API");
+				ww_async_mark_remote_started();
 				if (!ww_api_stroll_return(
 							pending_return_walked_steps,
 							(u16)pending_return_bonus_watts,
@@ -686,6 +911,14 @@ static void ww_async_worker(void *arg)
 					success = false;
 					break;
 				}
+				ww_async_progress_set(35, "Return accepted by API");
+
+				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
+					free(return_json);
+					free(sync_json);
+					success = false;
+					break;
+				}
 
 				if (!ww_json_get_u32_after_token(return_json, "\"returnedPokemon\"", "speciesId", &api_return_species)
 						|| api_return_species == 0
@@ -698,9 +931,17 @@ static void ww_async_worker(void *arg)
 					api_exp_gain = pending_return_exp_gain;
 				}
 
-				ww_async_progress_set(12, "Fetching sync package");
+				ww_async_progress_set(35, "Fetching sync package");
 				if (!ww_api_get_sync_package(sync_json, WW_API_RESPONSE_MAX)) {
 					snprintf(json, WW_API_RESPONSE_MAX, "guided return sync fetch failed");
+					free(return_json);
+					free(sync_json);
+					success = false;
+					break;
+				}
+				ww_async_progress_set(60, "Sync package fetched");
+
+				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
 					free(return_json);
 					free(sync_json);
 					success = false;
@@ -722,7 +963,7 @@ static void ww_async_worker(void *arg)
 				free(return_json);
 				free(sync_json);
 
-				ww_async_progress_set(20, "Applying returned Pokemon");
+				ww_async_progress_set(70, "Applying returned Pokemon");
 				success = hgss_apply_stroll_return(
 						pending_save_path,
 						(u8)pending_return_box,
@@ -784,6 +1025,11 @@ static void ww_async_worker(void *arg)
 					hgss_stroll_return_report capture_report;
 					ww_return_capture_choice *capture = &pending_return_captures[i];
 					u32 progress = 28u + (u32)i * 20u;
+
+					if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
+						success = false;
+						break;
+					}
 
 					if (!capture->present || capture->species_id == 0)
 						continue;
@@ -871,6 +1117,9 @@ static void ww_async_worker(void *arg)
 	g_ww_async.success = success;
 	g_ww_async.finished = true;
 	g_ww_async.running = false;
+	g_ww_async.cancel_requested = false;
+	g_ww_async.remote_started = false;
+	g_ww_async.timeout_ms = 0;
 	g_ww_async.task = task;
 	g_ww_async.snapshot = snapshot;
 	snprintf(g_ww_async.json, sizeof(g_ww_async.json), "%s", json);
@@ -893,6 +1142,10 @@ static bool ww_async_start(ww_async_task task)
 	g_ww_async.running = true;
 	g_ww_async.finished = false;
 	g_ww_async.success = false;
+	g_ww_async.cancel_requested = false;
+	g_ww_async.remote_started = false;
+	g_ww_async.started_ms = osGetTime();
+	g_ww_async.timeout_ms = ww_async_timeout_for_task(task);
 	g_ww_async.task = task;
 	g_ww_async.json[0] = '\0';
 	memset(&g_ww_async.snapshot, 0, sizeof(g_ww_async.snapshot));
@@ -904,6 +1157,9 @@ static bool ww_async_start(ww_async_task task)
 	if (!thread) {
 		LightLock_Lock(&g_ww_async.lock);
 		g_ww_async.running = false;
+		g_ww_async.cancel_requested = false;
+		g_ww_async.remote_started = false;
+		g_ww_async.timeout_ms = 0;
 		LightLock_Unlock(&g_ww_async.lock);
 		return false;
 	}
@@ -994,6 +1250,9 @@ static void ww_async_shutdown(void)
 	g_ww_async.thread = NULL;
 	g_ww_async.running = false;
 	g_ww_async.finished = false;
+	g_ww_async.cancel_requested = false;
+	g_ww_async.remote_started = false;
+	g_ww_async.timeout_ms = 0;
 	LightLock_Unlock(&g_ww_async.lock);
 
 	if (thread) {

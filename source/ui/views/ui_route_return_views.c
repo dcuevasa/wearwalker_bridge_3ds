@@ -96,7 +96,10 @@ static void ww_draw_route_selector(void)
 		draw_string(0.0f, 154.0f, 9.5f, "Sending to Pokewalker", true, 0);
 		snprintf(line, sizeof(line), "%s (%lu%%)", progress_label, (unsigned long)progress_pct);
 		draw_string(0.0f, 168.0f, 8.6f, line, true, 0);
-		draw_string(0.0f, 184.0f, 8.4f, "Please wait...", true, 0);
+		if (ww_async_can_cancel_before_start())
+			draw_string(0.0f, 184.0f, 8.4f, "B: cancel while pending", true, 0);
+		else
+			draw_string(0.0f, 184.0f, 8.4f, "Please wait...", true, 0);
 	} else {
 		draw_string(0, 224, 8, "DPad left/right route  A send  B back", true, 0);
 	}
@@ -228,7 +231,10 @@ static void ww_draw_return_selector(void)
 		draw_string(0.0f, 114.0f, 10.0f, line, true, 0);
 		C2D_DrawRectSolid(40.0f, 142.0f, 0.0f, 240.0f, 16.0f, C2D_Color32(0x2B, 0x46, 0x4C, 0xFF));
 		C2D_DrawRectSolid(40.0f, 142.0f, 0.0f, (240.0f * (float)progress_pct) / 100.0f, 16.0f, C2D_Color32(0x6D, 0xC1, 0x8D, 0xFF));
-		draw_string(0.0f, 172.0f, 9.0f, "Please wait, returning to main menu...", true, 0);
+		if (ww_async_can_cancel_before_start())
+			draw_string(0.0f, 172.0f, 9.0f, "B: cancel while pending", true, 0);
+		else
+			draw_string(0.0f, 172.0f, 9.0f, "Please wait, returning to main menu...", true, 0);
 		return;
 	}
 

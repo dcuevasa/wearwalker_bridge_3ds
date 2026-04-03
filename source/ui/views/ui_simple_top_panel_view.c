@@ -1,3 +1,6 @@
+/* Include UI header so this view can be compiled standalone */
+#include "ui/ui.h"
+
 static void ww_draw_simple_top_panel(void)
 {
 	char line[128];
@@ -142,6 +145,29 @@ static void ww_draw_simple_top_panel(void)
 		return;
 	}
 
+	/* If Settings menu is active, show current backend and selected paths on top screen */
+	if (g_active_menu == &settings_menu) {
+		char hostline[96];
+		char save_name[48];
+		char rom_name[48];
+
+		ww_path_basename(g_selected_hgss_save_path, save_name, sizeof(save_name));
+		ww_path_basename(g_selected_hgss_nds_path, rom_name, sizeof(rom_name));
+
+		snprintf(hostline, sizeof(hostline), "Host: %s:%u", ww_api_get_host(), (unsigned)ww_api_get_port());
+		ww_draw_string_width(12, 52, 12, "Settings", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		ww_draw_string_width(12, 74, 10, hostline, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		ww_draw_string_width(12, 92, 10, save_name, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		ww_draw_string_width(12, 110, 10, rom_name, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+
+		/* transient top status overrides */
+		if (g_top_status_msg[0] && g_ui_anim_tick < g_top_status_expire_tick) {
+			ww_draw_string_width(12, 140, 10, g_top_status_msg, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		}
+
+		return;
+	}
+
 	if (g_state == IN_ROUTE_SELECTOR) {
 		u32 slot_index;
 		u32 progress_pct = 0;
@@ -164,7 +190,10 @@ static void ww_draw_simple_top_panel(void)
 			ww_draw_string_width(0, 116, 13, line, true, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 			C2D_DrawRectSolid(44.0f, 142.0f, 0.0f, 312.0f, 18.0f, C2D_Color32(0x2B, 0x46, 0x4C, 0xFF));
 			C2D_DrawRectSolid(44.0f, 142.0f, 0.0f, (312.0f * (float)progress_pct) / 100.0f, 18.0f, C2D_Color32(0x6D, 0xC1, 0x8D, 0xFF));
-			ww_draw_string_width(0, 172, 10.5f, "Returning to menu after completion", true, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			if (ww_async_can_cancel_before_start())
+				ww_draw_string_width(0, 172, 10.5f, "B: cancel while pending", true, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			else
+				ww_draw_string_width(0, 172, 10.5f, "Returning to menu after completion", true, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 			return;
 		}
 
