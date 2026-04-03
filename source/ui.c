@@ -53,6 +53,7 @@ void call_apply_settings_endpoint();
 void call_toggle_simple_mode();
 void call_save_ui_config_now();
 void call_start_guided_send(void);
+void call_start_guided_return(void);
 
 static bool ww_save_ui_config(void);
 static void ww_sync_port_entries(u16 port);
@@ -69,6 +70,9 @@ typedef enum {
 	WW_BOX_PICKER_NONE = 0,
 	WW_BOX_PICKER_SEND_SOURCE,
 	WW_BOX_PICKER_RETURN_SOURCE,
+	WW_BOX_PICKER_RETURN_CAPTURE_1,
+	WW_BOX_PICKER_RETURN_CAPTURE_2,
+	WW_BOX_PICKER_RETURN_CAPTURE_3,
 } ww_box_picker_mode;
 
 static bool ww_box_selector_reload(void);
@@ -79,6 +83,13 @@ static bool ww_compute_simple_return_walked_steps(u32 *out_walked_steps);
 static bool ww_route_selector_reload(void);
 static bool ww_route_selector_open(void);
 static void ww_draw_route_selector(void);
+static void ww_draw_return_selector(void);
+static void ww_return_flow_reset(void);
+static bool ww_return_fetch_trip_preview(void);
+static bool ww_return_open_capture_picker(u8 capture_index);
+static bool ww_return_validate_capture_target(u8 capture_index, u8 box, u8 slot);
+static void ww_return_set_capture_auto_all(void);
+static bool ww_start_guided_return_apply(void);
 static void ww_draw_2bpp_sprite(
 		const u8 *sprite,
 		u32 width,
@@ -132,8 +143,27 @@ typedef struct {
 	char item_name[32];
 } ww_route_item_preview;
 
+typedef struct {
+	bool present;
+	u16 species_id;
+	u8 level;
+	u16 moves[4];
+	u32 api_slot;
+	u8 target_box;
+	u8 target_slot;
+	char species_name[32];
+} ww_return_capture_choice;
+
+typedef enum {
+	WW_RETURN_STEP_CONFIRM = 0,
+	WW_RETURN_STEP_CAPTURE_POLICY,
+	WW_RETURN_STEP_REVIEW,
+	WW_RETURN_STEP_APPLYING,
+} ww_return_step;
+
 #define WW_ROUTE_PREVIEW_SLOT_COUNT 6u
 #define WW_ROUTE_SELECTED_SLOT_COUNT 3u
+#define WW_RETURN_CAPTURE_MAX 3u
 
 #define WW_SAVE_PATH_MAX 512
 #define WW_BROWSER_ENTRY_NAME_MAX 256
@@ -220,6 +250,7 @@ static bool g_route_selector_special_lock = false;
 static s32 g_route_selector_required_watts = 0;
 static u32 g_route_selector_current_watts = 0;
 static bool g_route_send_busy = false;
+static bool g_return_apply_busy = false;
 static u32 g_ui_anim_tick = 0;
 static u32 g_async_progress_percent = 0;
 static char g_async_progress_label[48] = "Idle";
@@ -227,6 +258,20 @@ static u32 g_route_selector_session_seed = 0;
 static u32 g_route_selector_preview_seed = 0;
 static u32 g_pending_send_route_seed = 0;
 static bool g_pending_send_route_seed_valid = false;
+static bool g_return_flow_active = false;
+static ww_return_step g_return_step = WW_RETURN_STEP_CONFIRM;
+static bool g_return_manual_capture_targets = false;
+static u8 g_return_capture_pick_index = 0;
+static u16 g_return_preview_source_species = 0;
+static char g_return_preview_source_name[32];
+static u32 g_return_preview_walked_steps = 0;
+static u32 g_return_preview_exp_gain = 0;
+static u32 g_return_preview_sync_steps = 0;
+static u32 g_return_preview_sync_watts = 0;
+static u32 g_return_preview_sync_flags = 0;
+static u8 g_return_capture_count = 0;
+static char g_return_error[160];
+static ww_return_capture_choice g_return_captures[WW_RETURN_CAPTURE_MAX];
 
 typedef enum {
 	WW_TASK_NONE = 0,
@@ -242,6 +287,7 @@ typedef enum {
 	WW_TASK_HGSS_PATCH_SYNC,
 	WW_TASK_HGSS_STROLL_SEND,
 	WW_TASK_HGSS_STROLL_RETURN,
+	WW_TASK_HGSS_STROLL_RETURN_GUIDED_APPLY,
 } ww_async_task;
 
 typedef struct {
@@ -419,6 +465,8 @@ static const char *ww_async_task_name(ww_async_task task)
 			return "HGSS stroll send";
 		case WW_TASK_HGSS_STROLL_RETURN:
 			return "HGSS stroll return";
+		case WW_TASK_HGSS_STROLL_RETURN_GUIDED_APPLY:
+			return "HGSS guided stroll return";
 		default:
 			return "request";
 	}
@@ -763,6 +811,25 @@ static bool ww_json_get_u32_after_token(const char *json, const char *anchor, co
 	return ww_json_get_u32_from(cursor, key, out_value);
 }
 
+static bool ww_json_get_string_after_token(
+		const char *json,
+		const char *anchor,
+		const char *key,
+		char *out_str,
+		u32 out_size)
+{
+	const char *cursor;
+
+	if (!json || !anchor || !key || !out_str || out_size == 0)
+		return false;
+
+	cursor = strstr(json, anchor);
+	if (!cursor)
+		return false;
+
+	return ww_json_get_string_from(cursor, key, out_str, out_size);
+}
+
 static u8 ww_estimate_level_from_exp(u32 exp)
 {
 	u8 level = 1;
@@ -857,6 +924,108 @@ static bool ww_json_get_first_capture(
 	*out_species = (u16)species;
 	*out_level = (u8)level;
 	return true;
+}
+
+static u8 ww_json_get_caught_captures_from_sync(
+		const char *sync_json,
+		ww_return_capture_choice out_captures[WW_RETURN_CAPTURE_MAX])
+{
+	const char *domains;
+	const char *inventory;
+	const char *caught;
+	const char *list_start;
+	const char *list_end;
+	const char *cursor;
+	u8 parsed = 0;
+	u8 i;
+
+	if (!sync_json || !out_captures)
+		return 0;
+
+	for (i = 0; i < WW_RETURN_CAPTURE_MAX; i++)
+		memset(&out_captures[i], 0, sizeof(out_captures[i]));
+
+	domains = strstr(sync_json, "\"domains\"");
+	if (!domains)
+		return 0;
+
+	inventory = strstr(domains, "\"inventory\"");
+	if (!inventory)
+		return 0;
+
+	caught = strstr(inventory, "\"caught\"");
+	if (!caught)
+		return 0;
+
+	list_start = strchr(caught, '[');
+	if (!list_start)
+		return 0;
+	list_end = ww_json_find_array_end(list_start, sync_json + strlen(sync_json));
+	if (!list_end)
+		return 0;
+
+	cursor = list_start + 1;
+	while (cursor < list_end && parsed < WW_RETURN_CAPTURE_MAX) {
+		const char *entry;
+		const char *entry_end;
+		u32 species = 0;
+		u32 level = 10;
+		u32 api_slot = 0;
+		ww_return_capture_choice *capture;
+
+		entry = strchr(cursor, '{');
+		if (!entry || entry >= list_end)
+			break;
+
+		entry_end = ww_json_find_object_end(entry, list_end + 1);
+		if (!entry_end)
+			break;
+
+		if (!ww_json_get_u32_from_range(entry, entry_end + 1, "speciesId", &species)
+				|| species == 0
+				|| species > 0xFFFFu) {
+			cursor = entry_end + 1;
+			continue;
+		}
+
+		ww_json_get_u32_from_range(entry, entry_end + 1, "level", &level);
+		ww_json_get_u32_from_range(entry, entry_end + 1, "slot", &api_slot);
+		if (level == 0 || level > 100)
+			level = 10;
+
+		capture = &out_captures[parsed];
+		capture->present = true;
+		capture->species_id = (u16)species;
+		capture->level = (u8)level;
+		capture->api_slot = api_slot;
+		capture->target_box = 0;
+		capture->target_slot = 0;
+		capture->moves[0] = 0;
+		capture->moves[1] = 0;
+		capture->moves[2] = 0;
+		capture->moves[3] = 0;
+
+		if (!ww_json_get_string_from_range(
+					entry,
+					entry_end + 1,
+					"speciesName",
+					capture->species_name,
+					sizeof(capture->species_name))) {
+			snprintf(
+					capture->species_name,
+					sizeof(capture->species_name),
+					"%s",
+					ww_lookup_species_name(capture->species_id));
+		}
+
+		if (!ww_json_get_moves_from_range(entry, entry_end + 1, capture->moves))
+			capture->moves[0] = 33;
+
+		parsed++;
+		cursor = entry_end + 1;
+	}
+
+	return parsed;
 }
 
 static bool ww_json_get_configured_route_species_name(
@@ -3197,6 +3366,13 @@ static void ww_async_worker(void *arg)
 	u32 pending_return_bonus_watts = g_pending_return_bonus_watts;
 	u32 pending_return_auto_captures = g_pending_return_auto_captures;
 	bool pending_return_increment_trip_counter = g_pending_return_increment_trip_counter;
+	u16 pending_return_expected_species = g_return_preview_source_species;
+	u32 pending_return_exp_gain = g_return_preview_exp_gain;
+	u32 pending_return_sync_steps = g_return_preview_sync_steps;
+	u32 pending_return_sync_watts = g_return_preview_sync_watts;
+	u32 pending_return_sync_flags = g_return_preview_sync_flags;
+	u8 pending_return_capture_count = g_return_capture_count;
+	ww_return_capture_choice pending_return_captures[WW_RETURN_CAPTURE_MAX];
 	char pending_trainer[sizeof(g_pending_trainer)];
 	char pending_save_path[sizeof(g_pending_save_path)];
 	char pending_nds_path[sizeof(g_pending_nds_path)];
@@ -3204,6 +3380,7 @@ static void ww_async_worker(void *arg)
 	snprintf(pending_trainer, sizeof(pending_trainer), "%s", g_pending_trainer);
 	snprintf(pending_save_path, sizeof(pending_save_path), "%s", g_pending_save_path);
 	snprintf(pending_nds_path, sizeof(pending_nds_path), "%s", g_pending_nds_path);
+	memcpy(pending_return_captures, g_return_captures, sizeof(pending_return_captures));
 
 	if (!json) {
 		LightLock_Lock(&g_ww_async.lock);
@@ -3698,6 +3875,7 @@ static void ww_async_worker(void *arg)
 						pending_save_path,
 						(u8)pending_return_box,
 						(u8)pending_return_source_slot,
+						(u8)pending_return_box,
 						(u8)pending_return_target_slot,
 						expected_source_species,
 						exp_gain,
@@ -3745,10 +3923,10 @@ static void ww_async_worker(void *arg)
 					break;
 				}
 
-				if (report.capture_species != 0 && report.target_slot > 0) {
+				if (report.capture_species != 0 && report.target_box > 0 && report.target_slot > 0) {
 					success = hgss_read_box_slot_summary(
 							pending_save_path,
-							(u8)pending_return_box,
+							(u8)report.target_box,
 							(u8)report.target_slot,
 							&verify_target_slot,
 							verify_error,
@@ -3787,6 +3965,242 @@ static void ww_async_worker(void *arg)
 						(unsigned long)report.pokewalker_steps_after,
 						(unsigned long)report.pokewalker_watts_after,
 						(unsigned long)report.pokewalker_course_flags_after);
+				break;
+			}
+			case WW_TASK_HGSS_STROLL_RETURN_GUIDED_APPLY: {
+				hgss_stroll_return_report base_report;
+				hgss_box_slot_summary verify_source_slot;
+				char patch_error[128];
+				char verify_error[128];
+				char api_error[96];
+				char api_detail[128];
+				char capture_summary[384];
+				char *return_json = NULL;
+				char *sync_json = NULL;
+				u32 api_return_species = pending_return_expected_species;
+				u32 api_exp_gain = pending_return_exp_gain;
+				u8 captures_written = 0;
+				u8 captures_skipped = 0;
+				u8 i;
+
+				capture_summary[0] = '\0';
+				api_error[0] = '\0';
+				api_detail[0] = '\0';
+
+				return_json = (char *)malloc(WW_API_RESPONSE_MAX);
+				sync_json = (char *)malloc(WW_API_RESPONSE_MAX);
+				if (!return_json || !sync_json) {
+					snprintf(json, WW_API_RESPONSE_MAX, "out of memory during guided return apply");
+					if (return_json)
+						free(return_json);
+					if (sync_json)
+						free(sync_json);
+					success = false;
+					break;
+				}
+
+				ww_async_progress_set(4, "Requesting return from API");
+				if (!ww_api_stroll_return(
+							pending_return_walked_steps,
+							(u16)pending_return_bonus_watts,
+							0,
+							false,
+							false,
+							return_json,
+							WW_API_RESPONSE_MAX)) {
+					ww_json_get_string_from(return_json, "error", api_error, sizeof(api_error));
+					if (!ww_json_get_string_from(return_json, "detail", api_detail, sizeof(api_detail)))
+						ww_json_get_string_from(return_json, "message", api_detail, sizeof(api_detail));
+					if (api_error[0] || api_detail[0]) {
+						snprintf(
+								json,
+								WW_API_RESPONSE_MAX,
+								"guided return API failed: %s%s%s",
+								api_error[0] ? api_error : "return_api_error",
+								(api_error[0] && api_detail[0]) ? ": " : "",
+								api_detail[0] ? api_detail : "request failed");
+					} else {
+						snprintf(json, WW_API_RESPONSE_MAX, "guided return API failed");
+					}
+					free(return_json);
+					free(sync_json);
+					success = false;
+					break;
+				}
+
+				if (!ww_json_get_u32_after_token(return_json, "\"returnedPokemon\"", "speciesId", &api_return_species)
+						|| api_return_species == 0
+						|| api_return_species > 0xFFFFu) {
+					api_return_species = pending_return_expected_species;
+				}
+
+				if (!ww_json_get_u32_after_token(return_json, "\"returnedPokemon\"", "expGainApplied", &api_exp_gain)
+						&& !ww_json_get_u32_after_token(return_json, "\"returnedPokemon\"", "expGain", &api_exp_gain)) {
+					api_exp_gain = pending_return_exp_gain;
+				}
+
+				ww_async_progress_set(12, "Fetching sync package");
+				if (!ww_api_get_sync_package(sync_json, WW_API_RESPONSE_MAX)) {
+					snprintf(json, WW_API_RESPONSE_MAX, "guided return sync fetch failed");
+					free(return_json);
+					free(sync_json);
+					success = false;
+					break;
+				}
+
+				if (!ww_json_get_u32_after_token(sync_json, "\"stats\"", "steps", &pending_return_sync_steps)
+						|| !ww_json_get_u32_after_token(sync_json, "\"stats\"", "watts", &pending_return_sync_watts)) {
+					snprintf(json, WW_API_RESPONSE_MAX, "guided return sync package missing stats");
+					free(return_json);
+					free(sync_json);
+					success = false;
+					break;
+				}
+
+				if (!ww_json_get_u32_after_token(sync_json, "\"courseUnlocks\"", "unlockFlags", &pending_return_sync_flags))
+					pending_return_sync_flags = 0;
+
+				free(return_json);
+				free(sync_json);
+
+				ww_async_progress_set(20, "Applying returned Pokemon");
+				success = hgss_apply_stroll_return(
+						pending_save_path,
+						(u8)pending_return_box,
+						(u8)pending_return_source_slot,
+						0,
+						0,
+						(u16)api_return_species,
+						api_exp_gain,
+						pending_return_walked_steps,
+						0,
+						0,
+						NULL,
+						NULL,
+						pending_return_sync_steps,
+						pending_return_sync_watts,
+						pending_return_sync_flags,
+						pending_return_increment_trip_counter,
+						&base_report,
+						patch_error,
+						sizeof(patch_error));
+				if (!success) {
+					snprintf(
+							json,
+							WW_API_RESPONSE_MAX,
+							"%s",
+							patch_error[0] ? patch_error : "failed to apply guided return to save");
+					break;
+				}
+
+				ww_async_progress_set(28, "Verifying returned Pokemon");
+				success = hgss_read_box_slot_summary(
+						pending_save_path,
+						(u8)pending_return_box,
+						(u8)pending_return_source_slot,
+						&verify_source_slot,
+						verify_error,
+						sizeof(verify_error));
+				if (!success) {
+					snprintf(
+							json,
+							WW_API_RESPONSE_MAX,
+							"guided return verify failed: %s",
+							verify_error[0] ? verify_error : "unable to inspect destination slot");
+					break;
+				}
+
+				if (!verify_source_slot.occupied || verify_source_slot.species_id != (u16)api_return_species) {
+					snprintf(
+							json,
+							WW_API_RESPONSE_MAX,
+							"guided return verify mismatch: destination slot has species %u (expected %u)",
+							(unsigned)verify_source_slot.species_id,
+							(unsigned)api_return_species);
+					success = false;
+					break;
+				}
+
+				for (i = 0; i < pending_return_capture_count && i < WW_RETURN_CAPTURE_MAX; i++) {
+					hgss_stroll_return_report capture_report;
+					ww_return_capture_choice *capture = &pending_return_captures[i];
+					u32 progress = 28u + (u32)i * 20u;
+
+					if (!capture->present || capture->species_id == 0)
+						continue;
+
+					if (progress > 94u)
+						progress = 94u;
+					ww_async_progress_set(progress, "Placing captures");
+
+					success = hgss_apply_stroll_return(
+							pending_save_path,
+							(u8)pending_return_box,
+							(u8)pending_return_source_slot,
+							capture->target_box,
+							capture->target_slot,
+							(u16)api_return_species,
+							0,
+							0,
+							capture->species_id,
+							capture->level,
+							capture->moves,
+							capture->species_name,
+							pending_return_sync_steps,
+							pending_return_sync_watts,
+							pending_return_sync_flags,
+							false,
+							&capture_report,
+							patch_error,
+							sizeof(patch_error));
+					if (!success) {
+						snprintf(
+								json,
+								WW_API_RESPONSE_MAX,
+								"capture %u apply failed: %s",
+								(unsigned)(i + 1),
+								patch_error[0] ? patch_error : "unknown capture patch error");
+						break;
+					}
+
+					if (capture_report.capture_species != 0 && capture_report.target_box > 0 && capture_report.target_slot > 0) {
+						char row[96];
+						size_t used = strlen(capture_summary);
+
+						captures_written++;
+						snprintf(
+								row,
+								sizeof(row),
+								" #%u->B%ldS%ld",
+								(unsigned)(i + 1),
+								(long)capture_report.target_box,
+								(long)capture_report.target_slot);
+						if (used + strlen(row) + 1 < sizeof(capture_summary))
+							strcat(capture_summary, row);
+					} else if (capture_report.capture_skipped_no_space) {
+						captures_skipped++;
+					}
+				}
+
+				if (!success)
+					break;
+
+				ww_async_progress_set(100, "Return completed");
+				snprintf(
+						json,
+						WW_API_RESPONSE_MAX,
+						"Guided return applied to %s | returned %u to box %lu slot %lu | EXP +%lu | captures written=%u skipped=%u%s | steps %lu watts %lu flags 0x%08lX",
+						pending_save_path,
+						(unsigned)api_return_species,
+						(unsigned long)pending_return_box,
+						(unsigned long)pending_return_source_slot,
+						(unsigned long)api_exp_gain,
+						(unsigned)captures_written,
+						(unsigned)captures_skipped,
+						capture_summary,
+						(unsigned long)pending_return_sync_steps,
+						(unsigned long)pending_return_sync_watts,
+						(unsigned long)pending_return_sync_flags);
 				break;
 			}
 		default:
@@ -3901,6 +4315,7 @@ static bool ww_async_poll_completion(void)
 		case WW_TASK_HGSS_PATCH_SYNC:
 		case WW_TASK_HGSS_STROLL_SEND:
 		case WW_TASK_HGSS_STROLL_RETURN:
+		case WW_TASK_HGSS_STROLL_RETURN_GUIDED_APPLY:
 			printf("%s\n", json);
 			break;
 		default:
@@ -4252,7 +4667,7 @@ menu settings_menu = {
 
 menu_entry main_menu_simple_entries[] = {
 	{"HGSS stroll send", ENTRY_ACTION, .callback = call_start_guided_send},
-	{"HGSS stroll return", ENTRY_CHANGEMENU, .new_menu = &hgss_stroll_return_simple_menu},
+	{"HGSS stroll return", ENTRY_ACTION, .callback = call_start_guided_return},
 	{"Settings", ENTRY_CHANGEMENU, .new_menu = &settings_menu},
 };
 
@@ -4369,6 +4784,8 @@ static void ww_draw_top_context(void)
 
 	if (g_state == IN_BOX_SELECTOR)
 		panel_state = "Visual box selector";
+	else if (g_state == IN_RETURN_SELECTOR)
+		panel_state = "Guided return flow";
 	else if (g_state == IN_FILE_BROWSER)
 		panel_state = "File browser";
 	else
@@ -4718,6 +5135,24 @@ static bool ww_box_selector_open(ww_box_picker_mode mode)
 	} else if (mode == WW_BOX_PICKER_RETURN_SOURCE) {
 		g_box_picker_box = hgss_stroll_return_menu_entries[RETURN_MENU_BOX].num_attr.value;
 		g_box_picker_slot = hgss_stroll_return_menu_entries[RETURN_MENU_SOURCE_SLOT].num_attr.value;
+	} else if (mode == WW_BOX_PICKER_RETURN_CAPTURE_1
+			|| mode == WW_BOX_PICKER_RETURN_CAPTURE_2
+			|| mode == WW_BOX_PICKER_RETURN_CAPTURE_3) {
+		u8 capture_index = (u8)(mode - WW_BOX_PICKER_RETURN_CAPTURE_1);
+
+		if (capture_index < WW_RETURN_CAPTURE_MAX
+				&& g_return_captures[capture_index].target_box >= 1
+				&& g_return_captures[capture_index].target_box <= HGSS_BOX_COUNT
+				&& g_return_captures[capture_index].target_slot >= 1
+				&& g_return_captures[capture_index].target_slot <= HGSS_BOX_SLOTS) {
+			g_box_picker_box = g_return_captures[capture_index].target_box;
+			g_box_picker_slot = g_return_captures[capture_index].target_slot;
+		} else {
+			g_box_picker_box = g_pending_return_box >= 1 && g_pending_return_box <= HGSS_BOX_COUNT
+					? g_pending_return_box
+					: 1;
+			g_box_picker_slot = 1;
+		}
 	}
 
 	if (g_box_picker_box < 1 || g_box_picker_box > HGSS_BOX_COUNT)
@@ -4742,12 +5177,21 @@ static void ww_box_selector_apply_choice(void)
 		hgss_stroll_return_menu_entries[RETURN_MENU_SOURCE_SLOT].num_attr.value = g_box_picker_slot;
 		g_pending_return_box = g_box_picker_box;
 		g_pending_return_source_slot = g_box_picker_slot;
+	} else if (g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_1
+			|| g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_2
+			|| g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_3) {
+		u8 capture_index = (u8)(g_box_picker_mode - WW_BOX_PICKER_RETURN_CAPTURE_1);
+
+		if (capture_index < WW_RETURN_CAPTURE_MAX) {
+			g_return_captures[capture_index].target_box = (u8)g_box_picker_box;
+			g_return_captures[capture_index].target_slot = (u8)g_box_picker_slot;
+		}
 	}
 }
 
 static void ww_draw_box_selector(void)
 {
-	const char *title = g_box_picker_mode == WW_BOX_PICKER_SEND_SOURCE ? "Select source slot (Send)" : "Select source slot (Return)";
+	const char *title = "Select slot";
 	const float origin_x = 10.0f;
 	const float origin_y = 56.0f;
 	const float cell_w = 49.0f;
@@ -4755,6 +5199,17 @@ static void ww_draw_box_selector(void)
 	u32 row;
 	u32 col;
 	char info[96];
+
+	if (g_box_picker_mode == WW_BOX_PICKER_SEND_SOURCE)
+		title = "Select source slot (Send)";
+	else if (g_box_picker_mode == WW_BOX_PICKER_RETURN_SOURCE)
+		title = "Select destination for returned Pokemon";
+	else if (g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_1)
+		title = "Select destination for capture #1";
+	else if (g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_2)
+		title = "Select destination for capture #2";
+	else if (g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_3)
+		title = "Select destination for capture #3";
 
 	draw_top(title);
 	snprintf(info, sizeof(info), "Box %lu / %u", (unsigned long)g_box_picker_box, (unsigned)HGSS_BOX_COUNT);
@@ -4816,7 +5271,15 @@ static void ww_draw_box_selector(void)
 		draw_string(0, 212, 9, g_box_picker_error[0] ? g_box_picker_error : "Could not read slots", true, 0);
 	}
 
-	draw_string(0, 226, 8, "A: choose  B: cancel  L/R: change box", true, 0);
+	if (g_return_flow_active && g_box_picker_mode == WW_BOX_PICKER_RETURN_SOURCE)
+		draw_string(0, 226, 8, "A: choose destination  L/R: change box", true, 0);
+	else if (g_return_flow_active
+			&& (g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_1
+					|| g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_2
+					|| g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_3))
+		draw_string(0, 226, 8, "A: choose  B: back  L/R: change box", true, 0);
+	else
+		draw_string(0, 226, 8, "A: choose  B: cancel  L/R: change box", true, 0);
 }
 
 static void ww_build_sprite_palette(u32 color_seed, bool colorize, u32 out_colors[4])
@@ -5438,6 +5901,137 @@ static void ww_draw_route_selector(void)
 	return;
 }
 
+static void ww_draw_return_selector(void)
+{
+	char line[192];
+	u32 i;
+
+	draw_top("Guided Stroll Return");
+	C2D_DrawRectSolid(8.0f, 36.0f, 0.0f, 304.0f, 196.0f, C2D_Color32(0x14, 0x34, 0x3E, 0xFF));
+
+	if (g_return_step == WW_RETURN_STEP_CONFIRM) {
+		draw_string(16.0f, 52.0f, 11.0f, "Return Pokemon from Pokewalker?", false, 0);
+		draw_string(16.0f, 76.0f, 9.8f, "This action cannot be undone.", false, 0);
+		draw_string(16.0f, 94.0f, 9.4f, "The app will fetch trip results", false, 0);
+		draw_string(16.0f, 108.0f, 9.4f, "from API and then ask placements.", false, 0);
+		if (g_return_error[0]) {
+			draw_string(16.0f, 128.0f, 8.8f, "Last error:", false, 0);
+			draw_string(16.0f, 140.0f, 8.5f, g_return_error, false, 0);
+			draw_string(16.0f, 162.0f, 9.2f, "A: retry", false, 0);
+			draw_string(16.0f, 176.0f, 9.2f, "B: cancel", false, 0);
+		} else {
+			draw_string(16.0f, 138.0f, 9.2f, "A: confirm and continue", false, 0);
+			draw_string(16.0f, 152.0f, 9.2f, "B: cancel", false, 0);
+		}
+		draw_string(16.0f, 186.0f, 8.6f, "After confirmation, continue until save patch completes.", false, 0);
+		return;
+	}
+
+	if (g_return_step == WW_RETURN_STEP_CAPTURE_POLICY) {
+		snprintf(
+				line,
+				sizeof(line),
+				"Returned: %s (+%lu EXP)",
+				g_return_preview_source_name[0] ? g_return_preview_source_name : ww_lookup_species_name(g_return_preview_source_species),
+				(unsigned long)g_return_preview_exp_gain);
+		draw_string(16.0f, 52.0f, 10.8f, line, false, 0);
+		snprintf(
+				line,
+				sizeof(line),
+				"Destination selected: Box %lu Slot %lu",
+				(unsigned long)g_pending_return_box,
+				(unsigned long)g_pending_return_source_slot);
+		draw_string(16.0f, 70.0f, 9.4f, line, false, 0);
+
+		snprintf(line, sizeof(line), "Captures reported by trip: %u", (unsigned)g_return_capture_count);
+		draw_string(16.0f, 92.0f, 9.4f, line, false, 0);
+
+		for (i = 0; i < g_return_capture_count && i < WW_RETURN_CAPTURE_MAX; i++) {
+			snprintf(
+					line,
+					sizeof(line),
+					"%lu) %s Lv%u",
+					(unsigned long)(i + 1),
+					g_return_captures[i].species_name[0] ? g_return_captures[i].species_name : ww_lookup_species_name(g_return_captures[i].species_id),
+					(unsigned)g_return_captures[i].level);
+			draw_string(22.0f, 108.0f + (float)i * 14.0f, 8.8f, line, false, 0);
+		}
+
+		if (g_return_capture_count == 0) {
+			draw_string(16.0f, 158.0f, 9.2f, "No captures to place.", false, 0);
+			draw_string(16.0f, 176.0f, 9.2f, "A: continue", false, 0);
+		} else {
+			draw_string(16.0f, 158.0f, 9.0f, "A: auto-place captures", false, 0);
+			draw_string(16.0f, 172.0f, 9.0f, "X: choose slots manually", false, 0);
+		}
+		draw_string(16.0f, 198.0f, 8.5f, "B: change returned Pokemon slot", false, 0);
+		return;
+	}
+
+	if (g_return_step == WW_RETURN_STEP_REVIEW) {
+		snprintf(
+				line,
+				sizeof(line),
+				"Return %s to Box %lu Slot %lu",
+				g_return_preview_source_name[0] ? g_return_preview_source_name : ww_lookup_species_name(g_return_preview_source_species),
+				(unsigned long)g_pending_return_box,
+				(unsigned long)g_pending_return_source_slot);
+		draw_string(16.0f, 52.0f, 10.6f, line, false, 0);
+		snprintf(line, sizeof(line), "Capture mode: %s", g_return_manual_capture_targets ? "manual" : "auto");
+		draw_string(16.0f, 66.0f, 9.0f, line, false, 0);
+
+		draw_string(16.0f, 82.0f, 9.2f, "Capture placement plan:", false, 0);
+		if (g_return_capture_count == 0) {
+			draw_string(22.0f, 98.0f, 9.0f, "(none)", false, 0);
+		} else {
+			for (i = 0; i < g_return_capture_count && i < WW_RETURN_CAPTURE_MAX; i++) {
+				if (g_return_captures[i].target_box == 0 || g_return_captures[i].target_slot == 0) {
+					snprintf(
+							line,
+							sizeof(line),
+							"%lu) %s -> auto",
+							(unsigned long)(i + 1),
+							g_return_captures[i].species_name[0]
+									? g_return_captures[i].species_name
+									: ww_lookup_species_name(g_return_captures[i].species_id));
+				} else {
+					snprintf(
+							line,
+							sizeof(line),
+							"%lu) %s -> Box %u Slot %u",
+							(unsigned long)(i + 1),
+							g_return_captures[i].species_name[0]
+									? g_return_captures[i].species_name
+									: ww_lookup_species_name(g_return_captures[i].species_id),
+							(unsigned)g_return_captures[i].target_box,
+							(unsigned)g_return_captures[i].target_slot);
+				}
+				draw_string(22.0f, 98.0f + (float)i * 14.0f, 8.7f, line, false, 0);
+			}
+		}
+
+		draw_string(16.0f, 176.0f, 9.2f, "A: apply return and patch save", false, 0);
+		draw_string(16.0f, 194.0f, 8.8f, "B: adjust capture placement", false, 0);
+		return;
+	}
+
+	if (g_return_step == WW_RETURN_STEP_APPLYING) {
+		u32 progress_pct = 0;
+		char progress_label[48];
+
+		ww_async_progress_get(&progress_pct, progress_label, sizeof(progress_label));
+		draw_string(0.0f, 84.0f, 14.0f, "Applying Return", true, 0);
+		snprintf(line, sizeof(line), "%s (%lu%%)", progress_label, (unsigned long)progress_pct);
+		draw_string(0.0f, 114.0f, 10.0f, line, true, 0);
+		C2D_DrawRectSolid(40.0f, 142.0f, 0.0f, 240.0f, 16.0f, C2D_Color32(0x2B, 0x46, 0x4C, 0xFF));
+		C2D_DrawRectSolid(40.0f, 142.0f, 0.0f, (240.0f * (float)progress_pct) / 100.0f, 16.0f, C2D_Color32(0x6D, 0xC1, 0x8D, 0xFF));
+		draw_string(0.0f, 172.0f, 9.0f, "Please wait, returning to main menu...", true, 0);
+		return;
+	}
+
+	draw_string(16.0f, 84.0f, 10.0f, "Return flow is idle.", false, 0);
+}
+
 static void ww_draw_simple_top_panel(void)
 {
 	char line[128];
@@ -5448,7 +6042,7 @@ static void ww_draw_simple_top_panel(void)
 		C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, 8, C2D_Color32(0x17, 0x4A, 0x57, 0xFF));
 	} else {
 		C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, 18, C2D_Color32(0x17, 0x4A, 0x57, 0xFF));
-		ww_draw_string_width(8, 3, 8, "Simple", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		ww_draw_string_width(8, 3, 8.8f, "Simple", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 	}
 
 	if (g_state == IN_BOX_SELECTOR) {
@@ -5465,8 +6059,11 @@ static void ww_draw_simple_top_panel(void)
 		}
 
 		if (slot->occupied && slot->species_id != 0 && g_box_picker_sprite_species != slot->species_id) {
+			u8 *large_narc_data = NULL;
+			u32 large_narc_size = 0;
 			u8 *poke_icon_narc_data = NULL;
 			u32 poke_icon_narc_size = 0;
+			u8 frame1[0x300];
 
 			g_box_picker_sprite_ready = false;
 			g_box_picker_color_icon_ready = false;
@@ -5502,26 +6099,21 @@ static void ww_draw_simple_top_panel(void)
 			if (poke_icon_narc_data)
 				free(poke_icon_narc_data);
 
-			if (!g_box_picker_color_icon_ready) {
-				u8 *large_narc_data = NULL;
-				u32 large_narc_size = 0;
-				u8 frame1[0x300];
-
-				if (g_selected_hgss_nds_path[0]
-						&& ww_load_narc_from_nds(g_selected_hgss_nds_path, "a/2/5/6", &large_narc_data, &large_narc_size)
-						&& ww_extract_species_large_frames(
-								large_narc_data,
-								large_narc_size,
-								slot->species_id,
-								g_box_picker_sprite,
-								frame1)) {
-					ww_remap_sprite_2bpp_contrast(g_box_picker_sprite, sizeof(g_box_picker_sprite));
-					g_box_picker_sprite_ready = true;
-				}
-
-				if (large_narc_data)
-					free(large_narc_data);
+			if (!g_box_picker_color_icon_ready
+					&& g_selected_hgss_nds_path[0]
+					&& ww_load_narc_from_nds(g_selected_hgss_nds_path, "a/2/5/6", &large_narc_data, &large_narc_size)
+					&& ww_extract_species_large_frames(
+							large_narc_data,
+							large_narc_size,
+							slot->species_id,
+							g_box_picker_sprite,
+							frame1)) {
+				ww_remap_sprite_2bpp_contrast(g_box_picker_sprite, sizeof(g_box_picker_sprite));
+				g_box_picker_sprite_ready = true;
 			}
+
+			if (large_narc_data)
+				free(large_narc_data);
 		}
 
 		C2D_DrawRectSolid(12, 40, 0, 140, 188, C2D_Color32(0x13, 0x34, 0x3F, 0xFF));
@@ -5531,9 +6123,9 @@ static void ww_draw_simple_top_panel(void)
 					g_box_picker_color_icon_width,
 					g_box_picker_color_icon_height,
 					g_box_picker_color_icon_palette,
-					22.0f,
-					54.0f,
-					2.95f,
+					14.0f,
+					46.0f,
+					3.30f,
 					true);
 		} else if (g_box_picker_sprite_ready) {
 			ww_draw_2bpp_sprite(
@@ -5543,13 +6135,13 @@ static void ww_draw_simple_top_panel(void)
 					18.0f,
 					52.0f,
 					1.8f,
-					true,
+					false,
 					0u,
 					false);
 		}
 
 		snprintf(line, sizeof(line), "Box %lu Slot %lu", (unsigned long)g_box_picker_box, (unsigned long)g_box_picker_slot);
-		ww_draw_string_width(170, 50, 12, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		ww_draw_string_width(170, 50, 12.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 
 		if (slot->occupied && slot->species_id != 0) {
 			u8 level_est = ww_estimate_level_from_exp(slot->exp);
@@ -5562,25 +6154,25 @@ static void ww_draw_simple_top_panel(void)
 			u32 exp_bar_pct = level_est >= 100 ? 100u : (level_prog >= level_span ? 100u : (level_prog * 100u) / level_span);
 
 			snprintf(line, sizeof(line), "%s", species_name);
-			ww_draw_string_width(170, 76, 12, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(170, 76, 12.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 
 			snprintf(line, sizeof(line), "Nickname: %s", (nickname && nickname[0]) ? nickname : "(none)");
-			ww_draw_string_width(170, 98, 10, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(170, 98, 10.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 
 			snprintf(line, sizeof(line), "Lv~%u  Friendship %u", (unsigned)level_est, (unsigned)slot->friendship);
-			ww_draw_string_width(170, 116, 10, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(170, 116, 10.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 
 			snprintf(line, sizeof(line), "EXP %lu", (unsigned long)slot->exp);
-			ww_draw_string_width(170, 134, 9, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(170, 134, 9.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 			C2D_DrawRectSolid(170.0f, 148.0f, 0.0f, 170.0f, 8.0f, C2D_Color32(0x2B, 0x46, 0x4C, 0xFF));
 			C2D_DrawRectSolid(170.0f, 148.0f, 0.0f, (170.0f * (float)exp_bar_pct) / 100.0f, 8.0f, C2D_Color32(0x6D, 0xC1, 0x8D, 0xFF));
 			snprintf(line, sizeof(line), "%u%% to next level", (unsigned)exp_bar_pct);
-			ww_draw_string_width(170, 160, 8, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(170, 160, 8.7f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 		} else {
-			ww_draw_string_width(170, 90, 12, "Empty slot", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(170, 90, 12.8f, "Empty slot", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 		}
 
-		ww_draw_string_width(170, 186, 9, "A select  B back  L/R box", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		ww_draw_string_width(170, 186, 9.6f, "A select  B back  L/R box", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 		return;
 	}
 
@@ -5611,7 +6203,7 @@ static void ww_draw_simple_top_panel(void)
 		}
 
 		C2D_DrawRectSolid(6, 6, 0, 388, 228, C2D_Color32(0x13, 0x34, 0x3F, 0xFF));
-		ww_draw_string_width(12, 8, 10.2f, "Encounter Pokemon (6)", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		ww_draw_string_width(12, 8, 10.8f, "Encounter Pokemon (6)", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 
 		for (slot_index = 0; slot_index < WW_ROUTE_PREVIEW_SLOT_COUNT; slot_index++) {
 			u32 row = slot_index / 3u;
@@ -5652,7 +6244,7 @@ static void ww_draw_simple_top_panel(void)
 					"%lu. %.11s",
 					(unsigned long)(slot_index + 1),
 					g_route_preview_slots[slot_index].species_name);
-			ww_draw_string_width(x + 45.0f, y + 6.0f, 8.4f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(x + 45.0f, y + 6.0f, 8.9f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 
 			snprintf(
 					line,
@@ -5660,12 +6252,12 @@ static void ww_draw_simple_top_panel(void)
 					"%u%% | %u steps",
 					(unsigned)g_route_preview_slots[slot_index].chance,
 					(unsigned)g_route_preview_slots[slot_index].min_steps);
-			ww_draw_string_width(x + 45.0f, y + 22.0f, 7.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(x + 45.0f, y + 22.0f, 8.3f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 			snprintf(line, sizeof(line), "Lv %u", (unsigned)g_route_preview_slots[slot_index].level);
-			ww_draw_string_width(x + 45.0f, y + 34.0f, 7.4f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(x + 45.0f, y + 34.0f, 7.9f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 		}
 
-		ww_draw_string_width(12, 132, 10.8f, "Route Items (10)", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		ww_draw_string_width(12, 132, 11.4f, "Route Items (10)", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 		for (i = 0; i < WW_OV112_ITEM_COUNT; i++) {
 			u32 row = i / 5u;
 			u32 col = i % 5u;
@@ -5691,14 +6283,52 @@ static void ww_draw_simple_top_panel(void)
 					sizeof(line),
 					"%.8s",
 					g_route_preview_items[i].item_name);
-			ww_draw_string_width(x + 34.0f, y + 4.0f, 8.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(x + 34.0f, y + 4.0f, 9.4f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
 			snprintf(
 					line,
 					sizeof(line),
 					"%u%% %ust",
 					(unsigned)g_route_preview_items[i].chance,
 					(unsigned)g_route_preview_items[i].min_steps);
-			ww_draw_string_width(x + 34.0f, y + 22.0f, 8.3f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+			ww_draw_string_width(x + 34.0f, y + 22.0f, 8.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+		}
+
+		return;
+	}
+
+	if (g_state == IN_RETURN_SELECTOR) {
+		switch (g_return_step) {
+			case WW_RETURN_STEP_CONFIRM:
+				ww_draw_string_width(12, 52, 12, "Return confirmation", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+				ww_draw_string_width(12, 76, 10, "This action is irreversible once confirmed.", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+				break;
+			case WW_RETURN_STEP_CAPTURE_POLICY:
+				ww_draw_string_width(12, 52, 11.5f, "Trip results loaded", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+				snprintf(
+						line,
+						sizeof(line),
+						"Returned: %s",
+						g_return_preview_source_name[0]
+								? g_return_preview_source_name
+								: ww_lookup_species_name(g_return_preview_source_species));
+				ww_draw_string_width(12, 74, 10, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+				snprintf(line, sizeof(line), "Captures: %u", (unsigned)g_return_capture_count);
+				ww_draw_string_width(12, 94, 10, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+				break;
+			case WW_RETURN_STEP_REVIEW:
+				ww_draw_string_width(12, 52, 11.5f, "Ready to apply return", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+				snprintf(
+						line,
+						sizeof(line),
+						"Box %lu Slot %lu | EXP +%lu",
+						(unsigned long)g_pending_return_box,
+						(unsigned long)g_pending_return_source_slot,
+						(unsigned long)g_return_preview_exp_gain);
+				ww_draw_string_width(12, 74, 9.8f, line, false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+				break;
+			case WW_RETURN_STEP_APPLYING:
+				ww_draw_string_width(12, 52, 12, "Applying guided return", false, 0, TOP_SCREEN_WIDTH, COLOR_TEXT);
+				break;
 		}
 
 		return;
@@ -5966,6 +6596,218 @@ void call_show_hgss_rom_path()
 	}
 
 	printf("Selected HGSS ROM: %s\n", g_selected_hgss_nds_path);
+}
+
+static void ww_return_flow_reset(void)
+{
+	g_return_flow_active = false;
+	g_return_apply_busy = false;
+	g_return_step = WW_RETURN_STEP_CONFIRM;
+	g_return_manual_capture_targets = false;
+	g_return_capture_pick_index = 0;
+	g_return_preview_source_species = 0;
+	g_return_preview_source_name[0] = '\0';
+	g_return_preview_walked_steps = 0;
+	g_return_preview_exp_gain = 0;
+	g_return_preview_sync_steps = 0;
+	g_return_preview_sync_watts = 0;
+	g_return_preview_sync_flags = 0;
+	g_return_capture_count = 0;
+	g_return_error[0] = '\0';
+	memset(g_return_captures, 0, sizeof(g_return_captures));
+}
+
+static bool ww_return_validate_capture_target(u8 capture_index, u8 box, u8 slot)
+{
+	u8 i;
+
+	if (capture_index >= g_return_capture_count)
+		return false;
+	if (box == 0 || box > HGSS_BOX_COUNT || slot == 0 || slot > HGSS_BOX_SLOTS)
+		return false;
+	if (box == g_pending_return_box && slot == g_pending_return_source_slot)
+		return false;
+	if (g_box_picker_slots[slot - 1].occupied && g_box_picker_slots[slot - 1].species_id != 0)
+		return false;
+
+	for (i = 0; i < g_return_capture_count; i++) {
+		if (i == capture_index)
+			continue;
+		if (!g_return_captures[i].present)
+			continue;
+		if (g_return_captures[i].target_box == box && g_return_captures[i].target_slot == slot)
+			return false;
+	}
+
+	return true;
+}
+
+static void ww_return_set_capture_auto_all(void)
+{
+	u8 i;
+
+	for (i = 0; i < g_return_capture_count; i++) {
+		g_return_captures[i].target_box = 0;
+		g_return_captures[i].target_slot = 0;
+	}
+}
+
+static bool ww_return_open_capture_picker(u8 capture_index)
+{
+	ww_box_picker_mode mode = WW_BOX_PICKER_NONE;
+
+	if (capture_index >= g_return_capture_count)
+		return false;
+
+	switch (capture_index) {
+		case 0:
+			mode = WW_BOX_PICKER_RETURN_CAPTURE_1;
+			break;
+		case 1:
+			mode = WW_BOX_PICKER_RETURN_CAPTURE_2;
+			break;
+		case 2:
+			mode = WW_BOX_PICKER_RETURN_CAPTURE_3;
+			break;
+		default:
+			return false;
+	}
+
+	g_return_capture_pick_index = capture_index;
+	if (!ww_box_selector_open(mode))
+		return false;
+
+	printf(
+			"Select destination for capture %u: %s\n",
+			(unsigned)(capture_index + 1),
+			g_return_captures[capture_index].species_name[0]
+					? g_return_captures[capture_index].species_name
+					: ww_lookup_species_name(g_return_captures[capture_index].species_id));
+	return true;
+}
+
+static bool ww_return_fetch_trip_preview(void)
+{
+	char *sync_json = NULL;
+	u32 walked_steps = 0;
+	bool have_walked_steps = false;
+	u32 species_id = 0;
+
+	if (!ww_prepare_selected_save_path())
+		return false;
+
+	g_pending_return_box = 1;
+	g_pending_return_source_slot = 1;
+	g_pending_return_increment_trip_counter = true;
+
+	have_walked_steps = ww_compute_simple_return_walked_steps(&walked_steps);
+	g_return_preview_walked_steps = have_walked_steps ? walked_steps : 0;
+	g_return_preview_exp_gain = g_return_preview_walked_steps;
+	g_pending_return_walked_steps = g_return_preview_walked_steps;
+	g_pending_return_bonus_watts = 0;
+	g_pending_return_auto_captures = 0;
+	g_return_error[0] = '\0';
+
+	sync_json = (char *)malloc(WW_API_RESPONSE_MAX);
+	if (!sync_json) {
+		snprintf(g_return_error, sizeof(g_return_error), "out of memory");
+		printf("Return preview failed: out of memory\n");
+		if (sync_json)
+			free(sync_json);
+		return false;
+	}
+
+	if (!ww_api_get_sync_package(sync_json, WW_API_RESPONSE_MAX)) {
+		snprintf(g_return_error, sizeof(g_return_error), "sync package unavailable");
+		printf("Return preview failed: sync package unavailable\n");
+		free(sync_json);
+		return false;
+	}
+
+	if (!ww_json_get_u32_after_token(sync_json, "\"stats\"", "steps", &g_return_preview_sync_steps)
+			|| !ww_json_get_u32_after_token(sync_json, "\"stats\"", "watts", &g_return_preview_sync_watts)) {
+		snprintf(g_return_error, sizeof(g_return_error), "sync package missing steps/watts");
+		printf("Return preview failed: sync package missing steps/watts\n");
+		free(sync_json);
+		return false;
+	}
+	if (!ww_json_get_u32_after_token(sync_json, "\"courseUnlocks\"", "unlockFlags", &g_return_preview_sync_flags))
+		g_return_preview_sync_flags = 0;
+
+	if (!ww_json_get_u32_after_token(sync_json, "\"stroll\"", "walkingSpecies", &species_id)
+			|| species_id == 0
+			|| species_id > 0xFFFFu) {
+		snprintf(g_return_error, sizeof(g_return_error), "no walking Pokemon in device");
+		printf("Return preview failed: no walking Pokemon in sync package\n");
+		free(sync_json);
+		return false;
+	}
+	g_return_preview_source_species = (u16)species_id;
+
+	if (!ww_json_get_string_after_token(
+				sync_json,
+				"\"stroll\"",
+				"walkingSpeciesName",
+				g_return_preview_source_name,
+				sizeof(g_return_preview_source_name))) {
+		snprintf(
+				g_return_preview_source_name,
+				sizeof(g_return_preview_source_name),
+				"%s",
+				ww_lookup_species_name(g_return_preview_source_species));
+	}
+
+	g_return_capture_count = ww_json_get_caught_captures_from_sync(sync_json, g_return_captures);
+	if (g_return_capture_count > WW_RETURN_CAPTURE_MAX)
+		g_return_capture_count = WW_RETURN_CAPTURE_MAX;
+
+	printf(
+			"Return preview ready: %s +%lu EXP, captures=%u\n",
+			g_return_preview_source_name,
+			(unsigned long)g_return_preview_exp_gain,
+			(unsigned)g_return_capture_count);
+
+	free(sync_json);
+	return true;
+}
+
+static bool ww_start_guided_return_apply(void)
+{
+	if (!ww_prepare_selected_save_path())
+		return false;
+	if (g_pending_return_box == 0 || g_pending_return_box > HGSS_BOX_COUNT)
+		return false;
+	if (g_pending_return_source_slot == 0 || g_pending_return_source_slot > HGSS_BOX_SLOTS)
+		return false;
+
+	g_pending_return_walked_steps = g_return_preview_walked_steps;
+	g_pending_return_bonus_watts = 0;
+	g_pending_return_auto_captures = 0;
+	g_pending_return_increment_trip_counter = true;
+
+	if (!ww_async_start(WW_TASK_HGSS_STROLL_RETURN_GUIDED_APPLY)) {
+		printf("WearWalker request already running\n");
+		return false;
+	}
+
+	g_return_apply_busy = true;
+	g_return_step = WW_RETURN_STEP_APPLYING;
+	printf("Applying guided return to selected HGSS save...\n");
+	return true;
+}
+
+void call_start_guided_return(void)
+{
+	if (!ww_prepare_selected_save_path())
+		return;
+
+	ww_return_flow_reset();
+	g_return_flow_active = true;
+	g_return_step = WW_RETURN_STEP_CONFIRM;
+	g_return_error[0] = '\0';
+	g_state = IN_RETURN_SELECTOR;
+
+	printf("Guided return: confirm irreversible action to continue\n");
 }
 
 void call_start_guided_send(void)
@@ -6343,6 +7185,8 @@ void ui_draw()
 		ww_draw_box_selector();
 	else if (g_state == IN_ROUTE_SELECTOR)
 		ww_draw_route_selector();
+	else if (g_state == IN_RETURN_SELECTOR)
+		ww_draw_return_selector();
 	else if (g_state == IN_FILE_BROWSER)
 		draw_file_browser();
 	else if (g_state == IN_SELECTION)
@@ -6364,6 +7208,14 @@ enum operation ui_update()
 	u32 kDown = hidKeysDown() | (hidKeysDownRepeat() & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT | KEY_L | KEY_R));
 	async_completed = ww_async_poll_completion();
 
+	if (async_completed && g_return_apply_busy) {
+		g_return_apply_busy = false;
+		ww_return_flow_reset();
+		g_state = IN_MENU;
+		g_active_menu = ww_get_main_menu();
+		return OP_UPDATE;
+	}
+
 	if (async_completed && g_route_send_busy) {
 		g_route_send_busy = false;
 		g_state = IN_MENU;
@@ -6371,13 +7223,85 @@ enum operation ui_update()
 		return OP_UPDATE;
 	}
 
+	if (g_return_apply_busy && g_state == IN_RETURN_SELECTOR)
+		return OP_UPDATE;
+
 	if (g_route_send_busy && g_state == IN_ROUTE_SELECTOR)
 		return OP_UPDATE;
 
-	if (kDown & KEY_START)
+	if (kDown & KEY_START) {
+		if (g_return_flow_active || g_return_apply_busy) {
+			printf("Guided return in progress; complete it before exiting\n");
+			return OP_UPDATE;
+		}
 		return OP_EXIT;
+	}
 
 	if (kDown) {
+		if (g_state == IN_RETURN_SELECTOR) {
+			if (g_return_step == WW_RETURN_STEP_CONFIRM) {
+				if (kDown & KEY_A) {
+					if (ww_return_fetch_trip_preview()) {
+						if (!ww_box_selector_open(WW_BOX_PICKER_RETURN_SOURCE)) {
+							printf("Unable to open box selector for return destination\n");
+						} else {
+							printf("Choose destination slot for returned Pokemon\n");
+						}
+					}
+				} else if (kDown & KEY_B) {
+					ww_return_flow_reset();
+					g_state = IN_MENU;
+					g_active_menu = ww_get_main_menu();
+				}
+				return OP_UPDATE;
+			}
+
+			if (g_return_step == WW_RETURN_STEP_CAPTURE_POLICY) {
+				if (kDown & KEY_B) {
+					if (!ww_box_selector_open(WW_BOX_PICKER_RETURN_SOURCE))
+						printf("Unable to reopen destination selector\n");
+					return OP_UPDATE;
+				}
+
+				if (g_return_capture_count == 0) {
+					if (kDown & KEY_A)
+						g_return_step = WW_RETURN_STEP_REVIEW;
+					return OP_UPDATE;
+				}
+
+				if (kDown & KEY_A) {
+					g_return_manual_capture_targets = false;
+					ww_return_set_capture_auto_all();
+					g_return_step = WW_RETURN_STEP_REVIEW;
+				} else if (kDown & KEY_X) {
+					u8 idx;
+
+					g_return_manual_capture_targets = true;
+					for (idx = 0; idx < g_return_capture_count && idx < WW_RETURN_CAPTURE_MAX; idx++) {
+						g_return_captures[idx].target_box = 0;
+						g_return_captures[idx].target_slot = 0;
+					}
+					if (!ww_return_open_capture_picker(0))
+						printf("Unable to open capture selector\n");
+				}
+				return OP_UPDATE;
+			}
+
+			if (g_return_step == WW_RETURN_STEP_REVIEW) {
+				if (kDown & KEY_A) {
+					ww_start_guided_return_apply();
+				} else if (kDown & KEY_B) {
+					if (g_return_capture_count == 0)
+						g_return_step = WW_RETURN_STEP_CAPTURE_POLICY;
+					else
+						g_return_step = WW_RETURN_STEP_CAPTURE_POLICY;
+				}
+				return OP_UPDATE;
+			}
+
+			return OP_UPDATE;
+		}
+
 		if (g_state == IN_ROUTE_SELECTOR) {
 			if (kDown & KEY_LEFT) {
 				if (g_route_selector_course > 0)
@@ -6437,6 +7361,57 @@ enum operation ui_update()
 				ww_box_selector_reload();
 			} else if (kDown & KEY_A) {
 				ww_box_selector_apply_choice();
+
+				if (g_return_flow_active) {
+					if (g_box_picker_mode == WW_BOX_PICKER_RETURN_SOURCE) {
+						hgss_box_slot_summary *selected = &g_box_picker_slots[g_box_picker_slot - 1];
+
+						if (selected->occupied && selected->species_id != 0) {
+							printf("Destination slot must be empty for returned Pokemon\n");
+							return OP_UPDATE;
+						}
+
+						printf(
+								"Return destination: box %lu slot %lu\n",
+								(unsigned long)g_pending_return_box,
+								(unsigned long)g_pending_return_source_slot);
+
+						g_state = IN_RETURN_SELECTOR;
+						g_return_step = WW_RETURN_STEP_CAPTURE_POLICY;
+						return OP_UPDATE;
+					}
+
+					if (g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_1
+							|| g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_2
+							|| g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_3) {
+						u8 idx = (u8)(g_box_picker_mode - WW_BOX_PICKER_RETURN_CAPTURE_1);
+
+						if (!ww_return_validate_capture_target(idx, (u8)g_box_picker_box, (u8)g_box_picker_slot)) {
+							printf("Capture destination must be an empty unique slot\n");
+							return OP_UPDATE;
+						}
+
+						printf(
+								"Capture %u destination: box %lu slot %lu\n",
+								(unsigned)(idx + 1),
+								(unsigned long)g_box_picker_box,
+								(unsigned long)g_box_picker_slot);
+
+						idx++;
+						if (idx < g_return_capture_count) {
+							if (!ww_return_open_capture_picker(idx)) {
+								printf("Unable to open next capture selector\n");
+								g_state = IN_RETURN_SELECTOR;
+								g_return_step = WW_RETURN_STEP_CAPTURE_POLICY;
+							}
+						} else {
+							g_state = IN_RETURN_SELECTOR;
+							g_return_step = WW_RETURN_STEP_REVIEW;
+						}
+						return OP_UPDATE;
+					}
+				}
+
 				printf(
 						"Selected box %lu slot %lu\n",
 						(unsigned long)g_box_picker_box,
@@ -6451,6 +7426,21 @@ enum operation ui_update()
 					g_state = IN_MENU;
 				}
 			} else if (kDown & KEY_B) {
+				if (g_return_flow_active) {
+					if (g_box_picker_mode == WW_BOX_PICKER_RETURN_SOURCE) {
+						printf("Return already confirmed: choose a destination slot\n");
+						return OP_UPDATE;
+					}
+
+					if (g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_1
+							|| g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_2
+							|| g_box_picker_mode == WW_BOX_PICKER_RETURN_CAPTURE_3) {
+						g_state = IN_RETURN_SELECTOR;
+						g_return_step = WW_RETURN_STEP_CAPTURE_POLICY;
+						return OP_UPDATE;
+					}
+				}
+
 				g_state = IN_MENU;
 				printf("Cancelled visual box selector\n");
 			}

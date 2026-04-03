@@ -635,6 +635,32 @@ static bool hgss_find_first_empty_slot(const u8 *payload, u32 storage_offset, u8
 	return false;
 }
 
+static bool hgss_find_first_empty_slot_any_box(
+		const u8 *payload,
+		u32 storage_offset,
+		u8 exclude_box,
+		u8 exclude_slot,
+		u8 *out_box,
+		u8 *out_slot)
+{
+	u8 box;
+
+	for (box = 0; box < HGSS_BOX_COUNT; box++) {
+		u8 local_slot = 0;
+		u8 local_exclude = box == exclude_box ? exclude_slot : 0xFFu;
+
+		if (hgss_find_first_empty_slot(payload, storage_offset, box, local_exclude, &local_slot)) {
+			if (out_box)
+				*out_box = box;
+			if (out_slot)
+				*out_slot = local_slot;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static void hgss_patch_general_checksum(u8 *payload, u32 general_offset)
 {
 	u32 checksum_offset = general_offset + HGSS_GENERAL_SIZE - 2;
@@ -1040,6 +1066,7 @@ bool hgss_apply_stroll_return(
 		const char *save_path,
 		u8 box_number,
 		u8 source_slot_number,
+		u8 target_box_number,
 		u8 target_slot_number,
 		u16 expected_source_species,
 		u32 exp_gain,
@@ -1096,12 +1123,21 @@ bool hgss_apply_stroll_return(
 		hgss_set_error(out_error, out_error_size, "source slot out of range (1..30)");
 		return false;
 	}
+	if (target_box_number > HGSS_BOX_COUNT) {
+		hgss_set_error(out_error, out_error_size, "target box out of range (0..18)");
+		return false;
+	}
 	if (target_slot_number > HGSS_BOX_SLOTS) {
 		hgss_set_error(out_error, out_error_size, "target slot out of range (0..30)");
 		return false;
 	}
+	if (target_slot_number != 0 && target_box_number == 0) {
+		hgss_set_error(out_error, out_error_size, "target box must be set when target slot is explicit");
+		return false;
+	}
 
 	memset(&report, 0, sizeof(report));
+	report.target_box = 0;
 	report.target_slot = 0;
 	report.trip_counter_incremented = increment_trip_counter;
 
@@ -1195,6 +1231,7 @@ bool hgss_apply_stroll_return(
 		u8 trainer_ot_gender;
 		u8 trainer_language;
 		bool skip_capture = false;
+		u8 target_box_index = 0;
 
 		if (final_capture_level == 0)
 			final_capture_level = 10;
@@ -1202,18 +1239,35 @@ bool hgss_apply_stroll_return(
 			final_capture_level = 100;
 
 		if (target_slot_number == 0) {
-			if (!hgss_find_first_empty_slot(
-						payload,
-						storage_offset,
-						(u8)(box_number - 1),
-						(u8)(source_slot_number - 1),
-						&target_slot_index)) {
-				report.capture_skipped_no_space = true;
-				skip_capture = true;
+			if (target_box_number == 0) {
+				if (!hgss_find_first_empty_slot_any_box(
+							payload,
+							storage_offset,
+							(u8)(box_number - 1),
+							(u8)(source_slot_number - 1),
+							&target_box_index,
+							&target_slot_index)) {
+					report.capture_skipped_no_space = true;
+					skip_capture = true;
+				}
+			} else {
+				u8 exclude_slot = (target_box_number == box_number) ? (u8)(source_slot_number - 1) : 0xFFu;
+
+				target_box_index = (u8)(target_box_number - 1);
+				if (!hgss_find_first_empty_slot(
+							payload,
+							storage_offset,
+							target_box_index,
+							exclude_slot,
+							&target_slot_index)) {
+					report.capture_skipped_no_space = true;
+					skip_capture = true;
+				}
 			}
 		} else {
+			target_box_index = (u8)(target_box_number - 1);
 			target_slot_index = (u8)(target_slot_number - 1);
-			if (target_slot_index == (u8)(source_slot_number - 1)) {
+			if (target_box_number == box_number && target_slot_index == (u8)(source_slot_number - 1)) {
 				hgss_set_error(out_error, out_error_size, "target slot cannot be the same as source slot");
 				goto cleanup;
 			}
@@ -1222,8 +1276,8 @@ bool hgss_apply_stroll_return(
 		if (skip_capture)
 			goto skip_capture_write;
 
-		target_offset = hgss_storage_slot_offset(storage_offset, (u8)(box_number - 1), target_slot_index);
-		target_backup_offset = hgss_storage_slot_offset(storage_backup_offset, (u8)(box_number - 1), target_slot_index);
+		target_offset = hgss_storage_slot_offset(storage_offset, target_box_index, target_slot_index);
+		target_backup_offset = hgss_storage_slot_offset(storage_backup_offset, target_box_index, target_slot_index);
 		memcpy(target_raw, payload + target_offset, sizeof(target_raw));
 		hgss_pk4_decrypt_stored(target_raw, target_dec);
 		if (hgss_read_u16_le(target_dec, PK4_OFFSET_SPECIES) != 0) {
@@ -1257,6 +1311,7 @@ bool hgss_apply_stroll_return(
 		memcpy(payload + target_offset, target_enc, sizeof(target_enc));
 		memcpy(payload + target_backup_offset, target_enc, sizeof(target_enc));
 
+		report.target_box = (s32)target_box_index + 1;
 		report.target_slot = (s32)target_slot_index + 1;
 		report.capture_species = capture_species;
 		report.capture_level = final_capture_level;
@@ -1309,6 +1364,7 @@ skip_capture_write:
 	if (!write_capture) {
 		report.capture_species = 0;
 		report.capture_level = 0;
+		report.target_box = 0;
 		report.target_slot = 0;
 	}
 

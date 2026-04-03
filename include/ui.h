@@ -26,6 +26,7 @@ enum state {
 	IN_FILE_BROWSER,
 	IN_BOX_SELECTOR,
 	IN_ROUTE_SELECTOR,
+	IN_RETURN_SELECTOR,
 };
 
 enum operation {

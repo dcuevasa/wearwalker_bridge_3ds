@@ -44,6 +44,7 @@ typedef struct {
 	u32 source_exp_after;
 	u8 source_friendship_before;
 	u8 source_friendship_after;
+	s32 target_box;
 	s32 target_slot;
 	u16 capture_species;
 	u8 capture_level;
@@ -85,6 +86,7 @@ bool hgss_apply_stroll_return(
 		const char *save_path,
 		u8 box_number,
 		u8 source_slot_number,
+		u8 target_box_number,
 		u8 target_slot_number,
 		u16 expected_source_species,
 		u32 exp_gain,
