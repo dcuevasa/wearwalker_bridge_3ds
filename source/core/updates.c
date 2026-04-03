@@ -1,5 +1,5 @@
-#include "updates.h"
-#include "utils.h"
+#include "core/updates.h"
+#include "core/utils.h"
 #include <3ds.h>
 #include <stdio.h>
 #include <stdlib.h>

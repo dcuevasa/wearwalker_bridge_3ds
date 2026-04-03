@@ -1,5 +1,5 @@
-#include "utils.h"
-#include "font.h"
+#include "core/utils.h"
+#include "ui/font.h"
 #include "stdio.h"
 #include <string.h>
 #include <ctype.h>

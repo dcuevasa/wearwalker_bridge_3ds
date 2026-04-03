@@ -1,7 +1,7 @@
 /*
  * Adapted from https://github.com/profi200/libn3ds/blob/master/source/arm11/drivers/i2c.c
  */
-#include "i2c.h"
+#include "device/i2c.h"
 
 static I2cBus *const g_i2cBus = (I2cBus*)I2C3_REGS_BASE;
 

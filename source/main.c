@@ -1,8 +1,8 @@
-#include "transport.h"
-#include "transport_ir.h"
-#include "transport_wifi.h"
-#include "ui.h"
-#include "updates.h"
+#include "network/transport.h"
+#include "network/transport_ir.h"
+#include "network/transport_wifi.h"
+#include "ui/ui.h"
+#include "core/updates.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <3ds.h>

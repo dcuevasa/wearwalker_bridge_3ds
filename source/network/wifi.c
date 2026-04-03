@@ -1,4 +1,4 @@
-#include "wifi.h"
+#include "network/wifi.h"
 
 #include <3ds.h>
 #include <3ds/services/soc.h>

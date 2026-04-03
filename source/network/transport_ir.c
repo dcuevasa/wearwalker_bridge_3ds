@@ -1,5 +1,5 @@
-#include "transport_ir.h"
-#include "ir.h"
+#include "network/transport_ir.h"
+#include "device/ir.h"
 
 static bool ir_backend_init(void)
 {

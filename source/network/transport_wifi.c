@@ -1,5 +1,5 @@
-#include "transport_wifi.h"
-#include "wifi.h"
+#include "network/transport_wifi.h"
+#include "network/wifi.h"
 
 static bool wifi_backend_init(void)
 {

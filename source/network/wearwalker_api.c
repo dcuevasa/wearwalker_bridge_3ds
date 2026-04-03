@@ -1,5 +1,5 @@
-#include "wearwalker_api.h"
-#include "wifi.h"
+#include "network/wearwalker_api.h"
+#include "network/wifi.h"
 
 #include <ctype.h>
 #include <limits.h>

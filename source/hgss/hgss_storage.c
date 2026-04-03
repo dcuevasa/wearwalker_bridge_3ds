@@ -1,5 +1,5 @@
-#include "hgss_storage.h"
-#include "hgss_species_abilities.h"
+#include "hgss/hgss_storage.h"
+#include "hgss/hgss_species_abilities.h"
 
 #include <3ds.h>
 #include <stdio.h>

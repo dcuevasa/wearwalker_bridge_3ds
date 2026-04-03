@@ -33,7 +33,7 @@ include $(DEVKITARM)/3ds_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
-SOURCES		:=	source
+SOURCES		:=	source source/core source/device source/hgss source/network source/ui source/ui/logic source/ui/components source/ui/views
 DATA		:=	data
 INCLUDES	:=	include
 GRAPHICS	:=	gfx
@@ -98,6 +98,9 @@ export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
 export DEPSDIR	:=	$(CURDIR)/$(BUILD)
 
 CFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+EMBEDDED_UI_CFILES := ui_logic.c ui_async_logic.c ui_actions_controller.c \
+	ui_file_browser_view.c ui_box_selector_view.c ui_route_return_views.c ui_simple_top_panel_view.c
+CFILES		:=	$(filter-out $(EMBEDDED_UI_CFILES),$(CFILES))
 CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 PICAFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.v.pica)))

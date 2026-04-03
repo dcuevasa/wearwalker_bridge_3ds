@@ -19,3 +19,6 @@ dist/
 *.sav
 *.nds
 *.sh
+
+*.dmp
+*.tmp

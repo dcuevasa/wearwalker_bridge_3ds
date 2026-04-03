@@ -1,5 +1,5 @@
-#include "ir.h"
-#include "i2c.h"
+#include "device/ir.h"
+#include "device/i2c.h"
 #include <stdbool.h>
 #include <3ds/types.h>
 

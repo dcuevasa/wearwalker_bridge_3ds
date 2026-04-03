@@ -1,6 +1,6 @@
-#include "pokewalker.h"
-#include "transport.h"
-#include "utils.h"
+#include "device/pokewalker.h"
+#include "network/transport.h"
+#include "core/utils.h"
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>

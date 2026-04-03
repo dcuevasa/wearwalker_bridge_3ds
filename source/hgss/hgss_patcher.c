@@ -1,4 +1,4 @@
-#include "hgss_patcher.h"
+#include "hgss/hgss_patcher.h"
 
 #include <3ds.h>
 #include <stdio.h>
