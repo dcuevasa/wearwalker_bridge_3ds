@@ -48,6 +48,11 @@ u16 ww_api_get_port(void)
 	return wifi_get_port();
 }
 
+const char *ww_api_last_error(void)
+{
+	return wifi_last_error();
+}
+
 static bool ww_http_find_header_end(const u8 *response, u32 response_size, u32 *header_end)
 {
 	u32 i;
@@ -294,6 +299,34 @@ static bool ww_http_extract_text_body_any_status(const u8 *response, u32 respons
 	return true;
 }
 
+static bool ww_http_response_is_complete(const u8 *response, u32 response_size)
+{
+	ww_http_response parsed;
+	u32 i;
+	static const u8 chunk_end[] = {'0', '\r', '\n', '\r', '\n'};
+
+	if (!response || response_size == 0)
+		return false;
+	if (!ww_http_parse_response(response, response_size, &parsed))
+		return false;
+
+	if (parsed.chunked) {
+		if (parsed.body_size < sizeof(chunk_end))
+			return false;
+
+		for (i = 0; i + sizeof(chunk_end) <= parsed.body_size; i++) {
+			if (memcmp(parsed.body + i, chunk_end, sizeof(chunk_end)) == 0)
+				return true;
+		}
+		return false;
+	}
+
+	if (parsed.content_length >= 0)
+		return parsed.body_size >= (u32)parsed.content_length;
+
+	return false;
+}
+
 static bool ww_http_request_raw(const char *method, const char *path,
 		const u8 *request_body, u32 request_body_size,
 		u8 *response, u32 response_size, u32 *out_response_size)
@@ -334,11 +367,17 @@ static bool ww_http_request_raw(const char *method, const char *path,
 	if (request_body && request_body_size)
 		wifi_send_data((void *)request_body, request_body_size);
 
+	{
+		u32 timeout_ms = WIFI_DEFAULT_TIMEOUT_MS;
 	while (total < response_size) {
-		u32 got = wifi_recv_data(response + total, response_size - total, WIFI_DEFAULT_TIMEOUT_MS);
+		u32 got = wifi_recv_data(response + total, response_size - total, timeout_ms);
 		if (!got)
 			break;
 		total += got;
+		if (ww_http_response_is_complete(response, total))
+			break;
+		timeout_ms = WIFI_INTERBYTE_TIMEOUT_MS;
+	}
 	}
 	wifi_disconnect();
 
@@ -384,11 +423,17 @@ static bool ww_http_request_json(const char *method, const char *path,
 	if (request_size)
 		wifi_send_data((void *)request_json, request_size);
 
+	{
+		u32 timeout_ms = WIFI_DEFAULT_TIMEOUT_MS;
 	while (total < response_size) {
-		u32 got = wifi_recv_data(response + total, response_size - total, WIFI_DEFAULT_TIMEOUT_MS);
+		u32 got = wifi_recv_data(response + total, response_size - total, timeout_ms);
 		if (!got)
 			break;
 		total += got;
+		if (ww_http_response_is_complete(response, total))
+			break;
+		timeout_ms = WIFI_INTERBYTE_TIMEOUT_MS;
+	}
 	}
 	wifi_disconnect();
 

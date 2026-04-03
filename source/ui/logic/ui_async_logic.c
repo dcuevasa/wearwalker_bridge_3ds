@@ -183,13 +183,27 @@ static void ww_async_worker(void *arg)
 	switch (task) {
 		case WW_TASK_STATUS:
 			success = ww_api_get_status(json, WW_API_RESPONSE_MAX);
-			if (!success)
-				snprintf(json, WW_API_RESPONSE_MAX, "status request failed");
+			if (!success) {
+				const char *api_err = ww_api_last_error();
+				snprintf(
+						json,
+						WW_API_RESPONSE_MAX,
+						"status request failed%s%s",
+						api_err ? ": " : "",
+						api_err ? api_err : "");
+			}
 			break;
 		case WW_TASK_SNAPSHOT:
 			success = ww_api_get_snapshot(&snapshot, json, WW_API_RESPONSE_MAX);
-			if (!success)
-				snprintf(json, WW_API_RESPONSE_MAX, "snapshot request failed");
+			if (!success) {
+				const char *api_err = ww_api_last_error();
+				snprintf(
+						json,
+						WW_API_RESPONSE_MAX,
+						"snapshot request failed%s%s",
+						api_err ? ": " : "",
+						api_err ? api_err : "");
+			}
 			break;
 		case WW_TASK_EXPORT_EEPROM:
 			success = ww_api_export_eeprom("WWEEPROM.bin");

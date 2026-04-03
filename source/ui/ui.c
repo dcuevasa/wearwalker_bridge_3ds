@@ -901,7 +901,7 @@ static void ww_init_debug_console(void)
 
 static void ww_clear_debug_console(void)
 {
-	if (!g_debug_console_ready)
+	if (!g_debug_console_ready || !g_console_enabled)
 		return;
 
 	consoleSelect(&g_header_console);

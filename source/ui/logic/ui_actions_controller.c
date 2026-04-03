@@ -27,16 +27,24 @@ void call_toggle_simple_mode()
 	g_simple_mode = !g_simple_mode;
 	g_console_enabled = !g_simple_mode;
 	ww_save_ui_config();
-	if (g_console_enabled)
+	if (g_console_enabled) {
 		ww_init_debug_console();
-	if (was_console_enabled || g_console_enabled)
 		ww_clear_debug_console();
+		/* Rebind top target when entering debug to keep states consistent. */
+		target_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+	} else if (was_console_enabled && g_debug_console_ready) {
+		/* Leave debug mode cleanly so top simple UI does not render over stale console output. */
+		g_debug_console_ready = false;
+		target_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+	}
 	g_active_menu = ww_get_main_menu();
 	g_active_menu->props.selected = 0;
 	if (g_console_enabled && g_debug_console_ready) {
 		consoleSelect(&g_header_console);
 		printf("WearWalker Bridge Test v%s\n", VER);
 		consoleSelect(&logs);
+	} else {
+		ww_set_top_status("UI mode changed to Simple", 3000);
 	}
 	printf("UI mode changed to %s\n", g_simple_mode ? "Simple" : "Debug");
 }

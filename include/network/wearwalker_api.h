@@ -17,6 +17,7 @@ typedef struct {
 bool ww_api_set_endpoint(const char *host, u16 port);
 const char *ww_api_get_host(void);
 u16 ww_api_get_port(void);
+const char *ww_api_last_error(void);
 
 bool ww_api_get_status(char *out_json, u32 out_size);
 bool ww_api_get_snapshot(wearwalker_snapshot *out_snapshot, char *out_json, u32 out_size);
