@@ -120,6 +120,59 @@ static bool ww_async_should_abort_before_remote(ww_async_task task, char *json, 
 	return ww_async_has_timed_out(task, json, json_size);
 }
 
+/*
+ * Normalize return transfer counters across backends.
+ * - WearWalker app reports: steps.transferred / watts.totalTransferred
+ * - Python mock reports:    steps.addedSteps / watts.totalGained
+ */
+static void ww_extract_return_transfer_totals(
+		const char *return_json,
+		u32 fallback_steps,
+		u32 fallback_watts,
+		u32 *out_steps,
+		u32 *out_watts)
+{
+	u32 steps = fallback_steps;
+	u32 watts = fallback_watts;
+	u32 value = 0;
+	u32 watts_from_steps = 0;
+	u32 watts_bonus = 0;
+	bool have_watts = false;
+
+	if (return_json) {
+		if (ww_json_get_u32_after_token(return_json, "\"steps\"", "transferred", &value)
+				|| ww_json_get_u32_after_token(return_json, "\"steps\"", "addedSteps", &value)
+				|| ww_json_get_u32_after_token(return_json, "\"steps\"", "inputWalkedSteps", &value)) {
+			steps = value;
+		}
+
+		if (ww_json_get_u32_after_token(return_json, "\"watts\"", "totalTransferred", &value)
+				|| ww_json_get_u32_after_token(return_json, "\"watts\"", "totalGained", &value)) {
+			watts = value;
+			have_watts = true;
+		} else {
+			bool have_from_steps = ww_json_get_u32_after_token(return_json, "\"watts\"", "fromSteps", &watts_from_steps);
+			bool have_bonus = ww_json_get_u32_after_token(return_json, "\"watts\"", "bonus", &watts_bonus);
+
+			if (have_from_steps || have_bonus) {
+				u32 merged = watts_from_steps + watts_bonus;
+				if (merged < watts_from_steps)
+					merged = 0xFFFFFFFFu;
+				watts = merged;
+				have_watts = true;
+			}
+		}
+	}
+
+	if (!have_watts)
+		watts = fallback_watts;
+
+	if (out_steps)
+		*out_steps = steps;
+	if (out_watts)
+		*out_watts = watts;
+}
+
 static void ww_async_worker(void *arg)
 {
 	ww_async_task task = (ww_async_task)(uintptr_t)arg;
@@ -149,8 +202,6 @@ static void ww_async_worker(void *arg)
 	bool pending_return_increment_trip_counter = g_pending_return_increment_trip_counter;
 	u16 pending_return_expected_species = g_return_preview_source_species;
 	u32 pending_return_exp_gain = g_return_preview_exp_gain;
-	u32 pending_return_sync_steps = g_return_preview_sync_steps;
-	u32 pending_return_sync_watts = g_return_preview_sync_watts;
 	u32 pending_return_sync_flags = g_return_preview_sync_flags;
 	u8 pending_return_capture_count = g_return_capture_count;
 	ww_return_capture_choice pending_return_captures[WW_RETURN_CAPTURE_MAX];
@@ -626,8 +677,8 @@ static void ww_async_worker(void *arg)
 				char patch_error[128];
 				char *sync_json = NULL;
 				u32 exp_gain = pending_return_walked_steps;
-				u32 sync_steps;
-				u32 sync_watts;
+				u32 transfer_steps = pending_return_walked_steps;
+				u32 transfer_watts = pending_return_bonus_watts;
 				u32 sync_flags;
 				u16 expected_source_species = 0;
 				u16 capture_species = 0;
@@ -690,6 +741,13 @@ static void ww_async_worker(void *arg)
 					snprintf(json, WW_API_RESPONSE_MAX, "stroll return request failed");
 					break;
 				}
+
+				ww_extract_return_transfer_totals(
+						json,
+						pending_return_walked_steps,
+						pending_return_bonus_watts,
+						&transfer_steps,
+						&transfer_watts);
 				ww_async_progress_set(45, "Return accepted by API");
 
 				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
@@ -713,14 +771,6 @@ static void ww_async_worker(void *arg)
 				ww_async_progress_set(70, "Sync package fetched");
 
 				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
-					success = false;
-					free(sync_json);
-					break;
-				}
-
-				if (!ww_json_get_u32_after_token(sync_json, "\"stats\"", "steps", &sync_steps) ||
-						!ww_json_get_u32_after_token(sync_json, "\"stats\"", "watts", &sync_watts)) {
-					snprintf(json, WW_API_RESPONSE_MAX, "sync package missing stats.steps/stats.watts");
 					success = false;
 					free(sync_json);
 					break;
@@ -760,13 +810,13 @@ static void ww_async_worker(void *arg)
 						(u8)pending_return_target_slot,
 						expected_source_species,
 						exp_gain,
-						pending_return_walked_steps,
+						transfer_steps,
 						capture_species,
 						capture_level,
 						capture_moves,
 						capture_species_name,
-						sync_steps,
-						sync_watts,
+						transfer_steps,
+						transfer_watts,
 						sync_flags,
 						pending_return_increment_trip_counter,
 						&report,
@@ -883,6 +933,8 @@ static void ww_async_worker(void *arg)
 				char *sync_json = NULL;
 				u32 api_return_species = pending_return_expected_species;
 				u32 api_exp_gain = pending_return_exp_gain;
+				u32 transfer_steps = pending_return_walked_steps;
+				u32 transfer_watts = pending_return_bonus_watts;
 				u8 captures_written = 0;
 				u8 captures_skipped = 0;
 				bool reset_stats_ok = false;
@@ -953,6 +1005,13 @@ static void ww_async_worker(void *arg)
 					success = false;
 					break;
 				}
+
+				ww_extract_return_transfer_totals(
+						return_json,
+						pending_return_walked_steps,
+						pending_return_bonus_watts,
+						&transfer_steps,
+						&transfer_watts);
 				ww_async_progress_set(35, "Return accepted by API");
 
 				if (ww_async_has_timed_out(task, json, WW_API_RESPONSE_MAX)) {
@@ -990,15 +1049,6 @@ static void ww_async_worker(void *arg)
 					break;
 				}
 
-				if (!ww_json_get_u32_after_token(sync_json, "\"stats\"", "steps", &pending_return_sync_steps)
-						|| !ww_json_get_u32_after_token(sync_json, "\"stats\"", "watts", &pending_return_sync_watts)) {
-					snprintf(json, WW_API_RESPONSE_MAX, "guided return sync package missing stats");
-					free(return_json);
-					free(sync_json);
-					success = false;
-					break;
-				}
-
 				if (!ww_json_get_u32_after_token(sync_json, "\"courseUnlocks\"", "unlockFlags", &pending_return_sync_flags))
 					pending_return_sync_flags = 0;
 
@@ -1014,13 +1064,13 @@ static void ww_async_worker(void *arg)
 						0,
 						(u16)api_return_species,
 						api_exp_gain,
-						pending_return_walked_steps,
+						transfer_steps,
 						0,
 						0,
 						NULL,
 						NULL,
-						pending_return_sync_steps,
-						pending_return_sync_watts,
+						transfer_steps,
+						transfer_watts,
 						pending_return_sync_flags,
 						pending_return_increment_trip_counter,
 						&base_report,
