@@ -2269,6 +2269,7 @@ static bool ww_build_resolved_stroll_send_json(
 		u16 min_steps = ww_read_u16_le(record + base + 0x10);
 		u16 chance_raw = ww_read_u16_le(record + base + 0x12);
 		u8 chance = chance_raw > 0xFFu ? 0xFFu : (u8)chance_raw;
+		char safe_species_name[48];
 
 		if (species_id == 0) {
 			u32 alt_pair_index = pair_base + (pair_pick ^ 0x1u);
@@ -2300,14 +2301,17 @@ static bool ww_build_resolved_stroll_send_json(
 		if (slot_level > 100)
 			slot_level = 100;
 
+		ww_sanitize_json_ascii(ww_lookup_species_name(species_id), safe_species_name, sizeof(safe_species_name));
+
 		if (!ww_json_append(
 					&cursor,
 					&remaining,
-					"%s{\"slot\":%u,\"sourcePairIndex\":%u,\"speciesId\":%u,\"level\":%u,\"gender\":%u,\"moves\":[%u,%u,%u,%u],\"minSteps\":%u,\"chance\":%u}",
+					"%s{\"slot\":%u,\"sourcePairIndex\":%u,\"speciesId\":%u,\"speciesName\":\"%s\",\"level\":%u,\"gender\":%u,\"moves\":[%u,%u,%u,%u],\"minSteps\":%u,\"chance\":%u}",
 					group == 0 ? "" : ",",
 					(unsigned)group,
 					(unsigned)source_pair_index,
 					(unsigned)species_id,
+					safe_species_name,
 					(unsigned)slot_level,
 					(unsigned)gender,
 					(unsigned)move0,
@@ -2329,14 +2333,18 @@ static bool ww_build_resolved_stroll_send_json(
 		u16 min_steps = ww_read_u16_le(record + base + 0x02);
 		u16 chance_raw = ww_read_u16_le(record + base + 0x04);
 		u8 chance = chance_raw > 0xFFu ? 0xFFu : (u8)chance_raw;
+		char safe_item_name[48];
+
+		ww_sanitize_json_ascii(ww_lookup_item_name(item_id), safe_item_name, sizeof(safe_item_name));
 
 		if (!ww_json_append(
 					&cursor,
 					&remaining,
-					"%s{\"routeItemIndex\":%u,\"itemId\":%u,\"minSteps\":%u,\"chance\":%u}",
+					"%s{\"routeItemIndex\":%u,\"itemId\":%u,\"itemName\":\"%s\",\"minSteps\":%u,\"chance\":%u}",
 					item_index == 0 ? "" : ",",
 					(unsigned)item_index,
 					(unsigned)item_id,
+					safe_item_name,
 					(unsigned)min_steps,
 					(unsigned)chance)) {
 			return false;

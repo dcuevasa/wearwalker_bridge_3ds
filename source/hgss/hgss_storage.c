@@ -1321,12 +1321,30 @@ skip_capture_write:
 		;
 	}
 
-	hgss_write_u32_le(payload, general_offset + HGSS_WALKER_STEPS_OFFSET, pokewalker_steps);
-	hgss_write_u32_le(payload, general_offset + HGSS_WALKER_WATTS_OFFSET, pokewalker_watts);
-	hgss_write_u32_le(payload, general_offset + HGSS_WALKER_COURSE_FLAGS_OFFSET, pokewalker_course_flags);
-	hgss_write_u32_le(payload, general_backup_offset + HGSS_WALKER_STEPS_OFFSET, pokewalker_steps);
-	hgss_write_u32_le(payload, general_backup_offset + HGSS_WALKER_WATTS_OFFSET, pokewalker_watts);
-	hgss_write_u32_le(payload, general_backup_offset + HGSS_WALKER_COURSE_FLAGS_OFFSET, pokewalker_course_flags);
+	{
+		u32 save_steps_before = hgss_read_u32_le(payload, general_offset + HGSS_WALKER_STEPS_OFFSET);
+		u32 save_watts_before = hgss_read_u32_le(payload, general_offset + HGSS_WALKER_WATTS_OFFSET);
+		u32 save_flags_before = hgss_read_u32_le(payload, general_offset + HGSS_WALKER_COURSE_FLAGS_OFFSET);
+		u32 merged_steps = save_steps_before + pokewalker_steps;
+		u32 merged_watts = save_watts_before + pokewalker_watts;
+		u32 merged_flags = save_flags_before | pokewalker_course_flags;
+
+		if (merged_steps < save_steps_before)
+			merged_steps = 0xFFFFFFFFu;
+		if (merged_watts < save_watts_before)
+			merged_watts = 0xFFFFFFFFu;
+
+		hgss_write_u32_le(payload, general_offset + HGSS_WALKER_STEPS_OFFSET, merged_steps);
+		hgss_write_u32_le(payload, general_offset + HGSS_WALKER_WATTS_OFFSET, merged_watts);
+		hgss_write_u32_le(payload, general_offset + HGSS_WALKER_COURSE_FLAGS_OFFSET, merged_flags);
+		hgss_write_u32_le(payload, general_backup_offset + HGSS_WALKER_STEPS_OFFSET, merged_steps);
+		hgss_write_u32_le(payload, general_backup_offset + HGSS_WALKER_WATTS_OFFSET, merged_watts);
+		hgss_write_u32_le(payload, general_backup_offset + HGSS_WALKER_COURSE_FLAGS_OFFSET, merged_flags);
+
+		report.pokewalker_steps_after = merged_steps;
+		report.pokewalker_watts_after = merged_watts;
+		report.pokewalker_course_flags_after = merged_flags;
+	}
 
 	if (increment_trip_counter) {
 		u16 trip_counter;
@@ -1358,9 +1376,6 @@ skip_capture_write:
 	}
 	hgss_force_sync(f);
 
-	report.pokewalker_steps_after = pokewalker_steps;
-	report.pokewalker_watts_after = pokewalker_watts;
-	report.pokewalker_course_flags_after = pokewalker_course_flags;
 	if (!write_capture) {
 		report.capture_species = 0;
 		report.capture_level = 0;

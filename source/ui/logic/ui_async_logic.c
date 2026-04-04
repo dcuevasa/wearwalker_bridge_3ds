@@ -634,8 +634,11 @@ static void ww_async_worker(void *arg)
 				u8 capture_level = 10;
 				u16 capture_moves[4] = {0, 0, 0, 0};
 				char capture_species_name[32];
+				bool reset_stats_ok = false;
+				char reset_error[96];
 
 				capture_species_name[0] = '\0';
+				reset_error[0] = '\0';
 
 				if (ww_async_should_abort_before_remote(task, json, WW_API_RESPONSE_MAX)) {
 					success = false;
@@ -826,10 +829,24 @@ static void ww_async_worker(void *arg)
 					}
 				}
 
+				/* Finalize transaction on device: consumed progress is transferred to save, then reset watch stats. */
+				if (ww_api_command_set_steps(0, &snapshot, json, WW_API_RESPONSE_MAX)
+						&& ww_api_command_set_watts(0, &snapshot, json, WW_API_RESPONSE_MAX)) {
+					reset_stats_ok = true;
+				} else {
+					const char *api_err = ww_api_last_error();
+					snprintf(
+							reset_error,
+							sizeof(reset_error),
+							"device stats reset failed%s%s",
+							api_err ? ": " : "",
+							api_err ? api_err : "");
+				}
+
 				snprintf(
 						json,
 						WW_API_RESPONSE_MAX,
-						"Return applied to %s | source box %lu slot %lu (species %u, exp %lu->%lu, friendship %u->%u, origin %s) | capture %s | steps %lu watts %lu flags 0x%08lX",
+						"Return applied to %s | source box %lu slot %lu (species %u, exp %lu->%lu, friendship %u->%u, origin %s) | capture %s | save steps %lu watts %lu flags 0x%08lX | watch reset %s%s%s",
 						pending_save_path,
 						(unsigned long)pending_return_box,
 						(unsigned long)pending_return_source_slot,
@@ -842,7 +859,15 @@ static void ww_async_worker(void *arg)
 						report.capture_species ? "written" : (report.capture_skipped_no_space ? "skipped(box-full)" : "none"),
 						(unsigned long)report.pokewalker_steps_after,
 						(unsigned long)report.pokewalker_watts_after,
-						(unsigned long)report.pokewalker_course_flags_after);
+						(unsigned long)report.pokewalker_course_flags_after,
+						reset_stats_ok ? "ok" : "failed",
+						reset_error[0] ? " (" : "",
+						reset_error[0] ? reset_error : "");
+				if (reset_error[0]) {
+					size_t used = strlen(json);
+					if (used + 2 < WW_API_RESPONSE_MAX)
+						strncat(json, ")", WW_API_RESPONSE_MAX - used - 1);
+				}
 				break;
 			}
 			case WW_TASK_HGSS_STROLL_RETURN_GUIDED_APPLY: {
@@ -853,17 +878,20 @@ static void ww_async_worker(void *arg)
 				char api_error[96];
 				char api_detail[128];
 				char capture_summary[384];
+				char reset_error[96];
 				char *return_json = NULL;
 				char *sync_json = NULL;
 				u32 api_return_species = pending_return_expected_species;
 				u32 api_exp_gain = pending_return_exp_gain;
 				u8 captures_written = 0;
 				u8 captures_skipped = 0;
+				bool reset_stats_ok = false;
 				u8 i;
 
 				capture_summary[0] = '\0';
 				api_error[0] = '\0';
 				api_detail[0] = '\0';
+				reset_error[0] = '\0';
 
 				if (ww_async_should_abort_before_remote(task, json, WW_API_RESPONSE_MAX)) {
 					success = false;
@@ -1065,9 +1093,9 @@ static void ww_async_worker(void *arg)
 							capture->level,
 							capture->moves,
 							capture->species_name,
-							pending_return_sync_steps,
-							pending_return_sync_watts,
-							pending_return_sync_flags,
+							0,
+							0,
+							0,
 							false,
 							&capture_report,
 							patch_error,
@@ -1104,11 +1132,25 @@ static void ww_async_worker(void *arg)
 				if (!success)
 					break;
 
+				/* Finalize transaction on device after save patches are done. */
+				if (ww_api_command_set_steps(0, &snapshot, json, WW_API_RESPONSE_MAX)
+						&& ww_api_command_set_watts(0, &snapshot, json, WW_API_RESPONSE_MAX)) {
+					reset_stats_ok = true;
+				} else {
+					const char *api_err = ww_api_last_error();
+					snprintf(
+							reset_error,
+							sizeof(reset_error),
+							"device stats reset failed%s%s",
+							api_err ? ": " : "",
+							api_err ? api_err : "");
+				}
+
 				ww_async_progress_set(100, "Return completed");
 				snprintf(
 						json,
 						WW_API_RESPONSE_MAX,
-						"Guided return applied to %s | returned %u to box %lu slot %lu | EXP +%lu | captures written=%u skipped=%u%s | steps %lu watts %lu flags 0x%08lX",
+						"Guided return applied to %s | returned %u to box %lu slot %lu | EXP +%lu | captures written=%u skipped=%u%s | save steps %lu watts %lu flags 0x%08lX | watch reset %s%s%s",
 						pending_save_path,
 						(unsigned)api_return_species,
 						(unsigned long)pending_return_box,
@@ -1117,9 +1159,17 @@ static void ww_async_worker(void *arg)
 						(unsigned)captures_written,
 						(unsigned)captures_skipped,
 						capture_summary,
-						(unsigned long)pending_return_sync_steps,
-						(unsigned long)pending_return_sync_watts,
-						(unsigned long)pending_return_sync_flags);
+						(unsigned long)base_report.pokewalker_steps_after,
+						(unsigned long)base_report.pokewalker_watts_after,
+						(unsigned long)base_report.pokewalker_course_flags_after,
+						reset_stats_ok ? "ok" : "failed",
+						reset_error[0] ? " (" : "",
+						reset_error[0] ? reset_error : "");
+				if (reset_error[0]) {
+					size_t used = strlen(json);
+					if (used + 2 < WW_API_RESPONSE_MAX)
+						strncat(json, ")", WW_API_RESPONSE_MAX - used - 1);
+				}
 				break;
 			}
 		default:
